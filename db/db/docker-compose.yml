@@ -1,0 +1,52 @@
+# Local MySQL 8 for development.
+#
+#   docker compose up -d
+#   DB_HOST=127.0.0.1 DB_PORT=3307 DB_PASSWORD=root tools/load.sh all --fresh --with-mysql8
+#
+# Port 3307 on the host so this does not collide with a locally installed MySQL.
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: livfinder-mysql
+    restart: unless-stopped
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: livfinder
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # See docs/PERFORMANCE.md. These are development values; production sizing
+      # is a different exercise and the buffer pool should dominate available RAM.
+      - --innodb-buffer-pool-size=2G
+      - --innodb-log-file-size=512M
+      - --innodb-flush-method=O_DIRECT
+      - --innodb-flush-log-at-trx-commit=2
+      # 2 rather than 1 here on purpose: development throughput matters more than
+      # surviving an OS crash. Use 1 in production — it is the only fully ACID
+      # setting, and this schema holds money.
+      #
+      # ngram_token_size cannot be changed per index after creation, so it must be
+      # set before migration 0015 runs. 2 suits Chinese.
+      - --ngram-token-size=2
+      - --innodb-ft-min-token-size=2
+      # Small tokens matter for this catalogue: "GT", "M8", "S8", "RM" are all
+      # real search terms.
+      - --local-infile=1
+    volumes:
+      - livfinder-mysql-data:/var/lib/mysql
+      # Seeds mounted read-only, so they can also be loaded from inside the
+      # container with `docker compose exec`.
+      - ./seeds:/seeds:ro
+      - ./migrations:/migrations:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  livfinder-mysql-data:

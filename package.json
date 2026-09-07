@@ -1,0 +1,47 @@
+{
+  "name": "livfinder-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "LivFinder API \u2014 Express + MySQL backend for the LivFinder marketplace, portal and admin frontends.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "test": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration --pool=forks --poolOptions.forks.singleFork",
+    "test:all": "vitest run --pool=forks --poolOptions.forks.singleFork",
+    "health-check": "node scripts/health-check.js",
+    "seed:dev-passwords": "node scripts/seed-dev-passwords.js",
+    "import:frontend-media": "node scripts/import-frontend-media.js",
+    "media:projects": "node scripts/attach-project-media.js",
+    "backfill:canonical-paths": "node scripts/backfill-canonical-paths.js",
+    "smoke": "node scripts/smoke-test.js",
+    "cleanup:test-artifacts": "node scripts/cleanup-test-artifacts.js",
+    "maintenance": "node scripts/run-maintenance.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.700.0",
+    "@aws-sdk/s3-request-presigner": "^3.700.0",
+    "argon2": "^0.44.0",
+    "bcryptjs": "^3.0.2",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^17.0.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.0.0",
+    "helmet": "^8.1.0",
+    "multer": "^2.0.0",
+    "mysql2": "^3.15.0",
+    "pino": "^10.0.0",
+    "pino-http": "^11.0.0",
+    "sharp": "^0.35.4",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "supertest": "^7.1.0",
+    "vitest": "^3.2.7"
+  }
+}

@@ -1,0 +1,62 @@
+-- =============================================================================
+-- Liv Finder — migration 0034 · Drop the category-encoded permission codes
+-- =============================================================================
+-- Finishes what 0032 started.
+--
+-- WHAT WAS LEFT BEHIND
+--
+-- 0031 wrote the admin frontend's granular ids into `permissions` as real rows:
+-- 62 codes of the shape `domain.category.action` — `listings.cars.edit`,
+-- `leads.yachts.view`, `locations.subCommunity.archive`.
+--
+-- 0032 replaced that model. A category restriction is now a *scope* on the role
+-- (`role_scopes`), checked by `assertCategoryScope`, while the permission itself
+-- stays coarse — `listings.edit` — because LIV-IAM-001 §6.2 forbids encoding a
+-- category or page name into a permission key.
+--
+-- But 0032 only deleted the six superseded *coarse* codes. It never removed
+-- 0031's catalog, so the 62 granular rows survived the model that replaced them.
+--
+-- WHY THEY HAVE TO GO RATHER THAN JUST BEING IGNORED
+--
+-- Nothing checks them. `requirePermission` is called with coarse codes only, so
+-- a granular row is unreachable by the authorization path — which is precisely
+-- what makes it dangerous. The Role Access matrix draws a tick for every grant
+-- it finds, so these rows advertise authority that is never evaluated:
+--
+--   * `analyst` holds `listings.cars.create` and does NOT hold `listings.create`.
+--     The matrix shows an analyst who can create car listings. The server, which
+--     checks `listings.create`, refuses. The grid and the boundary disagree.
+--
+--   * `locations.archive` does not exist as a coarse code at all, so the five
+--     `locations.*.archive` grants were never enforceable in any form.
+--
+-- This is 0032's original bug wearing the opposite face: there the matrix showed
+-- *less* control than the server enforced, here it shows *more*. Both are a
+-- permission grid that cannot be read as the truth.
+--
+-- WHAT IS LOST
+--
+-- 272 rows in `role_permissions`, across seven roles, none of which is a real
+-- capability: 228 of them sit alongside the coarse grant that actually carries
+-- the access, and the remaining 44 name a coarse code the role does not hold (or
+-- that does not exist), so they grant nothing today either. No role's effective
+-- access changes. `role_permissions.permission_id` is ON DELETE CASCADE, so the
+-- grants go with the codes; no `workflow_steps.approver_permission_id` points at
+-- one of these rows, so no approver is orphaned.
+--
+-- IDEMPOTENT. Safe to re-run — a second run matches nothing.
+-- =============================================================================
+
+SET NAMES utf8mb4;
+
+-- -----------------------------------------------------------------------------
+-- 1 · Remove every code that carries a category or page name
+-- -----------------------------------------------------------------------------
+-- Matched by grammar rather than by an explicit list, deliberately: an explicit
+-- list would silently miss a code some later branch adds in the same shape. The
+-- pattern is the one `permissions.test.js` asserts — exactly two segments, each
+-- lowerCamelCase — so the migration and the test cannot drift apart.
+
+DELETE FROM `permissions`
+ WHERE `code` NOT REGEXP '^[a-z][a-zA-Z]*\\.[a-z][a-zA-Z]*$';

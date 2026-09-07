@@ -1,0 +1,30 @@
+# NOTE: gitignore has no trailing-comment syntax. Comments must be on their own
+# line, or the comment text becomes part of the pattern and the rule silently
+# stops matching.
+
+# Environment
+.env
+.env.local
+*.env.local
+
+# Schema dumps and build output
+db/build/
+*.sql.bak
+
+# Node
+node_modules/
+.next/
+dist/
+build/
+*.tsbuildinfo
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
