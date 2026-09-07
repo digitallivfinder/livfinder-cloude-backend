@@ -49,11 +49,20 @@ export function serializeListingMediaRow(row) {
 }
 
 export async function attachAssetToListing(
-  { listingId, assetId, mediaType = "image", altText = null, caption = null, tag = null, isCover = null },
+  {
+    listingId,
+    assetId,
+    mediaType = "image",
+    altText = null,
+    caption = null,
+    tag = null,
+    isCover = null,
+    promoteOverLegacy = false,
+  },
   executor
 ) {
   const asset = await queryOne(
-    "SELECT id, url, public_id, source FROM media_assets WHERE id = ? AND deleted_at IS NULL",
+    "SELECT id, url, public_id FROM media_assets WHERE id = ? AND deleted_at IS NULL",
     [Number(assetId)],
     executor
   );
@@ -74,7 +83,7 @@ export async function attachAssetToListing(
   // Seed rows make existingCount nonzero even before the owner uploads any photographs.
   // In that case the first actual upload used to leave the seeded cover in place forever.
   // An explicit choice or an existing real cover must still win.
-  if (isCover === null && existingCount > 0 && mediaType === "image" && asset.source === "upload") {
+  if (isCover === null && existingCount > 0 && mediaType === "image" && promoteOverLegacy) {
     const current = await queryOne(
       `SELECT url FROM listing_media
         WHERE listing_id = ? AND media_type = 'image' AND is_public = 1

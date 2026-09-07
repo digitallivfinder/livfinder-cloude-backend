@@ -12,12 +12,12 @@ import { attachAssetToListing } from "../../src/modules/media/listingMedia.servi
 
 beforeEach(() => vi.resetAllMocks());
 
-async function attach({ source = "upload", cover = "https://cdn.livfinder.com/listings/seed/01.jpg", isCover = null, count = 3 } = {}) {
-  queryOne.mockResolvedValueOnce({ id: 99, public_id: "asset99", url: "https://api.livfinder.com/media/listings/actual.jpg", source });
+async function attach({ cover = "https://cdn.livfinder.com/listings/seed/01.jpg", isCover = null, count = 3, promoteOverLegacy = true } = {}) {
+  queryOne.mockResolvedValueOnce({ id: 99, public_id: "asset99", url: "https://api.livfinder.com/media/listings/actual.jpg" });
   queryOne.mockResolvedValueOnce(cover ? { url: cover } : null);
   queryValue.mockResolvedValueOnce(3).mockResolvedValueOnce(count);
   execute.mockResolvedValue({ insertId: 123 });
-  await attachAssetToListing({ listingId: 143, assetId: 99, isCover });
+  await attachAssetToListing({ listingId: 143, assetId: 99, isCover, promoteOverLegacy });
   const insert = execute.mock.calls.find(([sql]) => sql.includes("INSERT INTO listing_media"));
   return insert[1][9]; // The actual is_cover value written for the newly attached image.
 }
@@ -33,8 +33,8 @@ describe("uploading actual photos to a seeded listing", () => {
   it("honours an explicit request not to change the cover", async () => {
     expect(await attach({ isCover: false })).toBe(0);
   });
-  it("does not promote demo imports over an existing cover", async () => {
-    expect(await attach({ source: "migration" })).toBe(0);
+  it("does not promote a previously stored or library asset automatically", async () => {
+    expect(await attach({ promoteOverLegacy: false })).toBe(0);
   });
   it("uses the actual upload when there are only non-image gallery rows", async () => {
     expect(await attach({ cover: null })).toBe(1);

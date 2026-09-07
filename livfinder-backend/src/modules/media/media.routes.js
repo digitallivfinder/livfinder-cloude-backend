@@ -228,6 +228,9 @@ router.post(
         listingId: listing.id,
         assetId: asset.id,
         altText: asset.alt_text,
+        // This asset was created from bytes supplied in this authenticated request. Unlike
+        // historical seed rows, that provenance is reliable enough to replace a seeded cover.
+        promoteOverLegacy: true,
       });
     }
 
