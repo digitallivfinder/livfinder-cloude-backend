@@ -4,6 +4,7 @@ import { AppError } from "../../utils/errors.js";
 import { getStorage } from "../../config/storage.js";
 import { listRenditions, softDeleteAsset, thumbnailFrom } from "./media.service.js";
 import { refreshListingSearch } from "../listings/listings.repository.js";
+import env from "../../config/env.js";
 
 /**
  * The gallery is `listing_media` rows ordered by `sort_order`, with exactly one
@@ -52,7 +53,7 @@ export async function attachAssetToListing(
   executor
 ) {
   const asset = await queryOne(
-    "SELECT id, url, public_id FROM media_assets WHERE id = ? AND deleted_at IS NULL",
+    "SELECT id, url, public_id, source FROM media_assets WHERE id = ? AND deleted_at IS NULL",
     [Number(assetId)],
     executor
   );
@@ -69,7 +70,25 @@ export async function attachAssetToListing(
   const existingCount = Number(
     (await queryValue("SELECT COUNT(*) FROM listing_media WHERE listing_id = ?", [Number(listingId)], executor)) || 0
   );
-  const shouldBeCover = isCover === true || (isCover === null && existingCount === 0);
+  let shouldBeCover = isCover === true || (isCover === null && existingCount === 0);
+  // Seed rows make existingCount nonzero even before the owner uploads any photographs.
+  // In that case the first actual upload used to leave the seeded cover in place forever.
+  // An explicit choice or an existing real cover must still win.
+  if (isCover === null && existingCount > 0 && mediaType === "image" && asset.source === "upload") {
+    const current = await queryOne(
+      `SELECT url FROM listing_media
+        WHERE listing_id = ? AND media_type = 'image' AND is_public = 1
+        ORDER BY is_cover DESC, sort_order ASC, id ASC LIMIT 1`,
+      [Number(listingId)],
+      executor
+    );
+    let seeded = false;
+    try {
+      const url = new URL(current?.url);
+      seeded = ["http:", "https:"].includes(url.protocol) && url.hostname === env.MEDIA_LEGACY_CDN_HOST;
+    } catch { /* A relative URL is not a legacy CDN URL. */ }
+    shouldBeCover = !current || seeded;
+  }
 
   if (shouldBeCover) {
     await execute("UPDATE listing_media SET is_cover = 0 WHERE listing_id = ?", [Number(listingId)], executor);

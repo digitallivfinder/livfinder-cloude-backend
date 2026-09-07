@@ -6,6 +6,7 @@ import { scrub } from "../../src/modules/system/audit.service.js";
 import { AppError } from "../../src/utils/errors.js";
 import { isOriginAllowed } from "../../src/middleware/security.js";
 import { rewriteLegacyMediaUrls } from "../../src/middleware/legacyMedia.js";
+import env from "../../src/config/env.js";
 import { renderPlaceholder } from "../../src/modules/media/placeholder.js";
 import { inClause } from "../../src/db/query.js";
 import { toAdminPermissions, adminPermissionUniverse } from "../../src/modules/auth/adminPermissions.js";
@@ -268,8 +269,8 @@ describe("legacy CDN image rewriting", () => {
     expect(out.data[1].logoUrl).toMatch(/\/media\/placeholder\/organizations\/omniyat\.svg$/);
     // A lookalike host is not the CDN and must not be rewritten.
     expect(out.data[1].website).toBe("https://cdn.livfinder.com.evil/x.jpg");
-    // Real stored media is untouched.
-    expect(out.cover.url).toBe("http://localhost:4100/media/listings/imported/yachts/real.jpg");
+    // The stored key is retained while a development origin follows the local storage config.
+    expect(out.cover.url).toBe(`${env.STORAGE_PUBLIC_BASE_URL.replace(/\/+$/, "")}/listings/imported/yachts/real.jpg`);
     expect(out.count).toBe(2);
     expect(out.nothing).toBeNull();
   });

@@ -12,6 +12,7 @@
  * rewrites to that instead; the stand-in only appears when nothing is configured.
  */
 import env from "../config/env.js";
+import { publicMediaUrl } from "../utils/publicMediaUrl.js";
 
 const legacyPrefix = `https://${env.MEDIA_LEGACY_CDN_HOST}/`;
 const legacyPrefixInsecure = `http://${env.MEDIA_LEGACY_CDN_HOST}/`;
@@ -39,6 +40,11 @@ const isLegacy = (value) =>
  */
 function rewrite(value) {
   if (isLegacy(value)) return replacementFor(value);
+  // Actual uploads restored from a local database may still carry a loopback origin.
+  // Only local-driver media is relocated; switching storage drivers requires a real migration.
+  if (typeof value === "string" && env.STORAGE_DRIVER === "local") {
+    return publicMediaUrl(value, env.STORAGE_PUBLIC_BASE_URL);
+  }
 
   if (Array.isArray(value)) {
     let changed = false;
