@@ -489,3 +489,13 @@ WHERE r.code IN ('support','analyst') AND p.code IN ('leads.export');
 --   SELECT 'listings.cars.view' AS code
 --    WHERE NOT EXISTS (SELECT 1 FROM permissions WHERE code = 'listings.cars.view');
 -- =============================================================================
+
+-- Record the migration.
+--
+-- Every other file in this directory ends with this line; these five did not, so the five
+-- changes they make were applied to the database while `schema_migrations` went on reporting
+-- the schema as five versions older than it is. Anything that reads the ledger to decide what
+-- to run — a deployment, a restore, a new environment — would conclude these were outstanding.
+-- Idempotent, so re-applying the file re-asserts the row rather than failing on it.
+INSERT INTO schema_migrations (version, name) VALUES ('0031', 'admin_permission_catalog')
+  ON DUPLICATE KEY UPDATE applied_at = applied_at;

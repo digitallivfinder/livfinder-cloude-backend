@@ -118,3 +118,13 @@ VALUES
   ('admin_payment', 'methods',      NULL, 'json', 'Payment methods',        'Which methods customers may use.', 0, 0),
   ('admin_payment', 'notifications', NULL, 'json', 'Payment notifications', 'Which payment events notify whom.', 0, 0),
   ('admin_payment', 'failures',     NULL, 'json', 'Failed payments',        'Retry schedule, grace period and dunning.', 0, 0);
+
+-- Record the migration.
+--
+-- Every other file in this directory ends with this line; these five did not, so the five
+-- changes they make were applied to the database while `schema_migrations` went on reporting
+-- the schema as five versions older than it is. Anything that reads the ledger to decide what
+-- to run — a deployment, a restore, a new environment — would conclude these were outstanding.
+-- Idempotent, so re-applying the file re-asserts the row rather than failing on it.
+INSERT INTO schema_migrations (version, name) VALUES ('0030', 'backend_integration')
+  ON DUPLICATE KEY UPDATE applied_at = applied_at;

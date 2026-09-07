@@ -88,6 +88,10 @@ router.get(
   asyncHandler(async (req, res) => {
     const rows = await searchRepo.countryFacets(q(req), { limit: req.query.limit ?? 12 });
     const data = rows.map((row) => ({
+      // The entity id the filter engine addresses a location by. The header row is a location
+      // filter like any other, so selecting a country has to be expressible as `country:1231`
+      // and not only as a slug — a slug alone cannot say which tier it names.
+      id: `country:${row.id}`,
       slug: row.slug,
       name: row.name,
       listingCount: Number(row.count) || 0,
@@ -120,6 +124,7 @@ router.get(
           resolvedCountry = row.slug;
           if (!data.some((entry) => entry.slug === row.slug)) {
             data.push({
+              id: `country:${own.id}`,
               slug: own.slug,
               name: own.name,
               listingCount: Number(own.count) || 0,

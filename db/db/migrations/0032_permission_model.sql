@@ -433,3 +433,13 @@ INSERT IGNORE INTO `role_permissions` (`role_id`,`permission_id`)
 SELECT r.`id`, p.`id` FROM `roles` r JOIN `permissions` p
  WHERE r.`code` = 'analyst'
    AND (p.`action` IN ('view','export') AND p.`code` <> 'settings.view');
+
+-- Record the migration.
+--
+-- Every other file in this directory ends with this line; these five did not, so the five
+-- changes they make were applied to the database while `schema_migrations` went on reporting
+-- the schema as five versions older than it is. Anything that reads the ledger to decide what
+-- to run — a deployment, a restore, a new environment — would conclude these were outstanding.
+-- Idempotent, so re-applying the file re-asserts the row rather than failing on it.
+INSERT INTO schema_migrations (version, name) VALUES ('0032', 'permission_model')
+  ON DUPLICATE KEY UPDATE applied_at = applied_at;

@@ -351,7 +351,8 @@ export async function countryFacets(rawFilters = {}, { limit = 12 } = {}) {
   // and this is a clamped integer, never caller text.
   const bounded = Math.min(Math.max(Number.parseInt(limit, 10) || 12, 1), 60);
   return query(
-    `SELECT co.slug AS slug,
+    `SELECT co.id AS id,
+            co.slug AS slug,
             co.name AS name,
             COUNT(*) AS count,
             SUBSTRING_INDEX(
