@@ -1945,10 +1945,10 @@ async function writeMedia({ projectId, payload }, connection) {
     }
     // The card reads `cover_image_url`; keeping it in step with the primary
     // gallery image is what stops a project publishing with a blank tile.
-    if (role === "gallery" && entries.length) {
+    if (role === "gallery") {
       const primary = entries.find((entry) => entry.isPrimary) || entries[0];
-      const asset = await resolveMediaAsset(primary.mediaAssetId, connection);
-      await execute("UPDATE projects SET cover_image_url = ? WHERE id = ?", [asset.url, projectId], connection);
+      const asset = primary ? await resolveMediaAsset(primary.mediaAssetId, connection) : null;
+      await execute("UPDATE projects SET cover_image_url = ? WHERE id = ?", [asset?.url ?? null, projectId], connection);
     }
   }
 
