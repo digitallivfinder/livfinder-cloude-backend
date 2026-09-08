@@ -17,6 +17,7 @@
     "seed:dev-passwords": "node scripts/seed-dev-passwords.js",
     "import:frontend-media": "node scripts/import-frontend-media.js",
     "media:projects": "node scripts/attach-project-media.js",
+    "media:project-presentation": "node scripts/install-project-presentation-images.js",
     "backfill:canonical-paths": "node scripts/backfill-canonical-paths.js",
     "smoke": "node scripts/smoke-test.js",
     "cleanup:test-artifacts": "node scripts/cleanup-test-artifacts.js",
