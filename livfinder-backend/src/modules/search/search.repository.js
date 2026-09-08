@@ -103,6 +103,9 @@ export function brandKindForCategory(category) {
 }
 
 async function resolveBrand(filters, conditions, params) {
+  const modelSlug = filters.model
+    ? String(filters.model).replace(/^model:[^:]*:/, "").replace(/^(model|collection):/, "")
+    : null;
   if (filters.make) {
     const slug = String(filters.make).replace(/^(make|brand|manufacturer):/, "");
     // `brands` has `is_active` and `deleted_at`; it has no `status` column at all, so
@@ -119,8 +122,7 @@ async function resolveBrand(filters, conditions, params) {
     conditions.push("ls.brand_id = ?");
     params.push(brandId);
 
-    if (filters.model) {
-      const modelSlug = String(filters.model).replace(/^model:[^:]*:/, "").replace(/^(model|collection):/, "");
+    if (modelSlug) {
       // `brand_models` has `is_active` but no `deleted_at`.
       const modelId = await queryValue(
         `SELECT id FROM brand_models WHERE brand_id = ? AND slug = ? AND is_active = 1 LIMIT 1`,
@@ -130,6 +132,24 @@ async function resolveBrand(filters, conditions, params) {
       conditions.push("ls.brand_model_id = ?");
       params.push(modelId);
     }
+  } else if (modelSlug) {
+    // A standalone model must never degrade to an unfiltered catalogue search.
+    // Resolve it only when it is unique within this marketplace; an unknown or
+    // ambiguous slug is an impossible search and therefore returns zero rows.
+    const kind = brandKindForCategory(filters.listingType);
+    if (!kind) return { unresolved: "model" };
+    const matches = await query(
+      `SELECT bm.id, bm.brand_id
+         FROM brand_models bm
+         JOIN brands b ON b.id = bm.brand_id
+        WHERE bm.slug = ? AND bm.is_active = 1
+          AND b.kind = ? AND b.is_active = 1 AND b.deleted_at IS NULL
+        LIMIT 2`,
+      [modelSlug, kind]
+    );
+    if (matches.length !== 1) return { unresolved: "model" };
+    conditions.push("ls.brand_id = ?", "ls.brand_model_id = ?");
+    params.push(matches[0].brand_id, matches[0].id);
   }
   return { unresolved: null };
 }
