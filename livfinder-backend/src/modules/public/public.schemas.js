@@ -54,10 +54,21 @@ export const listingSearchQuery = z
     pageSize: z.coerce.number().int().min(1).max(100).optional(),
     cursor: z.coerce.number().int().min(0).max(100000).optional(),
   })
-  // The category-specific range and facet keys are many and change with the
-  // filter registry; they are validated by type in normalizeSearchInput rather
-  // than enumerated twice.
-  .catchall(z.union([z.string(), z.array(z.string())]).optional());
+  /**
+   * The category-specific range and facet keys are many and change with the filter registry,
+   * so they are validated by type here rather than enumerated twice.
+   *
+   * String-only, deliberately. This accepted arrays, and `normalizeSearchInput` reads these
+   * keys with `cleanString`, which returns null for anything that is not a string — so a
+   * repeated facet silently *dropped its own filter* instead of being rejected:
+   * `?furnishing=furnished&furnishing=unfurnished` answered with the entire catalogue, and so
+   * did `completionStatus` and `ownershipType`. Every key the schema names above already
+   * rejects a repeat with a 422; these now do the same.
+   *
+   * The four keys that are genuinely repeatable — `location`, `bedrooms`/`beds`,
+   * `bathrooms`/`baths` — are declared explicitly above and are unaffected by this.
+   */
+  .catchall(optionalString(120));
 
 export const slugParam = z.object({ slug: z.string().trim().min(1).max(280) });
 export const referenceParam = z.object({ reference: z.string().trim().min(1).max(64) });

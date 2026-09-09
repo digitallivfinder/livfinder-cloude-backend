@@ -273,13 +273,26 @@ describe("seeded CDN imagery", () => {
     }
   });
 
-  it("serves a placeholder image for a rewritten path", async () => {
+  it("serves an image for every photo it advertises", async () => {
     const listings = await api.get("/v1/public/agents", { pageSize: 5 });
     const photo = (listings.body.data || []).map((agent) => agent.photo).find(Boolean);
     expect(photo).toBeTruthy();
 
     const url = new URL(photo);
     const image = await api.get(url.pathname);
+    expect(image.status).toBe(200);
+    /**
+     * An image, whichever kind. This asserted `image/svg+xml`, which only held while every
+     * agent fell through to a generated placeholder; agents that have a real photograph serve
+     * a JPEG, and the assertion turned the improvement into a failure. What matters here is
+     * that a path the API hands out actually resolves to an image.
+     */
+    expect(String(image.headers["content-type"])).toMatch(/^image\//);
+  });
+
+  it("still generates a placeholder for a subject with no image of its own", async () => {
+    // Organization logos have no files behind them, so they exercise the generated path.
+    const image = await api.get("/media/placeholder/logos/sovereign-estates.svg");
     expect(image.status).toBe(200);
     expect(String(image.headers["content-type"])).toContain("image/svg+xml");
   });

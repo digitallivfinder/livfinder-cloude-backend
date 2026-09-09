@@ -154,6 +154,14 @@ if [ "$COMMAND" = "seed" ] || [ "$COMMAND" = "all" ]; then
   for file in "$DB_DIR"/seeds/*.sql; do
     apply "$file" || failed=1
   done
+
+  # `051_demo_seed_images.sql` writes `/media/seed/...` paths; the files those name travel with
+  # the seeds and have to be copied into the API's storage directory, which is not in version
+  # control. Without this the demo catalogue seeds correctly and renders grey placeholders.
+  if [ -x "$DB_DIR/tools/install-seed-media.sh" ]; then
+    echo "Installing seed media…"
+    "$DB_DIR/tools/install-seed-media.sh" || failed=1
+  fi
 fi
 
 if [ "$COMMAND" = "all" ]; then

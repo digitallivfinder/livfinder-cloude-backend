@@ -714,6 +714,10 @@ export async function getAdminDevelopment(identifier) {
     mimeType: item.mime_type,
   });
 
+  const bedroomCounts = unitTypes
+    .map((item) => int(item.bedrooms))
+    .filter((value) => value !== null && value !== undefined);
+
   return {
     ...serializeAdminDevelopment(row),
     description: {
@@ -750,11 +754,16 @@ export async function getAdminDevelopment(identifier) {
     amenities: amenities.length ? amenities.map((item) => item.label) : (Array.isArray(jsonAmenities) ? jsonAmenities : []),
     amenityRecords: amenities.map((item) => ({ slug: item.slug, label: item.label, category: item.category })),
     propertyTypes: [...new Set(unitTypes.map((item) => item.unit_type))],
-    bedroomRange: unitTypes.length
-      ? {
-          min: Math.min(...unitTypes.map((item) => int(item.bedrooms) ?? 0)),
-          max: Math.max(...unitTypes.map((item) => int(item.bedrooms) ?? 0)),
-        }
+    /**
+     * Only the unit types that actually state a bedroom count.
+     *
+     * `?? 0` counted a bedroom-less unit type — an office, a plot, a whole building — as a
+     * zero-bedroom home, so a development selling 8-bedroom villas alongside retail reported a
+     * range starting at 0. A missing bedroom count is not a studio; the range is null when no
+     * unit type declares one.
+     */
+    bedroomRange: bedroomCounts.length
+      ? { min: Math.min(...bedroomCounts), max: Math.max(...bedroomCounts) }
       : null,
     unitTypes: unitTypes.map((item) => ({
       id: item.public_id,

@@ -218,6 +218,17 @@ export async function listAccountListings({
     if (rootId) {
       conditions.push("l.root_category_id = ?");
       params.push(rootId);
+    } else {
+      /**
+       * A category the catalogue does not know matches nothing.
+       *
+       * This used to add no condition at all, so an unrecognised slug returned the account's
+       * entire inventory as though no category had been asked for. The portal ships a
+       * `real-estate-developments` category whose slug no listing category answers to, so its
+       * page listed the owner's ordinary apartments and villas under "Developments" — wrong
+       * records, presented as the thing they are not. An empty result is the honest answer.
+       */
+      conditions.push("1 = 0");
     }
   }
   if (agentId) {

@@ -64,11 +64,35 @@ export function renderPlaceholder(pathname, { width = 800, height = 600 } = {}) 
   const h = square ? 512 : height;
 
   let foreground = "";
-  if (kind === "initials" || kind === "monogram") {
-    const text = kind === "initials" ? initialsFrom(label) : (label[0] || "L").toUpperCase();
+  if (kind === "initials") {
+    const text = initialsFrom(label);
     foreground = `<text x="50%" y="50%" dy="0.35em" text-anchor="middle"
         font-family="Georgia, 'Times New Roman', serif" font-size="${square ? 200 : 160}"
         fill="#ffffff" fill-opacity="0.9" letter-spacing="6">${escapeXml(text)}</text>`;
+  } else if (kind === "monogram") {
+    /**
+     * A company gets a mark, not a letter.
+     *
+     * This drew the first character of the name at 200px and nothing else, so an agency read as
+     * a bordered box with a stray "R" in it — the shape of a broken image rather than of a
+     * brand. A logo is the emblem plus the monogram: a ruled frame, both initials, and a rule
+     * under them. It is still generated and still deterministic, so a company keeps the same
+     * mark everywhere it appears, but it reads as something a designer placed there.
+     *
+     * The frame is inset from the edge because these are drawn into small, already-bordered
+     * boxes on the cards; a mark that ran to the edge would fight the container.
+     */
+    const text = initialsFrom(label);
+    const inset = w * 0.14;
+    const side = w - inset * 2;
+    foreground = `
+      <rect x="${inset}" y="${inset}" width="${side}" height="${side}" rx="${w * 0.04}"
+            fill="none" stroke="#ffffff" stroke-opacity="0.34" stroke-width="${w * 0.012}"/>
+      <text x="50%" y="47%" dy="0.35em" text-anchor="middle"
+            font-family="Georgia, 'Times New Roman', serif" font-size="${w * 0.30}"
+            fill="#ffffff" fill-opacity="0.95" letter-spacing="${w * 0.02}">${escapeXml(text)}</text>
+      <rect x="${w * 0.40}" y="${h * 0.645}" width="${w * 0.20}" height="${w * 0.011}"
+            fill="#ffffff" fill-opacity="0.5"/>`;
   } else {
     // A horizon line and a soft disc: enough shape to read as a photograph slot, not a texture.
     foreground = `

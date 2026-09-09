@@ -45,7 +45,15 @@ publicRouter.get(
     const pathname = (Array.isArray(raw) ? raw : String(raw).split("/"))
       .map((segment) => decodeURIComponent(segment))
       .join("/");
-    res.setHeader("Cache-Control", "public, max-age=86400");
+    /**
+     * Short-lived, and revalidated after that.
+     *
+     * These are generated, not uploaded: the bytes change whenever the mark's design changes,
+     * and at a day's `max-age` every browser that had seen the old one kept serving it for a
+     * day afterwards — a redesign looked like it had not shipped. An hour, then an ETag check,
+     * costs almost nothing for an SVG this small and keeps the rendered mark honest.
+     */
+    res.setHeader("Cache-Control", "public, max-age=3600, must-revalidate");
     res.type("image/svg+xml");
     return res.send(renderPlaceholder(pathname));
   }

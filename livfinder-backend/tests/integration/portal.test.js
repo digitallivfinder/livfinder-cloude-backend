@@ -334,8 +334,19 @@ describe("listing media", () => {
     expect(after.body.data.map((item) => item.id)).toEqual(reversed);
     expect(after.body.data[0].isCover).toBe(true);
 
+    /**
+     * Compared against what is stored, not against what is served.
+     *
+     * Media URLs are held as root-relative `/media/...` paths so the same row serves correctly
+     * from any host — `publicMediaUrl` resolves them against `STORAGE_PUBLIC_BASE_URL` on the
+     * way out. The response therefore carries an absolute URL while the column holds the
+     * relative one, and comparing the two directly only passed while every seeded URL happened
+     * to be absolute. The invariant worth asserting is that the cover points at the same stored
+     * object as the first image.
+     */
     const row = await queryOne("SELECT cover_image_url FROM listings WHERE public_id = ?", [listingId]);
-    expect(row.cover_image_url).toBe(after.body.data[0].url);
+    const cover = await queryOne("SELECT url FROM listing_media WHERE id = ?", [after.body.data[0].id]);
+    expect(row.cover_image_url).toBe(cover.url);
   });
 
   it("refuses a reorder that references media from another listing", async () => {

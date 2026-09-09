@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512"
+     role="img" aria-label="Agency logo">
+  <title>Agency logo</title>
+  <defs>
+    <linearGradient id="lf-ground" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f2b4d"/>
+      <stop offset="100%" stop-color="#1a4471"/>
+    </linearGradient>
+    <linearGradient id="lf-mark" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#efd7a4"/>
+      <stop offset="100%" stop-color="#c9a25c"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="104" fill="url(#lf-ground)"/>
+  <g fill="url(#lf-mark)">
+    <path d="M256 116 L400 240 h-52 L256 176 164 240 h-52 Z"/>
+    <rect x="196" y="262" width="42" height="106" rx="7"/>
+    <rect x="274" y="262" width="42" height="106" rx="7"/>
+    <rect x="160" y="386" width="192" height="18" rx="9"/>
+  </g>
+</svg>

@@ -24,6 +24,8 @@
 --
 -- Two deliberate narrowings:
 --
+--   * Sizes are square feet, because that is the unit the listing projection filters on and
+--     the projects API compares the request value to the column as-is.
 --   * Bedrooms are carried across for residential types only. The demo listings
 --     assign bedrooms regardless of category — there are offices with eight and
 --     plots with five — and copying that into `bedroom_values` would make the
@@ -71,8 +73,13 @@ SELECT
   d.bathrooms,
   d.min_size,
   d.max_size,
-  -- `listing_real_estate.built_area_sqm` is the source, so the sizes are square metres.
-  (SELECT id FROM measurement_units WHERE code = 'sqm'),
+  -- Square feet, to match the listing side.
+  --
+  -- `listing_search.spec_c` — what `areaMin`/`areaMax` filter listings on — holds sqft, and
+  -- `projects.repository` compares `ps.area_min` to the same request value with no unit
+  -- conversion. Sizing these rows in square metres would have made one area range mean two
+  -- different things across the shared Real Estate result stream, off by a factor of ten.
+  (SELECT id FROM measurement_units WHERE code = 'sqft'),
   d.starting_price,
   d.max_price,
   d.currency_code,
@@ -85,8 +92,8 @@ FROM (
     CASE WHEN m.is_residential = 1 AND re.bedrooms > 0 THEN re.bedrooms END AS bedrooms,
     MIN(l.category_id) AS category_id,
     ROUND(AVG(re.bathrooms), 1) AS bathrooms,
-    MIN(re.built_area_sqm) AS min_size,
-    MAX(re.built_area_sqm) AS max_size,
+    MIN(re.built_area_sqft) AS min_size,
+    MAX(re.built_area_sqft) AS max_size,
     MIN(l.price) AS starting_price,
     MAX(l.price) AS max_price,
     MIN(l.currency_code) AS currency_code,
