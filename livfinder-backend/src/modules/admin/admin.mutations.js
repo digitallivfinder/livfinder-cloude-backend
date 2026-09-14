@@ -5,7 +5,7 @@ import { AppError } from "../../utils/errors.js";
 import { ulid } from "../../utils/ids.js";
 import { slugify } from "../../utils/slug.js";
 import { resolveCategory } from "../../utils/categories.js";
-import { changeListingStatus, softDeleteListing } from "../listings/listings.service.js";
+import { changeListingStatus, softDeleteListing, syncAccountListingUsageForListing } from "../listings/listings.service.js";
 import { refreshListingSearch, recordStatusChange } from "../listings/listings.repository.js";
 import { htmlToBlocks } from "../../serializers/editorial.js";
 import { callProcedure } from "../../db/query.js";
@@ -60,6 +60,8 @@ export async function moderateListing({ identifier, decision, reason, note, user
         { listingId: listing.id, fromStatus: listing.status, toStatus: "active", userId, reason: note || "approved" },
         connection
       );
+      // Approving e.g. an archived listing takes an allowance slot again.
+      await syncAccountListingUsageForListing(listing.id, connection);
       await execute(
         "UPDATE moderation_queue SET status = 'approved', reviewed_by_user_id = ?, reviewed_at = NOW(3), decision_note = ? WHERE subject_type = 'listing' AND subject_id = ? AND status = 'pending'",
         [userId, note || null, listing.id],
@@ -85,6 +87,7 @@ export async function moderateListing({ identifier, decision, reason, note, user
         { listingId: listing.id, fromStatus: listing.status, toStatus: "rejected", userId, reason },
         connection
       );
+      await syncAccountListingUsageForListing(listing.id, connection);
       await execute(
         "UPDATE moderation_queue SET status = 'rejected', reviewed_by_user_id = ?, reviewed_at = NOW(3), decision_note = ? WHERE subject_type = 'listing' AND subject_id = ? AND status = 'pending'",
         [userId, reason, listing.id],
@@ -376,73 +379,137 @@ export const categoryAccessSchema = z.object({
   listingQuota: z.coerce.number().int().min(0).max(100000).optional().nullable(),
 });
 
-export async function decideCategoryAccess({ organizationPublicId, categoryId, decision, note, listingQuota, userId }) {
+/**
+ * Grant, reject or revoke a category for one account — a company or an
+ * individual. The caller resolves `accountId` from an organisation public id or
+ * a user public id; every category (Real Estate Developments included) is a row
+ * in `account_category_access`.
+ */
+async function resolveAccountId({ accountId, organizationPublicId, userPublicId }) {
+  if (accountId) return Number(accountId);
+  if (organizationPublicId) {
+    return queryValue("SELECT account_id FROM organizations WHERE public_id = ? AND deleted_at IS NULL LIMIT 1", [organizationPublicId]);
+  }
+  if (userPublicId) {
+    return queryValue(
+      `SELECT am.account_id
+         FROM users u
+         JOIN account_members am ON am.user_id = u.id AND am.role = 'owner' AND am.status = 'active'
+        WHERE u.public_id = ? AND u.deleted_at IS NULL
+        LIMIT 1`,
+      [userPublicId]
+    );
+  }
+  return null;
+}
+
+export async function decideCategoryAccess({ accountId, organizationPublicId, userPublicId, categoryId, decision, note, listingQuota, userId }) {
+  const resolvedAccountId = await resolveAccountId({ accountId, organizationPublicId, userPublicId });
+  if (!resolvedAccountId) throw AppError.notFound("That account was not found.");
+  accountId = resolvedAccountId;
   const definition = resolveCategory(categoryId);
   if (!definition) throw AppError.validation("Some information is invalid.", { categoryId: "Unknown category." });
-  const organization = await queryOne("SELECT id, public_id FROM organizations WHERE public_id = ? LIMIT 1", [organizationPublicId]);
-  if (!organization) throw AppError.notFound("That company was not found.");
 
   const status = decision === "approve" ? "approved" : decision === "reject" ? "rejected" : "revoked";
   const result = await execute(
-    `UPDATE organization_category_access oca
-       JOIN categories c ON c.id = oca.category_id
-        SET oca.status = ?, oca.reviewed_at = NOW(3), oca.reviewed_by_user_id = ?,
-            oca.notes = ?, oca.listing_quota = COALESCE(?, oca.listing_quota)
-      WHERE oca.organization_id = ? AND COALESCE(c.root_category_id, c.id) = ?`,
-    [status, userId, note || null, listingQuota ?? null, organization.id, definition.rootId]
+    `UPDATE account_category_access aca
+       JOIN categories c ON c.id = aca.category_id
+        SET aca.status = ?, aca.reviewed_at = NOW(3), aca.reviewed_by_user_id = ?,
+            aca.notes = ?, aca.listing_quota = COALESCE(?, aca.listing_quota)
+      WHERE aca.account_id = ? AND COALESCE(c.root_category_id, c.id) = ?`,
+    [status, userId, note || null, listingQuota ?? null, accountId, definition.rootId]
   );
   if (!result.affectedRows) {
     await execute(
-      `INSERT INTO organization_category_access
-         (organization_id, category_id, status, listing_quota, listing_used, requested_at,
+      `INSERT INTO account_category_access
+         (account_id, category_id, status, listing_quota, listing_used, requested_at,
           reviewed_at, reviewed_by_user_id, notes, created_at)
        VALUES (?, ?, ?, ?, 0, NOW(3), NOW(3), ?, ?, NOW(3))`,
-      [organization.id, definition.rootId, status, listingQuota ?? null, userId, note || null]
+      [accountId, definition.rootId, status, listingQuota ?? null, userId, note || null]
     );
   }
-  return { organizationId: organization.public_id, categoryId: definition.frontendId, status };
+  return { accountId: String(accountId), categoryId: definition.frontendId, status };
 }
 
 /* -------------------------------------------------------------------------- */
 /* Leads                                                                       */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The admin Leads screen speaks a pipeline vocabulary (new / qualified / follow-up / viewing /
+ * closed / lost); the table stores a coarse `status` plus a stage. Both are accepted here: a
+ * screen value becomes the status + stage the Leads summary counts it under (admin.crm.js
+ * leadSummary), so the tab a lead is moved to is the tab it then appears in.
+ */
+const SCREEN_LEAD_STATUS = {
+  new: { status: "open", stageType: "new" },
+  qualified: { status: "open", stageType: "qualified" },
+  "follow-up": { status: "open", stageType: "contacted" },
+  viewing: { status: "open", stageType: "proposal" },
+  closed: { status: "won", stageType: "won" },
+  lost: { status: "lost", stageType: "lost" },
+};
+
 export const leadUpdateSchema = z.object({
-  status: z.enum(["open", "won", "lost", "disqualified", "archived"]).optional(),
+  status: z
+    .enum(["open", "won", "lost", "disqualified", "archived", "new", "qualified", "follow-up", "viewing", "closed"])
+    .optional(),
   stageId: z.coerce.number().int().positive().optional(),
   ownerAgentId: z.string().max(64).nullable().optional(),
-  priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
+  // The edit drawer offered "medium"; the column's word for it is "normal".
+  priority: z
+    .enum(["low", "normal", "medium", "high", "urgent"])
+    .transform((value) => (value === "medium" ? "normal" : value))
+    .optional(),
   note: z.string().trim().max(2000).optional(),
 });
 
 export async function updateAdminLead({ identifier, payload, userId }) {
   const lead = await queryOne(
-    "SELECT id, public_id, stage_id, status, organization_id, contact_id FROM leads WHERE (public_id = ? OR reference = ?) AND deleted_at IS NULL",
+    `SELECT id, public_id, pipeline_id, stage_id, stage_type, status, organization_id, contact_id, primary_listing_id
+       FROM leads WHERE (public_id = ? OR reference = ?) AND deleted_at IS NULL`,
     [identifier, identifier]
   );
   if (!lead) throw AppError.notFound("That lead was not found.");
 
+  const screen = SCREEN_LEAD_STATUS[payload.status];
+  const status = screen ? screen.status : payload.status;
+
   await withTransaction(async (connection) => {
     const assignments = ["last_activity_at = NOW(3)"];
     const params = [];
-    if (payload.status) {
+    if (status) {
       assignments.push("status = ?");
-      params.push(payload.status);
-      if (payload.status !== "open") assignments.push("closed_at = NOW(3)");
+      params.push(status);
+      assignments.push(status === "open" ? "closed_at = NULL" : "closed_at = COALESCE(closed_at, NOW(3))");
     }
     if (payload.priority) {
       assignments.push("priority = ?");
       params.push(payload.priority);
     }
-    if (payload.stageId && payload.stageId !== lead.stage_id) {
-      const stage = await queryOne("SELECT id, stage_type FROM lead_pipeline_stages WHERE id = ?", [payload.stageId], connection);
+    let stage = null;
+    if (payload.stageId) {
+      stage = await queryOne("SELECT id, stage_type FROM lead_pipeline_stages WHERE id = ?", [payload.stageId], connection);
       if (!stage) throw AppError.validation("Some information is invalid.", { stageId: "Unknown stage." });
+    } else if (screen) {
+      stage = await queryOne(
+        `SELECT id, stage_type FROM lead_pipeline_stages
+          WHERE stage_type = ? AND is_active = 1 AND (pipeline_id = ? OR ? IS NULL)
+          ORDER BY pipeline_id = ? DESC, sort_order ASC LIMIT 1`,
+        [screen.stageType, lead.pipeline_id, lead.pipeline_id, lead.pipeline_id],
+        connection
+      );
+    }
+    if (stage && stage.id !== lead.stage_id) {
       assignments.push("stage_id = ?", "stage_type = ?", "stage_entered_at = NOW(3)");
       params.push(stage.id, stage.stage_type);
+      // Real columns are `reason` / `created_at` (+ the from/to stage types); this used to write
+      // `note` / `changed_at`, which do not exist, so every stage change from the admin 500'd.
       await execute(
-        `INSERT INTO lead_stage_history (lead_id, from_stage_id, to_stage_id, changed_by_user_id, note, changed_at)
-         VALUES (?, ?, ?, ?, ?, NOW(3))`,
-        [lead.id, lead.stage_id, stage.id, userId, payload.note || null],
+        `INSERT INTO lead_stage_history
+           (lead_id, from_stage_id, to_stage_id, from_stage_type, to_stage_type, changed_by_user_id, changed_by, reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'user', ?, NOW(3))`,
+        [lead.id, lead.stage_id, stage.id, lead.stage_type, stage.stage_type, userId, payload.note ? payload.note.slice(0, 300) : null],
         connection
       );
     }
@@ -459,11 +526,15 @@ export async function updateAdminLead({ identifier, payload, userId }) {
     await execute(`UPDATE leads SET ${assignments.join(", ")} WHERE id = ?`, [...params, lead.id], connection);
 
     if (payload.note) {
+      // `activities` needs its polymorphic subject and uses `subject_line` / `user_id`; this wrote
+      // `subject` / `created_by_user_id` (neither exists) and no subject, so every admin note 500'd.
       await execute(
-        `INSERT INTO activities (public_id, organization_id, lead_id, contact_id, activity_type, subject,
-                                 body, created_by_user_id, occurred_at, created_at)
-         VALUES (?, ?, ?, ?, 'note', 'Admin note', ?, ?, NOW(3), NOW(3))`,
-        [ulid(), lead.organization_id, lead.id, lead.contact_id, payload.note, userId],
+        `INSERT INTO activities
+           (public_id, organization_id, subject_type, subject_id, lead_id, contact_id,
+            activity_type, direction, subject_line, body, user_id, occurred_at, created_at, updated_at)
+         VALUES (?, COALESCE(?, (SELECT organization_id FROM listings WHERE id = ?)), 'lead', ?, ?, ?,
+                 'note', 'internal', 'Admin note', ?, ?, NOW(3), NOW(3), NOW(3))`,
+        [ulid(), lead.organization_id, lead.primary_listing_id, lead.id, lead.id, lead.contact_id, payload.note, userId],
         connection
       );
     }
@@ -1625,6 +1696,8 @@ const mediaRefSchema = z.object({
 
 const floorPlanSchema = z.object({
   name: z.string().trim().min(1).max(160),
+  unitType: z.string().trim().max(80).optional().nullable(),
+  bedrooms: z.coerce.number().int().min(0).max(50).optional().nullable(),
   mediaAssetId: z.string().trim().max(64).optional().nullable(),
   floorLevel: z.coerce.number().int().min(-20).max(300).optional().nullable(),
   areaSqm: z.coerce.number().min(0).max(1e7).optional().nullable(),
@@ -1658,6 +1731,9 @@ export const developmentSchema = z.object({
   status: enumIn(DEVELOPMENT_LIFECYCLE, "Development status").optional(),
   launchStatus: enumIn(DEVELOPMENT_LAUNCH, "Launch status").optional(),
   moderationStatus: enumIn(DEVELOPMENT_MODERATION, "Moderation status").optional(),
+  // Set alongside `moderationStatus: "rejected"`; cleared automatically in
+  // `upsertDevelopment` once the moderation status moves away from "rejected".
+  rejectionReason: z.string().trim().max(500).optional().nullable(),
 
   launchDate: nullableDate,
   constructionStartDate: nullableDate,
@@ -1681,6 +1757,16 @@ export const developmentSchema = z.object({
 
   coverImageUrl: z.string().trim().max(500).optional().nullable(),
   brochureUrl: z.string().trim().max(500).optional().nullable(),
+  // A hosted video URL (YouTube / Vimeo / a direct link). An uploaded video goes
+  // through the `video` media role instead; the two are mutually exclusive and
+  // the detail tab clears one when it sets the other. Empty string clears it.
+  videoUrl: z
+    .string()
+    .trim()
+    .max(500)
+    .optional()
+    .nullable()
+    .transform((value) => (value === undefined ? undefined : value || null)),
   amenities: z.array(z.string().trim().max(160)).max(120).optional(),
   unitTypes: z.array(unitTypeSchema).max(60).optional(),
   paymentPlans: z.array(paymentPlanSchema).max(12).optional(),
@@ -1715,6 +1801,7 @@ const DEVELOPMENT_COLUMNS = {
   status: "status",
   launchStatus: "launch_status",
   moderationStatus: "moderation_status",
+  rejectionReason: "rejection_reason",
   launchDate: "launch_date",
   constructionStartDate: "construction_start_date",
   handoverDate: "handover_date",
@@ -1735,6 +1822,7 @@ const DEVELOPMENT_COLUMNS = {
   longitude: "longitude",
   coverImageUrl: "cover_image_url",
   brochureUrl: "brochure_url",
+  videoUrl: "video_url",
   isFeatured: "is_featured",
   acceptsInquiries: "accepts_inquiries",
   isPubliclyVisible: "is_publicly_visible",
@@ -1958,12 +2046,14 @@ async function writeMedia({ projectId, payload }, connection) {
       const asset = plan.mediaAssetId ? await resolveMediaAsset(plan.mediaAssetId, connection) : null;
       await execute(
         `INSERT INTO floor_plans
-           (project_id, name, floor_level, media_asset_id, total_area_sqm, total_area_sqft,
-            is_public, requires_lead, sort_order, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+           (project_id, name, unit_type, bedrooms, floor_level, media_asset_id, total_area_sqm,
+            total_area_sqft, is_public, requires_lead, sort_order, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
         [
           projectId,
           plan.name,
+          plan.unitType ?? null,
+          plan.bedrooms ?? null,
           plan.floorLevel ?? null,
           asset?.id ?? null,
           plan.areaSqm ?? null,
@@ -2027,6 +2117,19 @@ function publicationAssignments(payload, current) {
   if (payload.moderationStatus !== undefined && payload.isPubliclyVisible === undefined) {
     assignments.push("is_publicly_visible = ?");
     params.push(nextModeration === "published" ? 1 : 0);
+  }
+  // A rejection reason belongs to one rejection. Once the moderation status
+  // moves off "rejected" — republished, restored to draft, whatever comes next
+  // — the old reason would otherwise linger and read as live. `DEVELOPMENT_COLUMNS`
+  // already writes an explicitly-sent `rejectionReason` (the Reject action always
+  // sends one); this only clears it when the caller did not.
+  if (
+    payload.moderationStatus !== undefined &&
+    nextModeration !== "rejected" &&
+    payload.rejectionReason === undefined &&
+    current?.rejection_reason
+  ) {
+    assignments.push("rejection_reason = NULL");
   }
   return { assignments, params };
 }
@@ -2108,7 +2211,7 @@ export async function upsertDevelopment({ identifier, payload, userId }) {
     let project;
     if (identifier) {
       project = await queryOne(
-        "SELECT id, public_id, slug, moderation_status, published_at FROM projects WHERE (public_id = ? OR slug = ?) AND deleted_at IS NULL LIMIT 1",
+        "SELECT id, public_id, slug, moderation_status, published_at, rejection_reason FROM projects WHERE (public_id = ? OR slug = ?) AND deleted_at IS NULL LIMIT 1",
         [identifier, identifier],
         connection
       );

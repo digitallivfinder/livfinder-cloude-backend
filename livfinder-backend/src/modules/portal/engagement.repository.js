@@ -11,6 +11,9 @@ import { PORTAL_LISTING_COLUMNS, PORTAL_LISTING_JOINS, serializePortalListing, f
  * the caller's account, their organization, or (for buyer-side features like
  * favourites) their user.
  */
+/** The spellings a caller may use for the Real Estate Developments category. */
+const DEVELOPMENT_CATEGORY_VALUES = new Set(["realEstateDevelopment", "real-estate-developments", "developments"]);
+
 function scopeClause(alias, { accountId, organizationId }) {
   const conditions = [`${alias}.account_id = ?`];
   const params = [accountId];
@@ -41,14 +44,20 @@ export async function listInquiries({ accountId, organizationId, search = "", li
     params.push(status);
   }
   if (listing !== "all") {
-    conditions.push("(l.public_id = ? OR l.reference = ?)");
-    params.push(String(listing), String(listing));
+    // A development's own detail page asks for its enquiries by the development's id.
+    conditions.push("(l.public_id = ? OR l.reference = ? OR pj.public_id = ?)");
+    params.push(String(listing), String(listing), String(listing));
   }
   if (category !== "all") {
-    const rootId = rootIdForFrontendCategory(category);
-    if (rootId) {
-      conditions.push("l.root_category_id = ?");
-      params.push(rootId);
+    if (DEVELOPMENT_CATEGORY_VALUES.has(category)) {
+      // Development enquiries carry the project, not a listing.
+      conditions.push("i.project_id IS NOT NULL");
+    } else {
+      const rootId = rootIdForFrontendCategory(category);
+      if (rootId) {
+        conditions.push("l.root_category_id = ?");
+        params.push(rootId);
+      }
     }
   }
   if (from) {
@@ -61,8 +70,8 @@ export async function listInquiries({ accountId, organizationId, search = "", li
   }
   const term = String(search || "").trim();
   if (term) {
-    conditions.push("(i.name LIKE ? OR i.email LIKE ? OR i.message LIKE ? OR l.title LIKE ? OR l.reference LIKE ?)");
-    params.push(`%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`);
+    conditions.push("(i.name LIKE ? OR i.email LIKE ? OR i.message LIKE ? OR l.title LIKE ? OR l.reference LIKE ? OR pj.name LIKE ?)");
+    params.push(`%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`);
   }
 
   const where = `WHERE ${conditions.join(" AND ")}`;
@@ -76,9 +85,12 @@ export async function listInquiries({ accountId, organizationId, search = "", li
               i.status AS entity_status, i.priority, i.channel, i.inquiry_type,
               i.created_at AS entity_created_at, i.first_response_at,
               i.assigned_to_agent_id, i.budget_min, i.budget_max, i.currency_code AS entity_currency_code,
+              pj.public_id AS project_public_id, pj.name AS project_name,
+              pj.canonical_path AS project_path, pj.is_publicly_visible AS project_visible,
               ${PORTAL_LISTING_COLUMNS.replaceAll("l.", "l.")}
          FROM inquiries i
          LEFT JOIN listings l ON l.id = i.listing_id
+         LEFT JOIN projects pj ON pj.id = i.project_id
          LEFT JOIN categories cat ON cat.id = l.category_id
          LEFT JOIN locations ct ON ct.id = l.city_id
          LEFT JOIN locations co ON co.id = l.country_id
@@ -94,7 +106,7 @@ export async function listInquiries({ accountId, organizationId, search = "", li
         ORDER BY ${orderBy} LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
-    queryValue(`SELECT COUNT(*) FROM inquiries i LEFT JOIN listings l ON l.id = i.listing_id ${where}`, params),
+    queryValue(`SELECT COUNT(*) FROM inquiries i LEFT JOIN listings l ON l.id = i.listing_id LEFT JOIN projects pj ON pj.id = i.project_id ${where}`, params),
     inquiryCounts({ accountId, organizationId }),
     query(
       `SELECT ${PORTAL_LISTING_COLUMNS} FROM listings l ${PORTAL_LISTING_JOINS}
@@ -120,6 +132,10 @@ export async function listInquiries({ accountId, organizationId, search = "", li
       relativeTime: relativeTime(row.entity_created_at),
       firstResponseAt: isoDate(row.first_response_at),
       listing: row.id ? serializePortalListing(row) : null,
+      // A development enquiry names its development (it has no listing).
+      project: row.project_public_id
+        ? { id: row.project_public_id, name: row.project_name, publicUrl: row.project_visible ? row.project_path : null }
+        : null,
       availableActions: inquiryActions(row.entity_status),
     })),
     total: Number(total || 0),
@@ -144,17 +160,33 @@ export async function inquiryCounts({ accountId, organizationId }) {
             SUM(i.status = 'new') AS new_count,
             SUM(i.status = 'contacted') AS contacted,
             SUM(i.status = 'qualified') AS qualified,
+            SUM(i.status = 'viewing_scheduled') AS viewing_scheduled,
+            SUM(i.status = 'negotiating') AS negotiating,
+            SUM(i.status = 'won') AS won,
+            SUM(i.status = 'lost') AS lost,
+            SUM(i.status = 'closed') AS closed_only,
+            SUM(i.status = 'spam') AS spam,
             SUM(i.status IN ('won','lost','closed')) AS closed
        FROM inquiries i
       WHERE ${scope.sql} AND i.deleted_at IS NULL AND i.is_spam = 0`,
     scope.params
   );
+  // One count per status the Inquiries tabs filter on. `viewing_scheduled`, `negotiating`,
+  // `won`, `lost` and `spam` used to be missing, so their tabs read "()" and six of the seeded
+  // owner's inquiries sat in no tab at all. `closed` keeps its meaning for the overview card
+  // (every finished inquiry); the Closed tab filters `status = 'closed'`, so it gets its own.
   return {
     all: int(row?.all_count) ?? 0,
     new: int(row?.new_count) ?? 0,
     contacted: int(row?.contacted) ?? 0,
     qualified: int(row?.qualified) ?? 0,
+    viewing_scheduled: int(row?.viewing_scheduled) ?? 0,
+    negotiating: int(row?.negotiating) ?? 0,
+    won: int(row?.won) ?? 0,
+    lost: int(row?.lost) ?? 0,
+    spam: int(row?.spam) ?? 0,
     closed: int(row?.closed) ?? 0,
+    closedOnly: int(row?.closed_only) ?? 0,
   };
 }
 
@@ -198,13 +230,15 @@ export async function listLeads({ accountId, organizationId, status = "all", sea
               s.name AS stage_name, src.name AS source_name,
               ag.display_name AS agent_name, ag.public_id AS agent_public_id,
               li.title AS listing_title, li.public_id AS listing_public_id,
-              li.root_category_id AS listing_root_category_id
+              li.root_category_id AS listing_root_category_id,
+              pj.name AS project_name, pj.public_id AS project_public_id
          FROM leads l
          LEFT JOIN crm_contacts c ON c.id = l.contact_id
          LEFT JOIN lead_pipeline_stages s ON s.id = l.stage_id
          LEFT JOIN lead_sources src ON src.id = l.source_id
          LEFT JOIN agents ag ON ag.id = l.owner_agent_id
          LEFT JOIN listings li ON li.id = l.primary_listing_id
+         LEFT JOIN projects pj ON pj.id = l.project_id
          ${where}
         ORDER BY l.created_at DESC LIMIT ${safeSize} OFFSET ${offset}`,
       params
@@ -222,8 +256,9 @@ export async function listLeads({ accountId, organizationId, status = "all", sea
       contactName: [row.first_name, row.last_name].filter(Boolean).join(" "),
       contactEmail: row.primary_email,
       contactPhone: row.primary_phone,
-      listingTitle: row.listing_title,
-      listingId: row.listing_public_id,
+      // A development lead's subject is the development (leads.project_id).
+      listingTitle: row.listing_title ?? row.project_name ?? null,
+      listingId: row.listing_public_id ?? row.project_public_id ?? null,
       categoryId: require_frontendCategoryId(row.listing_root_category_id ?? row.lead_root_category_id),
       assignedAgentName: row.agent_name,
       assignedAgentId: row.agent_public_id,
@@ -247,7 +282,9 @@ export async function listLeads({ accountId, organizationId, status = "all", sea
 }
 
 function require_frontendCategoryId(rootId) {
-  const map = { 1: "realEstate", 2: "car", 3: "yacht", 4: "jet", 5: "helicopter", 6: "watch" };
+  // 7: Real Estate Developments — without it a development lead had no category and the
+  // portal's Developments → Leads page filtered it out.
+  const map = { 1: "realEstate", 2: "car", 3: "yacht", 4: "jet", 5: "helicopter", 6: "watch", 7: "realEstateDevelopment" };
   return map[Number(rootId)] || null;
 }
 

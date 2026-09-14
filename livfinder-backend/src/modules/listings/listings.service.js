@@ -6,10 +6,11 @@ import { slugify } from "../../utils/slug.js";
 import { resolveCategory, categoryByRootId } from "../../utils/categories.js";
 import { buildCanonicalPath } from "../../utils/canonicalPath.js";
 import { resolveLocation } from "../locations/locations.repository.js";
+import { sanitizeDescription } from "../../utils/richText.js";
 import { DETAIL_SCHEMAS } from "./listings.schemas.js";
 import { refreshListingSearch, recordStatusChange, nextReference } from "./listings.repository.js";
 import { attachAssetToListing, syncListingMediaCounters } from "../media/listingMedia.service.js";
-import { getAssetByPublicId } from "../media/media.service.js";
+import { resolveAssetRef } from "../media/media.service.js";
 
 /**
  * A listing is never one row. Creating one writes:
@@ -50,7 +51,7 @@ const DETAIL_COLUMNS = {
     torqueNm: "torque_nm", topSpeedKmh: "top_speed_kmh", exteriorColor: "exterior_color",
     interiorColor: "interior_color", doors: "doors", seats: "seats",
     conditionType: "condition_type", steeringSide: "steering_side", vin: "vin",
-    regionalSpec: "regional_spec", ownersCount: "owners_count",
+    regionalSpec: "regional_spec", serviceHistory: "service_history", ownersCount: "owners_count",
     isAccidentFree: "is_accident_free", isLimitedEdition: "is_limited_edition",
   },
   yachts: {
@@ -96,6 +97,11 @@ const BRAND_KIND = {
   watches: "watch_brand",
 };
 
+// Jets and helicopters share `brands.kind = 'aircraft_manufacturer'`; `aircraft_segment`
+// (migration 0046) is the finer signal that stops a helicopter listing resolving to a
+// fixed-wing-only manufacturer, and vice versa.
+const AIRCRAFT_SEGMENT = { jets: "fixed_wing", helicopters: "rotorcraft" };
+
 async function resolveCategoryRow(definition, categorySlug, executor) {
   if (!categorySlug) return { categoryId: definition.rootId, rootCategoryId: definition.rootId };
   const row = await queryOne(
@@ -124,9 +130,14 @@ async function resolvePurposeId(purpose, executor) {
 async function resolveBrandAndModel({ definition, brand, model }, executor) {
   if (!brand) return { brandId: null, brandModelId: null, brandSlug: null, modelSlug: null };
   const brandSlug = slugify(String(brand).replace(/^[a-z]+:/, ""));
+  const segment = AIRCRAFT_SEGMENT[definition.listingType];
   const brandRow = await queryOne(
-    "SELECT id, slug FROM brands WHERE slug = ? AND kind = ? AND deleted_at IS NULL LIMIT 1",
-    [brandSlug, BRAND_KIND[definition.listingType]],
+    segment
+      ? "SELECT id, slug FROM brands WHERE slug = ? AND kind = ? AND aircraft_segment = ? AND deleted_at IS NULL LIMIT 1"
+      : "SELECT id, slug FROM brands WHERE slug = ? AND kind = ? AND deleted_at IS NULL LIMIT 1",
+    segment
+      ? [brandSlug, BRAND_KIND[definition.listingType], segment]
+      : [brandSlug, BRAND_KIND[definition.listingType]],
     executor
   );
   if (!brandRow) {
@@ -381,6 +392,82 @@ async function baseCurrencyAmount(price, currencyCode, executor) {
   return Number((amount / factor).toFixed(2));
 }
 
+/**
+ * Plan allowance usage.
+ *
+ * A listing occupies a slot while it is draft, pending review, live or rejected (awaiting a
+ * fix); archived, withdrawn, sold, rented, expired or deleted listings free it. Usage is
+ * recomputed from the rows on every change instead of being counted up: the old counter was
+ * only ever incremented, so nothing ever freed a slot and 47 accounts drifted — one owner read
+ * 500/500 "allowance used" while owning 26 listings. Migration 0052 brought existing accounts
+ * into line; the per-category figure (`account_category_access`) follows the same rule.
+ */
+export const LISTING_SLOT_STATUSES = ["draft", "pending_review", "active", "rejected"];
+
+export async function syncAccountListingUsage(accountId, connection) {
+  if (!accountId) return;
+  const slots = LISTING_SLOT_STATUSES.map(() => "?").join(", ");
+  await execute(
+    `UPDATE accounts
+        SET listing_used = (SELECT COUNT(*) FROM listings
+                             WHERE account_id = ? AND deleted_at IS NULL AND status IN (${slots}))
+      WHERE id = ?`,
+    [accountId, ...LISTING_SLOT_STATUSES, accountId],
+    connection
+  );
+  await execute(
+    `UPDATE account_category_access aca
+       JOIN categories c ON c.id = aca.category_id
+        SET aca.listing_used = (SELECT COUNT(*) FROM listings l
+                                 WHERE l.account_id = aca.account_id
+                                   AND l.root_category_id = COALESCE(c.root_category_id, c.id)
+                                   AND l.deleted_at IS NULL AND l.status IN (${slots}))
+      WHERE aca.account_id = ? AND COALESCE(c.root_category_id, c.id) <> 7`,
+    [...LISTING_SLOT_STATUSES, accountId],
+    connection
+  );
+}
+
+export async function syncAccountListingUsageForListing(listingId, connection, { previousAgentId = null } = {}) {
+  const row = await queryOne(
+    "SELECT account_id, agent_id, organization_id FROM listings WHERE id = ?",
+    [listingId],
+    connection
+  );
+  if (!row) return;
+  await syncAccountListingUsage(row.account_id, connection);
+  await syncOwnerListingCounters({ agentIds: [row.agent_id, previousAgentId], organizationId: row.organization_id }, connection);
+}
+
+/**
+ * The agent's and organisation's listing counters, recounted for the rows a change touched —
+ * the same definitions as the 0014 rollup and the integrity checks (all non-deleted listings,
+ * and the `active` ones). Only the bulk rollup ever set them, and nothing ran it, so a listing
+ * approved, withdrawn or expired left its agent and organisation counting the old state.
+ */
+export async function syncOwnerListingCounters({ agentIds = [], organizationId = null }, connection) {
+  for (const agentId of [...new Set(agentIds.filter(Boolean))]) {
+    await execute(
+      `UPDATE agents
+          SET listing_count = (SELECT COUNT(*) FROM listings WHERE agent_id = ? AND deleted_at IS NULL),
+              active_listing_count = (SELECT COUNT(*) FROM listings WHERE agent_id = ? AND deleted_at IS NULL AND status = 'active')
+        WHERE id = ?`,
+      [agentId, agentId, agentId],
+      connection
+    );
+  }
+  if (organizationId) {
+    await execute(
+      `UPDATE organizations
+          SET listing_count = (SELECT COUNT(*) FROM listings WHERE organization_id = ? AND deleted_at IS NULL),
+              active_listing_count = (SELECT COUNT(*) FROM listings WHERE organization_id = ? AND deleted_at IS NULL AND status = 'active')
+        WHERE id = ?`,
+      [organizationId, organizationId, organizationId],
+      connection
+    );
+  }
+}
+
 export async function createListing({ payload, accountId, userId, organizationId, agentId, ip }) {
   const definition = resolveCategory(payload.category);
   if (!definition) throw AppError.validation("Some information is invalid.", { category: "Unknown category." });
@@ -437,7 +524,13 @@ export async function createListing({ payload, accountId, userId, organizationId
           allow_call, allow_whatsapp, allow_email,
           seo_title, seo_description, source, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-               ?, ?, ?, ?, ?, ?, 'not_submitted', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NOW(3))`,
+               ?, ?, ?, ?, ?, ?,
+               -- A listing created with "Submit for review" is submitted: it was written as
+               -- 'not_submitted' regardless, so the portal showed "Moderation: Not submitted" on a
+               -- listing waiting in the admin queue. MySQL lets a value refer to a column set
+               -- earlier in the same row, so this follows the status just inserted.
+               IF(status = 'pending_review', 'pending', 'not_submitted'),
+               ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NOW(3))`,
       [
         publicId,
         reference,
@@ -455,7 +548,7 @@ export async function createListing({ payload, accountId, userId, organizationId
         // Placeholder: the real slug needs the auto-increment id.
         `pending-${publicId}`,
         payload.subtitle ?? null,
-        payload.description ?? null,
+        sanitizeDescription(payload.description) ?? null,
         `/pending/${publicId}`,
         payload.price ?? null,
         currency,
@@ -527,7 +620,7 @@ export async function createListing({ payload, accountId, userId, organizationId
     await writeAttributes({ listingId, attributes: payload.attributes }, connection);
 
     for (const assetPublicId of payload.mediaAssetIds || []) {
-      const asset = await getAssetByPublicId(assetPublicId);
+      const asset = await resolveAssetRef(assetPublicId);
       if (!asset) continue;
       if (asset.account_id && String(asset.account_id) !== String(accountId)) {
         throw AppError.forbidden("One of the selected images belongs to another account.");
@@ -537,11 +630,7 @@ export async function createListing({ payload, accountId, userId, organizationId
     await syncListingMediaCounters(listingId, connection);
 
     await recordStatusChange({ listingId, fromStatus: null, toStatus: status, userId, reason: "created" }, connection);
-    await execute(
-      "UPDATE accounts SET listing_used = listing_used + 1 WHERE id = ?",
-      [accountId],
-      connection
-    );
+    await syncAccountListingUsage(accountId, connection);
 
     return { listingId, publicId, reference, slug, canonicalPath, status };
   }).then(async (created) => {
@@ -571,7 +660,9 @@ export async function updateListing({ listing, payload, userId, accountId, organ
 
     if (payload.title !== undefined) set("title", payload.title);
     if (payload.subtitle !== undefined) set("subtitle", payload.subtitle ?? null);
-    if (payload.description !== undefined) set("description", payload.description ?? null);
+    // Rich text from the portal editor is rendered as HTML on the public page, so only the
+    // allowlist in utils/richText.js is ever stored.
+    if (payload.description !== undefined) set("description", sanitizeDescription(payload.description) ?? null);
     if (payload.priceType !== undefined) set("price_type", payload.priceType);
     if (payload.pricePeriod !== undefined) set("price_period", payload.pricePeriod ?? null);
     if (payload.isPriceHidden !== undefined) set("is_price_hidden", payload.isPriceHidden ? 1 : 0);
@@ -653,7 +744,7 @@ export async function updateListing({ listing, payload, userId, accountId, organ
     }
     if (payload.mediaAssetIds !== undefined) {
       for (const assetPublicId of payload.mediaAssetIds) {
-        const asset = await getAssetByPublicId(assetPublicId);
+        const asset = await resolveAssetRef(assetPublicId);
         if (!asset) continue;
         if (asset.account_id && String(asset.account_id) !== String(accountId)) {
           throw AppError.forbidden("One of the selected images belongs to another account.");
@@ -714,6 +805,10 @@ export async function updateListing({ listing, payload, userId, accountId, organ
     }
   });
 
+  // Reassigning the agent moves a listing from one agent's counters to another's.
+  if (payload.agentId !== undefined) {
+    await syncAccountListingUsageForListing(listing.id, undefined, { previousAgentId: listing.agent_id ?? null });
+  }
   await refreshListingSearch(listing.id);
   return true;
 }
@@ -768,10 +863,57 @@ export async function changeListingStatus({ listing, toStatus, reason, userId, b
     await recordStatusChange({ listingId: listing.id, fromStatus, toStatus, userId, reason }, connection);
     // A real-estate listing going in or out of `active` moves its unit's active counter.
     await syncUnitListingCountersForListing(listing.id, connection);
+    // Archive, withdraw, sold/rented and expiry free an allowance slot; a resubmission takes one.
+    await syncAccountListingUsageForListing(listing.id, connection);
   });
 
   await refreshListingSearch(listing.id);
   return { changed: true, fromStatus, toStatus };
+}
+
+/**
+ * An owner's change to a live listing sends it back to moderation.
+ *
+ * Approval covers the version a moderator looked at. Once the owner changes anything — text,
+ * price, specs, a photo, a document, the photo order — the live page would be showing content
+ * nobody reviewed, so the listing leaves the public site and returns to `pending_review` until
+ * it is approved again. A moderator's own edit is not an owner change and never comes here.
+ */
+export async function sendBackForReview({ listingId, userId, reason = "Changed by the owner after approval" }) {
+  const current = await queryOne("SELECT id, status FROM listings WHERE id = ? AND deleted_at IS NULL", [listingId]);
+  if (!current || current.status !== "active") return { changed: false };
+  await withTransaction(async (connection) => {
+    await execute(
+      `UPDATE listings
+          SET status = 'pending_review', moderation_status = 'pending', rejection_reason = NULL
+        WHERE id = ? AND status = 'active'`,
+      [listingId],
+      connection
+    );
+    await recordStatusChange({ listingId, fromStatus: "active", toStatus: "pending_review", userId, reason }, connection);
+    // Leaving `active` moves a real-estate unit's active counter, and the agent's and organisation's.
+    await syncUnitListingCountersForListing(listingId, connection);
+    await syncAccountListingUsageForListing(listingId, connection);
+  });
+  await refreshListingSearch(listingId);
+  return { changed: true, fromStatus: "active", toStatus: "pending_review" };
+}
+
+/**
+ * What an owner's edit does to the listing's status.
+ *
+ * A live listing goes back for review. Any other listing takes the status the edit form asked
+ * for ("Save draft" / "Submit for review") where the portal may make that move. The form always
+ * sent it and the update ignored it, so "Submit for review" on an edited rejected listing never
+ * actually resubmitted it.
+ */
+export async function applyOwnerEditStatus({ listing, requestedStatus, edited, userId }) {
+  if (listing.status === "active") {
+    return edited ? sendBackForReview({ listingId: listing.id, userId }) : { changed: false };
+  }
+  if (!requestedStatus || requestedStatus === listing.status) return { changed: false };
+  if (!(PORTAL_TRANSITIONS[listing.status] || []).includes(requestedStatus)) return { changed: false };
+  return changeListingStatus({ listing, toStatus: requestedStatus, reason: "Changed with an edit by the owner", userId });
 }
 
 export async function archiveListing({ listing, userId, reason }) {
@@ -786,6 +928,7 @@ export async function softDeleteListing({ listing, userId }) {
       connection
     );
     await syncUnitListingCountersForListing(listing.id, connection);
+    await syncAccountListingUsageForListing(listing.id, connection);
   });
   await refreshListingSearch(listing.id);
 }

@@ -125,10 +125,11 @@ export async function loadOrganizationSummary(organizationId) {
       [organizationId]
     ),
     query(
-      `SELECT COALESCE(c.root_category_id, c.id) AS root_category_id, oca.status
-         FROM organization_category_access oca
-         JOIN categories c ON c.id = oca.category_id
-        WHERE oca.organization_id = ? AND oca.status = 'approved'`,
+      `SELECT COALESCE(c.root_category_id, c.id) AS root_category_id, aca.status
+         FROM organizations o
+         JOIN account_category_access aca ON aca.account_id = o.account_id AND aca.status = 'approved'
+         JOIN categories c ON c.id = aca.category_id
+        WHERE o.id = ?`,
       [organizationId]
     ),
   ]);

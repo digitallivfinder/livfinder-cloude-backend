@@ -17,7 +17,10 @@ import * as organizationService from "./organization.service.js";
 import * as settingsService from "./settings.service.js";
 import { createListingSchema, updateListingSchema, listingStatusSchema } from "../listings/listings.schemas.js";
 import { listListingMedia } from "../media/listingMedia.service.js";
-import { query, queryOne, execute } from "../../db/query.js";
+import { query, queryOne, execute, callProcedure } from "../../db/query.js";
+import { developmentSchema, upsertDevelopment } from "../admin/admin.mutations.js";
+import { getAdminDevelopment } from "../admin/admin.catalog.js";
+import { developmentAttachments } from "../projects/developmentAttachments.service.js";
 import { withTransaction } from "../../db/transaction.js";
 import { ulid } from "../../utils/ids.js";
 
@@ -106,6 +109,10 @@ router.get(
         ...detail.detail,
         status: listing.status,
         moderationStatus: listing.moderation_status,
+        // The owner's own listing is the one place this belongs — admin already
+        // knows why it rejected something. Never leaked outside `rejected`, so a
+        // stale value from a listing's earlier lifecycle can't resurface later.
+        rejectionReason: listing.moderation_status === "rejected" ? listing.rejection_reason || null : null,
         media,
         gallery: media,
         summary: summary ? portalRepo.serializePortalListing(summary) : null,
@@ -167,12 +174,24 @@ router.patch(
     const listing = await assertListingAccess(req, req.params.id, "edit");
     const { accountId, organizationId, userId } = scope(req);
     await listingsService.updateListing({ listing, payload: req.body, userId, accountId, organizationId });
+    // A live listing the owner changes goes back for review (off the public site until approved
+    // again); any other listing takes the edit form's "Save draft" / "Submit for review" choice.
+    // A platform user editing through the portal is not the owner and changes no status here.
+    const statusChange = req.auth.platform.roles.length
+      ? { changed: false }
+      : await listingsService.applyOwnerEditStatus({
+          listing,
+          requestedStatus: req.body.status,
+          edited: Object.keys(req.body).some((key) => key !== "status"),
+          userId,
+        });
     await auditFromRequest(req, {
       action: "listing.updated",
       subjectType: "listing",
       subjectId: listing.id,
       subjectLabel: listing.title,
       changes: req.body,
+      ...(statusChange.changed ? { metadata: { statusChange } } : {}),
     });
     const summary = await portalRepo.getAccountListing({ accountId: listing.account_id, identifier: listing.public_id });
     return res.json(detailResponse(portalRepo.serializePortalListing(summary)));
@@ -246,7 +265,8 @@ router.patch(
   requireAccountCapability("can_manage_leads"),
   validate({
     body: z.object({
-      status: z.enum(["new", "contacted", "qualified", "won", "lost", "closed", "spam"]).optional(),
+      // Every `inquiries.status` value: viewing_scheduled and negotiating were readable but not settable.
+      status: z.enum(["new", "contacted", "qualified", "viewing_scheduled", "negotiating", "won", "lost", "closed", "spam"]).optional(),
       priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
       assignedAgentId: z.string().max(64).nullable().optional(),
       note: z.string().trim().max(2000).optional(),
@@ -304,7 +324,7 @@ router.patch(
       }
       if (req.body.note) {
         await execute(
-          `INSERT INTO inquiry_notes (inquiry_id, user_id, body, is_internal, created_at)
+          `INSERT INTO inquiry_notes (inquiry_id, user_id, note, is_internal, created_at)
            VALUES (?, ?, ?, 1, NOW(3))`,
           [inquiry.id, req.auth.user.id, req.body.note],
           connection
@@ -1076,6 +1096,390 @@ router.post(
     await revokeAllSessions(req.auth.user.id);
     await auditFromRequest(req, { action: "auth.logout_all", subjectType: "user", subjectId: req.auth.user.id });
     return res.json(detailResponse({ signedOut: true }));
+  })
+);
+
+/* -------------------------------------------------------------------------- */
+/* Developments                                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A developer's own developments.
+ *
+ * A development is a `projects` row owned by the caller's organization. The portal may
+ * create one, edit it and submit it for review — never publish it: publication,
+ * rejection and the reason stay with LivFinder moderators (admin
+ * `PATCH /developments/:id`), exactly as with listings. Everything is scoped to the
+ * caller's organization, and another organization's development answers 404, never 403,
+ * so its existence is not confirmed. Before this there was no portal endpoint at all and
+ * the portal's Developments form could only preview.
+ */
+// No `developerId`: the brand comes from the organization (defaultDeveloperBrand), not the client.
+const PORTAL_DEVELOPMENT_KEYS = [
+  "name", "tagline", "description", "highlights", "projectType", "ownershipType",
+  "status", "launchStatus", "launchDate", "constructionStartDate", "handoverDate", "completionPercentage",
+  "totalUnits", "availableUnits", "buildingCount", "minPrice", "maxPrice", "currencyCode",
+  "countryId", "stateId", "cityId", "communityId", "subCommunityId", "address", "latitude", "longitude",
+  "coverImageUrl", "brochureUrl", "videoUrl", "amenities", "unitTypes", "paymentPlans", "paymentPlan",
+  "gallery", "masterplan", "video", "brochure", "floorPlans", "documents",
+];
+// Moderation, visibility, featuring and SEO are LivFinder's, so they are not in the pick.
+const portalDevelopmentSchema = developmentSchema
+  .pick(Object.fromEntries(PORTAL_DEVELOPMENT_KEYS.map((key) => [key, true])))
+  .extend({ submit: z.boolean().optional() });
+
+const PORTAL_DEVELOPMENT_SELECT = `
+  SELECT p.id, p.public_id, p.name, p.slug, p.tagline, p.description, p.project_type,
+         p.status AS lifecycle_status, p.moderation_status, p.rejection_reason, p.is_publicly_visible,
+         p.published_at, p.canonical_path, p.cover_image_url, p.min_price, p.max_price, p.currency_code,
+         p.total_units, p.available_units, p.handover_date, p.created_at, p.updated_at,
+         b.name AS developer_name,
+         co.name AS country_name, ct.name AS city_name, cm.name AS community_name,
+         (SELECT COUNT(*) FROM inquiries i WHERE i.project_id = p.id AND i.deleted_at IS NULL) AS inquiry_count
+    FROM projects p
+    LEFT JOIN brands b ON b.id = p.developer_brand_id
+    LEFT JOIN locations co ON co.id = p.country_id
+    LEFT JOIN locations ct ON ct.id = p.city_id
+    LEFT JOIN locations cm ON cm.id = p.community_id`;
+
+// The portal's listing vocabulary, so the shared list and detail screens read developments:
+// `rawStatus` is what the status badge keys on, `status` is the tab the record sits under.
+const RAW_STATUS_BY_MODERATION = {
+  draft: "draft", pending: "pending_review", published: "active", rejected: "rejected", archived: "archived",
+};
+const TAB_BY_MODERATION = { draft: "draft", pending: "pending", published: "active", rejected: "rejected", archived: "archived" };
+const LABEL_BY_MODERATION = { draft: "Draft", pending: "Pending", published: "Active", rejected: "Rejected", archived: "Archived" };
+// A development is never sold/rented or expired, so those two tabs are simply empty.
+const MODERATION_BY_TAB = { active: "published", pending: "pending", draft: "draft", rejected: "rejected", archived: "archived" };
+const DEVELOPMENT_SORTS = {
+  newest: "p.created_at DESC",
+  oldest: "p.created_at ASC",
+  priceDesc: "p.min_price DESC",
+  priceAsc: "p.min_price ASC",
+  inquiries: "inquiry_count DESC",
+  updated: "p.updated_at DESC",
+  views: "p.created_at DESC",
+};
+const iso = (value) => (value ? new Date(value).toISOString() : null);
+const amount = (value) => (value === null || value === undefined ? null : Number(value));
+
+function serializePortalDevelopment(row) {
+  const published = row.moderation_status === "published" && Number(row.is_publicly_visible) === 1;
+  const moderation = row.moderation_status;
+  const cover = row.cover_image_url ? { url: row.cover_image_url, alt: row.name } : null;
+  return {
+    id: row.public_id,
+    reference: row.slug,
+    title: row.name,
+    name: row.name,
+    tagline: row.tagline,
+    subtitle: row.tagline,
+    description: row.description || "",
+    category: "realEstateDevelopment",
+    listingType: "real-estate-developments",
+    purpose: "sale",
+    projectType: row.project_type,
+    developmentStatus: row.lifecycle_status,
+    developerName: row.developer_name || null,
+    // The list's "Owner / agent" column: a development is marketed under its developer.
+    agentName: row.developer_name || null,
+    rawStatus: RAW_STATUS_BY_MODERATION[moderation] || moderation,
+    status: TAB_BY_MODERATION[moderation] || moderation,
+    statusLabel: LABEL_BY_MODERATION[moderation] || moderation,
+    moderationStatus: moderation,
+    // Only while rejected: a reason belongs to one rejection (same rule as listings).
+    rejectionReason: moderation === "rejected" ? row.rejection_reason || null : null,
+    // `formatted` is what the shared detail screen prints as "Price"; without it a development
+    // read "Price: Not provided" beside its own minimum price.
+    price: row.min_price !== null
+      ? {
+          amount: amount(row.min_price),
+          currency: row.currency_code || "AED",
+          formatted: portalRepo.formatMoney({ amount: amount(row.min_price), currency: row.currency_code || "AED" }),
+        }
+      : null,
+    priceMin: amount(row.min_price),
+    priceMax: amount(row.max_price),
+    priceRange: { min: amount(row.min_price), max: amount(row.max_price), currency: row.currency_code || null },
+    totalUnits: amount(row.total_units),
+    availableUnits: amount(row.available_units),
+    handoverDate: row.handover_date ? iso(row.handover_date).slice(0, 10) : null,
+    locationLabel: [row.community_name, row.city_name, row.country_name].filter(Boolean).join(", ") || null,
+    image: cover ? { src: cover.url, alt: cover.alt } : null,
+    coverImage: cover,
+    gallery: cover ? [{ id: "cover", url: cover.url, alt: cover.alt, isCover: true }] : [],
+    features: [],
+    specs: [],
+    metrics: { views: null, inquiries: Number(row.inquiry_count || 0) },
+    inquiryCount: Number(row.inquiry_count || 0),
+    viewCount: null,
+    favouriteCount: null,
+    publicUrl: published ? row.canonical_path : null,
+    canonicalUrl: published ? row.canonical_path : null,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+    publishedAt: iso(row.published_at),
+    expiresAt: null,
+  };
+}
+
+async function ownDevelopment(req, identifier) {
+  const organizationId = requireOrganizationId(req);
+  const row = await queryOne(
+    `${PORTAL_DEVELOPMENT_SELECT}
+      WHERE (p.public_id = ? OR p.slug = ?) AND p.organization_id = ? AND p.deleted_at IS NULL
+      LIMIT 1`,
+    [String(identifier), String(identifier), organizationId]
+  );
+  if (!row) throw AppError.notFound("That development was not found.");
+  return row;
+}
+
+/**
+ * The whole record, for the detail and edit screens: units, payment plans, amenities, gallery
+ * and the location ids the form's picker needs — read through the admin reader so there is one
+ * definition of a development, then shaped into the portal's listing-detail vocabulary.
+ */
+async function portalDevelopmentDetail(row) {
+  const base = serializePortalDevelopment(row);
+  const full = await getAdminDevelopment(row.public_id);
+  if (!full) return base;
+  const location = full.location || {};
+  const gallery = full.media?.gallery || [];
+  const hasPrimary = gallery.some((item) => item.primary);
+  const tier = (key) => location[key] || "";
+  return {
+    ...base,
+    description: full.description?.body || base.description,
+    developerId: full.developer?.id || null,
+    developerName: full.developer?.name || base.developerName,
+    launchDate: full.launch?.launchDate || null,
+    completionPercentage: full.construction?.completionPercentage ?? null,
+    currency: row.currency_code || "AED",
+    locationIds: {
+      country: tier("countryId"),
+      state: tier("stateId"),
+      city: tier("cityId"),
+      community: tier("communityId"),
+      subCommunity: tier("subCommunityId"),
+    },
+    locationNames: {
+      country: tier("country"),
+      state: tier("state"),
+      city: tier("city"),
+      community: tier("community"),
+      subCommunity: tier("subCommunity"),
+    },
+    address: location.address || "",
+    latitude: location.latitude ?? null,
+    longitude: location.longitude ?? null,
+    amenities: full.amenities || [],
+    features: (full.amenities || []).map((label) => ({ name: label, slug: label })),
+    // Real gallery attachments when there are any; a seeded project may have only a cover URL.
+    gallery: gallery.length
+      ? gallery.map((item, index) => ({
+          id: item.id,
+          url: item.url,
+          alt: item.label || row.name,
+          isCover: hasPrimary ? Boolean(item.primary) : index === 0,
+        }))
+      : base.gallery,
+    unitTypes: full.unitTypes || [],
+    paymentPlans: full.paymentPlans || [],
+    // Floor plans, brochure, documents, video and tours — listed on the Media tab and in the form.
+    documents: await developmentAttachments(row.id),
+  };
+}
+
+/**
+ * Media a developer may attach: files this account uploaded, or files already on this very
+ * development (a seeded or admin-added image survives an edit). Anything else — another
+ * account's upload, addressed by a guessed or leaked id — is refused.
+ */
+const DEVELOPMENT_MEDIA_ROLES = ["gallery", "masterplan", "video", "brochure", "floorPlans", "documents"];
+async function assertOwnDevelopmentMedia(req, payload, projectId = null) {
+  const ids = [
+    ...new Set(
+      DEVELOPMENT_MEDIA_ROLES.flatMap((role) => (payload[role] || []).map((entry) => entry?.mediaAssetId).filter(Boolean))
+    ),
+  ];
+  if (!ids.length) return;
+  const accountId = requireAccountId(req);
+  const rows = await query(
+    `SELECT a.public_id FROM media_assets a
+      WHERE a.public_id IN (${ids.map(() => "?").join(", ")}) AND a.deleted_at IS NULL
+        AND (a.account_id = ?
+             OR EXISTS (SELECT 1 FROM media_attachments ma
+                         WHERE ma.media_asset_id = a.id AND ma.attachable_type = 'project' AND ma.attachable_id = ?))`,
+    [...ids, accountId, projectId ?? 0]
+  );
+  const allowed = new Set(rows.map((row) => row.public_id));
+  if (ids.some((id) => !allowed.has(id))) {
+    throw AppError.validation("Some information is invalid.", {
+      mediaAssetId: "Only files uploaded by this account can be attached to its development.",
+    });
+  }
+}
+
+/**
+ * The developer brand a new development is filed under: the one this organization already
+ * markets its projects under. A client does not pick a brand — naming another developer's brand
+ * would misattribute the project — and LivFinder can change it during review.
+ */
+async function defaultDeveloperBrand(organizationId) {
+  const row = await queryOne(
+    `SELECT b.public_id
+       FROM projects p
+       JOIN brands b ON b.id = p.developer_brand_id AND b.deleted_at IS NULL
+      WHERE p.organization_id = ? AND p.deleted_at IS NULL
+      GROUP BY b.id, b.public_id
+      ORDER BY COUNT(*) DESC, b.id ASC
+      LIMIT 1`,
+    [organizationId]
+  );
+  return row?.public_id || null;
+}
+
+router.get(
+  "/developments",
+  validate({ query: listQuery }),
+  asyncHandler(async (req, res) => {
+    const organizationId = requireOrganizationId(req);
+    const { status = "all", search, sort, page, pageSize } = q(req);
+    const conditions = ["p.organization_id = ?", "p.deleted_at IS NULL"];
+    const params = [organizationId];
+    if (status && status !== "all") {
+      // The portal's tab names, or a moderation status named directly.
+      const moderation =
+        MODERATION_BY_TAB[status] ?? (Object.values(MODERATION_BY_TAB).includes(status) ? status : null);
+      if (moderation) {
+        conditions.push("p.moderation_status = ?");
+        params.push(moderation);
+      } else {
+        conditions.push("1 = 0");
+      }
+    }
+    const term = String(search || "").trim();
+    if (term) {
+      conditions.push("(p.name LIKE ? OR p.slug LIKE ?)");
+      params.push(`%${term}%`, `%${term}%`);
+    }
+    const where = conditions.join(" AND ");
+    const size = Math.min(Math.max(Number(pageSize) || 12, 1), 100);
+    const current = Math.max(Number(page) || 1, 1);
+
+    const [rows, totalRow, countRows] = await Promise.all([
+      query(
+        `${PORTAL_DEVELOPMENT_SELECT}
+          WHERE ${where}
+          ORDER BY ${DEVELOPMENT_SORTS[sort] || DEVELOPMENT_SORTS.newest}, p.id DESC
+          LIMIT ${size} OFFSET ${(current - 1) * size}`,
+        params
+      ),
+      queryOne(`SELECT COUNT(*) AS total FROM projects p WHERE ${where}`, params),
+      query(
+        "SELECT moderation_status, COUNT(*) AS n FROM projects WHERE organization_id = ? AND deleted_at IS NULL GROUP BY moderation_status",
+        [organizationId]
+      ),
+    ]);
+    const byModeration = Object.fromEntries(countRows.map((row) => [row.moderation_status, Number(row.n)]));
+    const counts = {
+      all: Object.values(byModeration).reduce((sum, value) => sum + value, 0),
+      ...Object.fromEntries(Object.entries(MODERATION_BY_TAB).map(([tab, moderation]) => [tab, byModeration[moderation] || 0])),
+      soldOrRented: 0,
+      expired: 0,
+    };
+    return res.json({
+      ...listResponse(rows.map(serializePortalDevelopment), {
+        page: current,
+        pageSize: size,
+        total: Number(totalRow?.total || 0),
+      }),
+      counts,
+    });
+  })
+);
+
+router.get(
+  "/developments/:id",
+  asyncHandler(async (req, res) => res.json(detailResponse(await portalDevelopmentDetail(await ownDevelopment(req, req.params.id)))))
+);
+
+router.post(
+  "/developments",
+  writeLimiter,
+  requireAccountCapability("can_manage_listings"),
+  validate({ body: portalDevelopmentSchema }),
+  asyncHandler(async (req, res) => {
+    const organizationId = requireOrganizationId(req);
+    // Only a developer approved for the category may submit one (0051 backfilled the grants).
+    await organizationService.assertCategoryAccess({ organizationId, category: "real-estate-developments" });
+    const { submit, ...payload } = req.body;
+    await assertOwnDevelopmentMedia(req, payload);
+    const developerId = await defaultDeveloperBrand(organizationId);
+
+    const created = await upsertDevelopment({
+      identifier: null,
+      payload: { ...payload, ...(developerId ? { developerId } : {}), acceptsInquiries: true },
+      userId: req.auth.user.id,
+    });
+    await execute(
+      `UPDATE projects
+          SET organization_id = ?, moderation_status = ?, is_publicly_visible = 0, rejection_reason = NULL, updated_at = NOW(3)
+        WHERE public_id = ?`,
+      [organizationId, submit ? "pending" : "draft", created.id]
+    );
+    const row = await ownDevelopment(req, created.id);
+    await callProcedure("sp_refresh_project_search", [row.id]);
+
+    await auditFromRequest(req, {
+      action: submit ? "development.submitted" : "development.created",
+      subjectType: "project",
+      subjectId: row.id,
+      subjectLabel: row.name,
+      metadata: { moderationStatus: row.moderation_status },
+    });
+    return res.status(201).json(detailResponse(serializePortalDevelopment(row)));
+  })
+);
+
+router.patch(
+  "/developments/:id",
+  writeLimiter,
+  requireAccountCapability("can_manage_listings"),
+  validate({ body: portalDevelopmentSchema.partial() }),
+  asyncHandler(async (req, res) => {
+    const current = await ownDevelopment(req, req.params.id);
+    if (current.moderation_status === "archived") {
+      throw AppError.conflict("An archived development cannot be edited.");
+    }
+    const { submit, ...payload } = req.body;
+    await assertOwnDevelopmentMedia(req, payload, current.id);
+    const edited = Object.keys(payload).length > 0;
+    if (edited) {
+      await upsertDevelopment({ identifier: current.public_id, payload, userId: req.auth.user.id });
+    }
+    // Approval covers the version a moderator reviewed: a published development the developer
+    // changes in any way — a unit, a milestone, a photo — goes back into the queue and off the
+    // public site, exactly like an explicit resubmission. It used to be saved live in place.
+    const wasLive = current.moderation_status === "published";
+    if (submit || (wasLive && edited)) {
+      // Resubmission: back into the queue, off the public site, the old reason cleared.
+      await execute(
+        "UPDATE projects SET moderation_status = 'pending', rejection_reason = NULL, is_publicly_visible = 0, updated_at = NOW(3) WHERE id = ?",
+        [current.id]
+      );
+      await callProcedure("sp_refresh_project_search", [current.id]);
+    }
+    const row = await ownDevelopment(req, current.public_id);
+    await auditFromRequest(req, {
+      action: submit ? "development.resubmitted" : "development.updated",
+      subjectType: "project",
+      subjectId: row.id,
+      subjectLabel: row.name,
+      metadata: { moderationStatus: row.moderation_status },
+    });
+    return res.json(detailResponse(serializePortalDevelopment(row)));
   })
 );
 

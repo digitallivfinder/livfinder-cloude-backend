@@ -205,8 +205,9 @@ describe("listing lifecycle", () => {
   it("refuses a category the account has not been approved for", async () => {
     const approved = await query(
       `SELECT COALESCE(c.root_category_id, c.id) AS root_category_id
-         FROM organization_category_access oca JOIN categories c ON c.id = oca.category_id
-        WHERE oca.organization_id = ? AND oca.status = 'approved'`,
+         FROM account_category_access aca JOIN categories c ON c.id = aca.category_id
+         JOIN organizations o ON o.account_id = aca.account_id
+        WHERE o.id = ? AND aca.status = 'approved'`,
       [owner.organization_id]
     );
     const approvedRoots = new Set(approved.map((row) => Number(row.root_category_id)));

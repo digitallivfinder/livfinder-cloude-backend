@@ -19,6 +19,36 @@ const ACCOUNT_TYPE_MAP = {
   partner: "organization",
 };
 
+/**
+ * Category access is per account now (companies and individuals alike), keyed on
+ * `accounts.id`. The frontend vocabulary is active/requested/rejected.
+ */
+async function readAccountCategories(accountId) {
+  const rows = await query(
+    `SELECT aca.id, aca.status, aca.requested_at, aca.reviewed_at, aca.reviewed_by_user_id,
+            aca.notes, aca.created_at, aca.updated_at,
+            COALESCE(c.root_category_id, c.id) AS root_category_id
+       FROM account_category_access aca
+       JOIN categories c ON c.id = aca.category_id
+      WHERE aca.account_id = ?`,
+    [accountId]
+  );
+  return rows
+    .map((row) => ({
+      id: `ac_${row.id}`,
+      categoryId: frontendCategoryId(row.root_category_id),
+      status: row.status === "approved" ? "active" : row.status === "revoked" ? "rejected" : row.status,
+      requestedAt: isoDate(row.requested_at),
+      approvedAt: row.status === "approved" ? isoDate(row.reviewed_at) : null,
+      approvedBy: row.reviewed_by_user_id ? String(row.reviewed_by_user_id) : null,
+      rejectionReason: row.status === "rejected" ? row.notes || null : undefined,
+      restrictions: [],
+      createdAt: isoDate(row.created_at),
+      updatedAt: isoDate(row.updated_at),
+    }))
+    .filter((entry) => entry.categoryId);
+}
+
 function accountState(row) {
   if (!row) return null;
   if (row.account_status === "suspended" || row.account_status === "closed") return "suspended";
@@ -94,28 +124,7 @@ export async function serializeSession(userId, { sessionId = null, activeAccount
           updatedAt: isoDate(organizationRow.updated_at),
         };
 
-        const categories = await query(
-          `SELECT oca.id, oca.status, oca.requested_at, oca.reviewed_at, oca.reviewed_by_user_id,
-                  oca.notes, oca.created_at, oca.updated_at,
-                  COALESCE(c.root_category_id, c.id) AS root_category_id
-             FROM organization_category_access oca
-             JOIN categories c ON c.id = oca.category_id
-            WHERE oca.organization_id = ?`,
-          [organizationRow.id]
-        );
-        accountCategories = categories.map((row) => ({
-          id: `ac_${row.id}`,
-          categoryId: frontendCategoryId(row.root_category_id),
-          // The frontend vocabulary is active/requested/rejected.
-          status: row.status === "approved" ? "active" : row.status === "revoked" ? "rejected" : row.status,
-          requestedAt: isoDate(row.requested_at),
-          approvedAt: row.status === "approved" ? isoDate(row.reviewed_at) : null,
-          approvedBy: row.reviewed_by_user_id ? String(row.reviewed_by_user_id) : null,
-          rejectionReason: row.status === "rejected" ? row.notes || null : undefined,
-          restrictions: [],
-          createdAt: isoDate(row.created_at),
-          updatedAt: isoDate(row.updated_at),
-        }));
+        accountCategories = await readAccountCategories(membership.account_id);
       }
 
       const memberRow = await queryOne(
@@ -165,22 +174,10 @@ export async function serializeSession(userId, { sessionId = null, activeAccount
         };
       }
     } else {
-      // A private lister's category access is implied by their account type.
-      accountCategories = membership.account_type_code === "lister"
-        ? [
-            {
-              id: `ac_${membership.account_id}_realEstate`,
-              categoryId: "realEstate",
-              status: "active",
-              requestedAt: isoDate(accountRow?.created_at),
-              approvedAt: isoDate(accountRow?.created_at),
-              approvedBy: null,
-              restrictions: [],
-              createdAt: isoDate(accountRow?.created_at),
-              updatedAt: isoDate(accountRow?.updated_at),
-            },
-          ]
-        : [];
+      // Individuals hold real category-access rows now, same as organizations —
+      // an admin can grant any category to a personal account. Migration 0040
+      // backfilled the real-estate grant every lister used to get implicitly.
+      accountCategories = await readAccountCategories(membership.account_id);
     }
 
     if (agent) {

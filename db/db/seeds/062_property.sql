@@ -1728,3 +1728,10 @@ WHERE m.gross_yield_percent IS NULL
   AND m.median_price > 0 AND m.median_rent > 0;
 
 DROP TABLE IF EXISTS tmp_numbers;
+
+-- The development projection counts payment plans (`payment_plan_count`, `payment_plan_types`,
+-- `min_down_payment_percent`), and the plans above are inserted after the last seed that rebuilt
+-- it. Left alone, every development reads "no payment plan" on a fresh load: the Off Plan
+-- payment-plan filter offers nothing and "post-handover" or "20% down" matches no development.
+SET SESSION group_concat_max_len = 8192;
+CALL sp_refresh_project_search(NULL);

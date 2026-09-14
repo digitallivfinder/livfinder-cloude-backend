@@ -36,7 +36,7 @@ function ipToBinary(ip) {
 async function resolvePublicListing(identifier) {
   const listing = await queryOne(
     `SELECT l.id, l.public_id, l.reference, l.title, l.account_id, l.organization_id, l.agent_id,
-            l.category_id, l.location_id, l.country_id, l.currency_code, l.contact_email
+            l.category_id, l.root_category_id, l.location_id, l.country_id, l.currency_code, l.contact_email
        FROM v_public_listings l
       WHERE l.public_id = ? OR l.reference = ? OR l.canonical_path = ?
       LIMIT 1`,
@@ -59,9 +59,10 @@ async function resolvePublicProject(identifier) {
   const row = await queryOne(
     `SELECT ps.project_id AS id, ps.public_id, ps.name, ps.canonical_path, ps.accepts_inquiries,
             ps.country_id, ps.city_id, ps.community_id, ps.currency_code,
-            p.organization_id, p.category_id, p.location_id
+            p.organization_id, p.category_id, p.location_id, o.account_id
        FROM project_search ps
        JOIN projects p ON p.id = ps.project_id
+       LEFT JOIN organizations o ON o.id = p.organization_id
       WHERE ps.public_id = ? OR ps.slug = ? OR ps.canonical_path = ?
       LIMIT 1`,
     [reference, reference, reference]
@@ -69,6 +70,168 @@ async function resolvePublicProject(identifier) {
   if (!row) throw AppError.notFound("That project is not available.");
   if (!row.accepts_inquiries) throw AppError.badRequest("This project is not accepting enquiries.");
   return row;
+}
+
+/** Best-effort `leads.intent` from the public form's (looser) `inquiryType`. */
+const INTENT_BY_INQUIRY_TYPE = {
+  viewing: "buy", callback: "buy", price: "buy", offer: "buy", availability: "buy",
+  general: "buy", brochure: "buy", floor_plan: "buy",
+  valuation: "valuation", charter: "charter",
+};
+
+/** The platform-wide "Website enquiry" lead source (migration 0049). */
+async function websiteLeadSourceId(connection) {
+  return queryValue(
+    "SELECT id FROM lead_sources WHERE code = 'website' AND organization_id IS NULL LIMIT 1",
+    [],
+    connection
+  );
+}
+
+/**
+ * Turns a public listing enquiry into a CRM lead.
+ *
+ * Before this, `POST /inquiries` only ever wrote to `inquiries` — the table
+ * the client portal's Leads page reads. The admin Leads module reads the
+ * separate `leads` table, which nothing in the running application wrote to
+ * (every row was seed data). A real visitor's enquiry reached the listing's
+ * owner and never reached admin/ops at all. This closes that gap: dedupe the
+ * contact by (organization, email), reuse an already-open lead for the same
+ * contact + listing rather than spawning a new one on every re-submission,
+ * and log one activity that is visible from the lead, the contact and the
+ * listing's own engagement tab (`getAdminListingEngagement` reads
+ * `subject_type = 'listing'`; the lead and contact detail screens read the
+ * direct `lead_id` / `contact_id` columns — this row satisfies all three).
+ *
+ * Returns the lead's numeric id, to link back from `inquiries.lead_id`.
+ */
+/**
+ * What an enquiry is about, in the one shape a lead needs — a listing or a development.
+ * A development is filed under the Real Estate Developments root (7), which is where the
+ * admin Developments → Leads screen and its summary look; the project row itself hangs off
+ * the Real Estate root for historical reasons.
+ */
+const DEVELOPMENTS_ROOT_ID = 7;
+
+function listingLeadSubject(listing) {
+  return {
+    kind: "listing", id: listing.id, title: listing.title,
+    organization_id: listing.organization_id, account_id: listing.account_id,
+    category_id: listing.category_id, root_category_id: listing.root_category_id ?? null,
+    purpose_id: listing.purpose_id ?? null, location_id: listing.location_id, country_id: listing.country_id,
+  };
+}
+
+function projectLeadSubject(project) {
+  return {
+    kind: "project", id: project.id, title: project.name,
+    organization_id: project.organization_id, account_id: project.account_id ?? null,
+    category_id: DEVELOPMENTS_ROOT_ID, root_category_id: DEVELOPMENTS_ROOT_ID,
+    purpose_id: null, location_id: project.location_id ?? null, country_id: project.country_id ?? null,
+  };
+}
+
+async function linkInquiryToLead({ subject, inquiry }, connection) {
+  // A contact belongs to an organization; an enquiry about something no organization
+  // owns has nobody to work it, so it stays an enquiry and does not become a lead.
+  if (!subject.organization_id) return null;
+  const email = String(inquiry.email).trim().toLowerCase();
+  const name = String(inquiry.name).trim();
+
+  let contact = await queryOne(
+    "SELECT id FROM crm_contacts WHERE organization_id = ? AND primary_email_normalized = ? AND deleted_at IS NULL LIMIT 1",
+    [subject.organization_id, email],
+    connection
+  );
+  if (!contact) {
+    const [firstName, ...rest] = name.split(/\s+/);
+    const lastName = rest.join(" ") || null;
+    const contactResult = await execute(
+      `INSERT INTO crm_contacts
+         (public_id, organization_id, contact_type, first_name, last_name, display_name, name_normalized,
+          primary_email, primary_email_normalized, primary_phone_e164, source_id, created_at, updated_at)
+       VALUES (?, ?, 'buyer', ?, ?, ?, LOWER(?), ?, ?, ?, ?, NOW(3), NOW(3))`,
+      [
+        ulid(), subject.organization_id, firstName || name, lastName, name, name,
+        inquiry.email, email, inquiry.phone || null, await websiteLeadSourceId(connection),
+      ],
+      connection
+    );
+    contact = { id: contactResult.insertId };
+  }
+
+  const subjectColumn = subject.kind === "project" ? "project_id" : "primary_listing_id";
+  const existingLead = await queryOne(
+    `SELECT id FROM leads
+      WHERE contact_id = ? AND ${subjectColumn} = ? AND status = 'open' AND deleted_at IS NULL
+      LIMIT 1`,
+    [contact.id, subject.id],
+    connection
+  );
+  if (existingLead) {
+    await execute(
+      "UPDATE leads SET inquiry_count = inquiry_count + 1, last_activity_at = NOW(3) WHERE id = ?",
+      [existingLead.id],
+      connection
+    );
+    await logInquiryActivity({ subject, contact, leadId: existingLead.id, inquiry }, connection);
+    return existingLead.id;
+  }
+
+  const sourceId = await websiteLeadSourceId(connection);
+  const stage = await queryOne(
+    `SELECT lps.id AS stage_id, lps.pipeline_id
+       FROM lead_pipeline_stages lps
+       JOIN lead_pipelines lp ON lp.id = lps.pipeline_id
+      WHERE lp.is_default = 1 AND lps.code = 'new'
+      LIMIT 1`,
+    [],
+    connection
+  );
+  const maxRef = await queryValue(
+    "SELECT MAX(CAST(SUBSTRING(reference, 4) AS UNSIGNED)) FROM leads WHERE reference LIKE 'LD-%'",
+    [],
+    connection
+  );
+  const reference = `LD-${Number(maxRef || 10000) + 1}`;
+
+  const leadResult = await execute(
+    `INSERT INTO leads
+       (public_id, reference, organization_id, account_id, contact_id, pipeline_id, stage_id, stage_type,
+        status, name, email, phone_e164, intent, category_id, root_category_id, purpose_id,
+        primary_listing_id, project_id, location_id, country_id, source_id, channel, inquiry_count,
+        stage_entered_at, last_activity_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'new', 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'web_form', 1,
+             NOW(3), NOW(3), NOW(3), NOW(3))`,
+    [
+      ulid(), reference, subject.organization_id, subject.account_id, contact.id,
+      stage?.pipeline_id ?? 1, stage?.stage_id ?? null,
+      name, inquiry.email, inquiry.phone || null,
+      INTENT_BY_INQUIRY_TYPE[inquiry.inquiryType] || "other",
+      subject.category_id, subject.root_category_id, subject.purpose_id,
+      subject.kind === "listing" ? subject.id : null,
+      subject.kind === "project" ? subject.id : null,
+      subject.location_id, subject.country_id, sourceId,
+    ],
+    connection
+  );
+
+  await logInquiryActivity({ subject, contact, leadId: leadResult.insertId, inquiry }, connection);
+  return leadResult.insertId;
+}
+
+async function logInquiryActivity({ subject, contact, leadId, inquiry }, connection) {
+  await execute(
+    `INSERT INTO activities
+       (public_id, organization_id, subject_type, subject_id, lead_id, contact_id,
+        activity_type, direction, subject_line, body, occurred_at, is_automated, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'other', 'inbound', ?, ?, NOW(3), 1, NOW(3), NOW(3))`,
+    [
+      ulid(), subject.organization_id, subject.kind, subject.id, leadId, contact.id,
+      `Website enquiry — ${subject.title}`, inquiry.message,
+    ],
+    connection
+  );
 }
 
 /**
@@ -152,7 +315,7 @@ router.post(
         connection
       );
       await execute(
-        `UPDATE listings SET favourite_count = (SELECT COUNT(*) FROM favourites WHERE listing_id = ?) WHERE id = ?`,
+        `UPDATE listings SET favourite_count = (SELECT COUNT(*) FROM favourites WHERE listing_id = ?), updated_at = updated_at WHERE id = ?`,
         [listing.id, listing.id],
         connection
       );
@@ -174,7 +337,7 @@ router.delete(
     await withTransaction(async (connection) => {
       await execute("DELETE FROM favourites WHERE user_id = ? AND listing_id = ?", [req.auth.user.id, listing.id], connection);
       await execute(
-        `UPDATE listings SET favourite_count = (SELECT COUNT(*) FROM favourites WHERE listing_id = ?) WHERE id = ?`,
+        `UPDATE listings SET favourite_count = (SELECT COUNT(*) FROM favourites WHERE listing_id = ?), updated_at = updated_at WHERE id = ?`,
         [listing.id, listing.id],
         connection
       );
@@ -371,7 +534,9 @@ router.post(
           ref,
           listing?.id ?? null,
           project?.id ?? null,
-          listing?.account_id ?? null,
+          // A development enquiry carries its developer's account too, so the same
+          // account-or-organization scope the portal applies finds it.
+          listing?.account_id ?? project?.account_id ?? null,
           listing?.organization_id ?? project?.organization_id ?? null,
           listing?.agent_id ?? null,
           listing?.category_id ?? project?.category_id ?? null,
@@ -394,8 +559,30 @@ router.post(
         connection
       );
 
+      let leadId = null;
       if (listing) {
-        await execute("UPDATE listings SET inquiry_count = inquiry_count + 1 WHERE id = ?", [listing.id], connection);
+        // A counter, not a content change: `updated_at` would otherwise move on every enquiry,
+        // making the search projection look stale and the owner's "Updated" date meaningless.
+        await execute("UPDATE listings SET inquiry_count = inquiry_count + 1, updated_at = updated_at WHERE id = ?", [listing.id], connection);
+      }
+      // A listing enquiry and a development enquiry both become an admin lead — a
+      // development's only ever reached the developer's portal before, never admin.
+      const leadSubject = listing ? listingLeadSubject(listing) : project ? projectLeadSubject(project) : null;
+      if (leadSubject) {
+        leadId = await linkInquiryToLead(
+          {
+            subject: leadSubject,
+            inquiry: {
+              name: req.body.name,
+              email: req.body.email,
+              phone: req.body.phone,
+              message: req.body.message,
+              inquiryType: req.body.inquiryType || "general",
+            },
+          },
+          connection
+        );
+        if (leadId) await execute("UPDATE inquiries SET lead_id = ? WHERE id = ?", [leadId, result.insertId], connection);
       }
       const granted = project
         ? await grantProjectDocuments(
@@ -403,7 +590,7 @@ router.post(
             connection
           )
         : [];
-      return { reference: ref, inquiryId: result.insertId, grantedDocuments: granted };
+      return { reference: ref, inquiryId: result.insertId, leadId, grantedDocuments: granted };
     });
 
     if (listing?.contact_email) {

@@ -432,8 +432,14 @@ async function applyAgentRelations({ agentId, payload, connection }) {
 /* Category access                                                             */
 /* -------------------------------------------------------------------------- */
 
+/** Category access is per account now; the portal still addresses it by org. */
+async function accountIdForOrganization(organizationId) {
+  return queryValue("SELECT account_id FROM organizations WHERE id = ? LIMIT 1", [organizationId]);
+}
+
 export async function categoryAccess(organizationId) {
-  if (!organizationId) {
+  const accountId = organizationId ? await accountIdForOrganization(organizationId) : null;
+  if (!accountId) {
     return CATEGORY_DEFINITIONS.map((definition) => ({
       id: `cat_${definition.frontendId}`,
       categoryId: definition.frontendId,
@@ -444,12 +450,12 @@ export async function categoryAccess(organizationId) {
     }));
   }
   const rows = await query(
-    `SELECT oca.id, oca.status, oca.requested_at, oca.reviewed_at, oca.notes, oca.listing_quota,
-            oca.listing_used, COALESCE(c.root_category_id, c.id) AS root_category_id, c.name
-       FROM organization_category_access oca
-       JOIN categories c ON c.id = oca.category_id
-      WHERE oca.organization_id = ?`,
-    [organizationId]
+    `SELECT aca.id, aca.status, aca.requested_at, aca.reviewed_at, aca.notes, aca.listing_quota,
+            aca.listing_used, COALESCE(c.root_category_id, c.id) AS root_category_id, c.name
+       FROM account_category_access aca
+       JOIN categories c ON c.id = aca.category_id
+      WHERE aca.account_id = ?`,
+    [accountId]
   );
   const byCategory = new Map(rows.map((row) => [frontendCategoryId(row.root_category_id), row]));
 
@@ -472,13 +478,16 @@ export async function categoryAccess(organizationId) {
 export async function assertCategoryAccess({ organizationId, category }) {
   const definition = resolveCategory(category);
   if (!definition) throw AppError.validation("Some information is invalid.", { category: "Unknown category." });
-  const approved = await queryValue(
-    `SELECT oca.id FROM organization_category_access oca
-       JOIN categories c ON c.id = oca.category_id
-      WHERE oca.organization_id = ? AND COALESCE(c.root_category_id, c.id) = ? AND oca.status = 'approved'
-      LIMIT 1`,
-    [organizationId, definition.rootId]
-  );
+  const accountId = await accountIdForOrganization(organizationId);
+  const approved = accountId
+    ? await queryValue(
+        `SELECT aca.id FROM account_category_access aca
+           JOIN categories c ON c.id = aca.category_id
+          WHERE aca.account_id = ? AND COALESCE(c.root_category_id, c.id) = ? AND aca.status = 'approved'
+          LIMIT 1`,
+        [accountId, definition.rootId]
+      )
+    : null;
   if (!approved) {
     throw AppError.forbidden("This account has not been approved to list in that category.");
   }
@@ -488,13 +497,15 @@ export async function assertCategoryAccess({ organizationId, category }) {
 export async function requestCategoryAccess({ organizationId, categoryId, note, userId }) {
   const definition = resolveCategory(categoryId);
   if (!definition) throw AppError.validation("Some information is invalid.", { categoryId: "Unknown category." });
+  const accountId = await accountIdForOrganization(organizationId);
+  if (!accountId) throw AppError.notFound("That account was not found.");
 
   const existing = await queryOne(
-    `SELECT oca.id, oca.status FROM organization_category_access oca
-       JOIN categories c ON c.id = oca.category_id
-      WHERE oca.organization_id = ? AND COALESCE(c.root_category_id, c.id) = ?
+    `SELECT aca.id, aca.status FROM account_category_access aca
+       JOIN categories c ON c.id = aca.category_id
+      WHERE aca.account_id = ? AND COALESCE(c.root_category_id, c.id) = ?
       LIMIT 1`,
-    [organizationId, definition.rootId]
+    [accountId, definition.rootId]
   );
   if (existing && ["approved", "requested"].includes(existing.status)) {
     throw AppError.conflict("Access to that category has already been requested.");
@@ -502,15 +513,15 @@ export async function requestCategoryAccess({ organizationId, categoryId, note, 
 
   if (existing) {
     await execute(
-      "UPDATE organization_category_access SET status = 'requested', requested_at = NOW(3), requested_by_user_id = ?, notes = ? WHERE id = ?",
+      "UPDATE account_category_access SET status = 'requested', requested_at = NOW(3), requested_by_user_id = ?, notes = ? WHERE id = ?",
       [userId, note || null, existing.id]
     );
   } else {
     await execute(
-      `INSERT INTO organization_category_access
-         (organization_id, category_id, status, listing_used, requested_at, requested_by_user_id, notes, created_at)
+      `INSERT INTO account_category_access
+         (account_id, category_id, status, listing_used, requested_at, requested_by_user_id, notes, created_at)
        VALUES (?, ?, 'requested', 0, NOW(3), ?, ?, NOW(3))`,
-      [organizationId, definition.rootId, userId, note || null]
+      [accountId, definition.rootId, userId, note || null]
     );
   }
   return { categoryId: definition.frontendId, status: "requested" };

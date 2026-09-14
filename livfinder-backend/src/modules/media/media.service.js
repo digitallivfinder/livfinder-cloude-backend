@@ -245,6 +245,63 @@ async function generateRenditions({ assetId, buffer, key, info, visibility }) {
   return created;
 }
 
+const PDF_SIGNATURE = Buffer.from("%PDF-");
+
+/** Read from the bytes, never from the declared type or the file name. */
+export function isPdf(buffer) {
+  return Buffer.isBuffer(buffer) && buffer.length > PDF_SIGNATURE.length && buffer.subarray(0, 5).equals(PDF_SIGNATURE);
+}
+
+/**
+ * Stores a PDF — a brochure, title deed, floor plan — as a media asset.
+ *
+ * The same gates as an image: a size cap, a check of the bytes themselves, and a malware
+ * scan before anything reaches the store. Nothing is rendered or resized; a PDF is kept as
+ * it arrived.
+ */
+export async function storeDocument({ buffer, originalFileName, accountId, userId, scope = "listings/documents", caption = null }) {
+  if (buffer.length > MAX_IMAGE_BYTES) {
+    throw AppError.payloadTooLarge("Files must be 15 MB or smaller.");
+  }
+  if (!isPdf(buffer)) throw AppError.unsupportedMedia("Upload a PDF, JPG, PNG or WebP file.");
+  const checksum = crypto.createHash("sha256").update(buffer).digest("hex");
+
+  const scan = await scanBuffer(buffer);
+  if (scan.status === "infected") {
+    logger.warn({ detail: scan.detail, originalFileName }, "upload rejected by the malware scanner");
+    throw AppError.badRequest("That file was rejected by the malware scanner.");
+  }
+
+  const storage = getStorage();
+  const baseName = slugify(path.parse(originalFileName || "document").name).slice(0, 60) || "document";
+  const key = storageKey({ scope: `${scope}/${baseName}`, extension: "pdf" });
+  const stored = await storage.put(key, buffer, { contentType: "application/pdf", visibility: "public" });
+  const url = storage.publicUrl(key);
+
+  const result = await execute(
+    `INSERT INTO media_assets
+       (public_id, account_id, uploaded_by_user_id, media_type, storage_disk, storage_path, url,
+        file_name, original_file_name, mime_type, extension, file_size_bytes, checksum, source,
+        caption, scan_status, processing_status, reference_count, last_referenced_at, tier, created_at)
+     VALUES (?, ?, ?, 'document', ?, ?, ?, ?, ?, 'application/pdf', 'pdf', ?, ?, 'upload', ?, ?, 'ready', 1, NOW(3), 'hot', NOW(3))`,
+    [
+      ulid(),
+      accountId,
+      userId,
+      storage.driver,
+      key,
+      url,
+      key.split("/").pop(),
+      String(originalFileName || "").slice(0, 255) || null,
+      stored?.size ?? buffer.length,
+      checksum,
+      caption,
+      scan.status,
+    ]
+  );
+  return { id: result.insertId, url, mime_type: "application/pdf" };
+}
+
 export async function listRenditions(assetId) {
   const rows = await query(
     "SELECT preset_code, url, width, height FROM media_renditions WHERE media_asset_id = ? AND status = 'ready'",
@@ -283,4 +340,23 @@ export async function getAssetByPublicId(publicId) {
     "SELECT * FROM media_assets WHERE public_id = ? AND deleted_at IS NULL LIMIT 1",
     [publicId]
   );
+}
+
+/**
+ * Resolves a caller-supplied asset reference. The public id is the contract, but
+ * older upload responses handed back the numeric row id, so a bare integer is
+ * accepted as a fallback rather than silently resolving to nothing.
+ */
+export async function resolveAssetRef(ref) {
+  if (ref === null || ref === undefined || ref === "") return null;
+  const asString = String(ref).trim();
+  const byPublicId = await getAssetByPublicId(asString);
+  if (byPublicId) return byPublicId;
+  if (/^\d+$/.test(asString)) {
+    return queryOne(
+      "SELECT * FROM media_assets WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+      [Number(asString)]
+    );
+  }
+  return null;
 }

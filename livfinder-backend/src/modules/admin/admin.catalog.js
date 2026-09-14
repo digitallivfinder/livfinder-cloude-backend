@@ -93,7 +93,19 @@ export async function listAdminListings({
   const [rows, total, summary] = await Promise.all([
     query(
       `SELECT l.id, l.public_id, l.reference, l.title, l.status, l.moderation_status, l.price,
-              l.currency_code, l.cover_image_url, l.created_at, l.published_at, l.updated_at,
+              l.currency_code, l.created_at, l.published_at, l.updated_at,
+              -- Fall back to the first gallery image, then to any image file on the
+              -- listing (a photo uploaded as a floor plan or document), so the admin
+              -- table still shows a picture when no cover has been set.
+              COALESCE(
+                l.cover_image_url,
+                (SELECT lm.url FROM listing_media lm
+                   WHERE lm.listing_id = l.id AND lm.media_type = 'image'
+                   ORDER BY lm.is_cover DESC, lm.sort_order ASC, lm.id ASC LIMIT 1),
+                (SELECT lm.url FROM listing_media lm JOIN media_assets ma ON ma.id = lm.media_asset_id
+                   WHERE lm.listing_id = l.id AND ma.media_type = 'image'
+                   ORDER BY lm.sort_order ASC, lm.id ASC LIMIT 1)
+              ) AS cover_image_url,
               l.view_count, l.inquiry_count, l.root_category_id,
               cat.name AS category_name,
               CONCAT_WS(', ', NULLIF(cm.name, ''), NULLIF(ct.name, ''), NULLIF(co.name, '')) AS location,
@@ -155,32 +167,40 @@ export async function listAdminListings({
  * emitted and the view picks the pair its category uses.
  */
 async function listingFilterOptions(definition) {
-  const [makes, builders, manufacturers, watchBrands, carModels, yachtModels, aircraftModels, watchModels, propertyTypes, locationList] =
-    await Promise.all([
-      options.brandsOfKind("car_make"),
-      options.brandsOfKind("yacht_builder"),
-      options.brandsOfKind("aircraft_manufacturer"),
-      options.brandsOfKind("watch_brand"),
-      options.brandModels("car_make"),
-      options.brandModels("yacht_builder"),
-      options.brandModels("aircraft_manufacturer"),
-      options.brandModels("watch_brand"),
-      options.categoryTypes(1),
-      options.locations(200),
-    ]);
+  const [
+    makes, builders, jetManufacturers, helicopterManufacturers, watchBrands,
+    carModels, yachtModels, jetModels, helicopterModels, watchModels,
+    propertyTypes, locationList,
+  ] = await Promise.all([
+    options.brandsOfKind("car_make"),
+    options.brandsOfKind("yacht_builder"),
+    // Jets and helicopters share `kind = 'aircraft_manufacturer'`; `aircraft_segment`
+    // (migration 0046) is what stops one filter from listing the other's makes.
+    options.brandsOfKind("aircraft_manufacturer", "fixed_wing"),
+    options.brandsOfKind("aircraft_manufacturer", "rotorcraft"),
+    options.brandsOfKind("watch_brand"),
+    options.brandModels("car_make"),
+    options.brandModels("yacht_builder"),
+    options.brandModels("aircraft_manufacturer", "fixed_wing"),
+    options.brandModels("aircraft_manufacturer", "rotorcraft"),
+    options.brandModels("watch_brand"),
+    options.categoryTypes(1),
+    options.locations(200),
+  ]);
+  const manufacturers = [...jetManufacturers, ...helicopterManufacturers];
 
   const modelsFor = {
     cars: carModels,
     yachts: yachtModels,
-    jets: aircraftModels,
-    helicopters: aircraftModels,
+    jets: jetModels,
+    helicopters: helicopterModels,
     watches: watchModels,
   };
   const brandsFor = {
     cars: makes,
     yachts: builders,
-    jets: manufacturers,
-    helicopters: manufacturers,
+    jets: jetManufacturers,
+    helicopters: helicopterManufacturers,
     watches: watchBrands,
   };
   const type = definition?.listingType ?? null;
@@ -449,7 +469,7 @@ export async function listAdminDevelopments({
   const [rows, total, summary] = await Promise.all([
     query(
       `SELECT p.id, p.public_id, p.name, p.slug, p.canonical_path, p.tagline, p.project_type,
-              p.status, p.launch_status, p.ownership_type, p.moderation_status, p.published_at,
+              p.status, p.launch_status, p.ownership_type, p.moderation_status, p.rejection_reason, p.published_at,
               p.completion_percentage, p.launch_date, p.construction_start_date, p.handover_date,
               p.total_units, p.available_units, p.building_count,
               p.min_price, p.max_price, p.currency_code, p.cover_image_url,
@@ -539,6 +559,7 @@ function serializeAdminDevelopment(row) {
     developmentStatus: row.status,
     launchStatus: row.launch_status,
     moderationStatus: row.moderation_status,
+    rejectionReason: row.moderation_status === "rejected" ? row.rejection_reason || null : null,
     ownershipType: row.ownership_type,
     status: row.status,
     published: bool(row.is_publicly_visible) && row.moderation_status === "published",
@@ -669,7 +690,8 @@ export async function getAdminDevelopment(identifier) {
       // and internal documents, which is exactly what the public DTO must not.
       query(
         `SELECT d.public_id, d.document_type, d.title, d.description, d.visibility, d.status,
-                d.page_count, d.file_size_bytes, d.version, COALESCE(a.cdn_url, a.url) AS url
+                d.page_count, d.file_size_bytes, d.version, d.created_at,
+                a.public_id AS media_asset_id, COALESCE(a.cdn_url, a.url) AS url
            FROM documents d
            LEFT JOIN media_assets a ON a.id = d.media_asset_id
           WHERE d.owner_type = 'project' AND d.owner_id = ? AND d.deleted_at IS NULL
@@ -677,8 +699,9 @@ export async function getAdminDevelopment(identifier) {
         [row.id]
       ),
       query(
-        `SELECT fp.id, fp.name, fp.floor_level, fp.total_area_sqm, fp.total_area_sqft,
-                fp.requires_lead, fp.is_public, fp.sort_order, COALESCE(a.cdn_url, a.url) AS url
+        `SELECT fp.id, fp.name, fp.unit_type, fp.bedrooms, fp.floor_level, fp.total_area_sqm,
+                fp.total_area_sqft, fp.requires_lead, fp.is_public, fp.sort_order,
+                a.public_id AS media_asset_id, COALESCE(a.cdn_url, a.url) AS url
            FROM floor_plans fp
            LEFT JOIN media_assets a ON a.id = fp.media_asset_id
           WHERE fp.project_id = ? ORDER BY fp.sort_order ASC, fp.id ASC`,
@@ -813,28 +836,39 @@ export async function getAdminDevelopment(identifier) {
     media: {
       gallery: mediaByRole("gallery").map(asMedia),
       masterplan: mediaByRole("masterplan").map(asMedia)[0] || null,
-      video: mediaByRole("video").map((item) => ({ id: item.public_id, url: item.url, uploadType: "Upload" }))[0] || null,
+      // An uploaded file wins; a hosted URL (projects.video_url) is the fallback.
+      video:
+        mediaByRole("video").map((item) => ({ id: item.public_id, url: item.url, uploadType: "Upload" }))[0] ||
+        (row.video_url ? { url: row.video_url, uploadType: "URL" } : null),
       brochure: mediaByRole("brochure").map(asMedia)[0] || null,
       floorPlans: floorPlans.map((plan) => ({
         id: String(plan.id),
         title: plan.name,
+        name: plan.name,
+        unitType: plan.unit_type || "",
+        bedrooms: int(plan.bedrooms),
+        mediaAssetId: plan.media_asset_id || null,
         floorLevel: int(plan.floor_level),
         areaSqm: num(plan.total_area_sqm),
         areaSqft: num(plan.total_area_sqft),
         requiresLead: bool(plan.requires_lead),
         isPublic: bool(plan.is_public),
+        sortOrder: int(plan.sort_order) ?? 0,
         url: plan.url,
       })),
       documents: documents.map((document) => ({
         id: document.public_id,
         type: document.document_type,
         title: document.title,
+        name: document.title,
         description: document.description,
         visibility: document.visibility,
         status: document.status,
+        mediaAssetId: document.media_asset_id || null,
         pageCount: int(document.page_count),
         fileSizeBytes: int(document.file_size_bytes),
         version: document.version,
+        uploadedOn: isoDay(document.created_at),
         url: document.url,
       })),
       virtualTours: tours.map((tour) => ({
@@ -925,8 +959,8 @@ export async function listAdminCompanies({ status = "all", search = "", category
   const rootId = category ? rootIdFor(category) : null;
   const joins = [];
   if (rootId) {
-    joins.push(`JOIN organization_category_access oca ON oca.organization_id = o.id AND oca.status = 'approved'
-                JOIN categories occ ON occ.id = oca.category_id AND COALESCE(occ.root_category_id, occ.id) = ?`);
+    joins.push(`JOIN account_category_access aca ON aca.account_id = o.account_id AND aca.status = 'approved'
+                JOIN categories occ ON occ.id = aca.category_id AND COALESCE(occ.root_category_id, occ.id) = ?`);
     params.unshift(rootId);
   }
 
@@ -942,7 +976,7 @@ export async function listAdminCompanies({ status = "all", search = "", category
               co.id AS country_id, co.name AS country_name,
               st.id AS state_id, st.name AS state_name,
               ct.id AS city_id, ct.name AS city_name,
-              a.public_id AS account_public_id,
+              a.public_id AS account_public_id, o.account_id,
               (SELECT COUNT(*) FROM inquiries i WHERE i.organization_id = o.id AND i.deleted_at IS NULL) AS inquiry_count,
               (SELECT MAX(l.updated_at) FROM listings l WHERE l.organization_id = o.id) AS last_activity_at
          FROM organizations o
@@ -968,31 +1002,31 @@ export async function listAdminCompanies({ status = "all", search = "", category
               SUM(EXISTS (SELECT 1 FROM api_clients ac
                            WHERE ac.organization_id = o.id AND ac.revoked_at IS NULL
                              AND ac.status = 'active')) AS apiEnabled,
-              SUM((SELECT COUNT(*) FROM organization_category_access oca
-                    WHERE oca.organization_id = o.id AND oca.status = 'approved') > 1) AS multiCategory
+              SUM((SELECT COUNT(*) FROM account_category_access aca
+                    WHERE aca.account_id = o.account_id AND aca.status = 'approved') > 1) AS multiCategory
          FROM organizations o WHERE o.deleted_at IS NULL`
     ),
   ]);
 
-  const ids = rows.map((row) => row.id);
-  const categoryAccess = ids.length
+  const accountIds = rows.map((row) => row.account_id).filter(Boolean);
+  const categoryAccess = accountIds.length
     ? await query(
-        `SELECT oca.organization_id, COALESCE(c.root_category_id, c.id) AS root_category_id, oca.status
-           FROM organization_category_access oca JOIN categories c ON c.id = oca.category_id
-          WHERE oca.organization_id IN (${ids.map(() => "?").join(", ")})`,
-        ids
+        `SELECT aca.account_id, COALESCE(c.root_category_id, c.id) AS root_category_id, aca.status
+           FROM account_category_access aca JOIN categories c ON c.id = aca.category_id
+          WHERE aca.account_id IN (${accountIds.map(() => "?").join(", ")})`,
+        accountIds
       )
     : [];
   const accessByOrg = categoryAccess.reduce((map, row) => {
-    const list = map.get(String(row.organization_id)) || [];
+    const list = map.get(String(row.account_id)) || [];
     list.push(row);
-    map.set(String(row.organization_id), list);
+    map.set(String(row.account_id), list);
     return map;
   }, new Map());
 
   return adminList({
     items: rows.map((row) => {
-      const access = accessByOrg.get(String(row.id)) || [];
+      const access = accessByOrg.get(String(row.account_id)) || [];
       return {
         id: row.public_id,
         organizationId: String(row.id),
@@ -1175,8 +1209,27 @@ export async function listAdminIndividuals({ status = "all", search = "", page =
     ),
   ]);
 
+  const accountIds = rows.map((row) => row.account_id).filter(Boolean);
+  const access = accountIds.length
+    ? await query(
+        `SELECT aca.account_id, COALESCE(c.root_category_id, c.id) AS root_category_id, aca.status
+           FROM account_category_access aca JOIN categories c ON c.id = aca.category_id
+          WHERE aca.account_id IN (${accountIds.map(() => "?").join(", ")})`,
+        accountIds
+      )
+    : [];
+  const accessByAccount = new Map();
+  for (const entry of access) {
+    const key = String(entry.account_id);
+    if (!accessByAccount.has(key)) accessByAccount.set(key, []);
+    accessByAccount.get(key).push(entry);
+  }
+
   return adminList({
-    items: rows.map((row) => ({
+    items: rows.map((row) => {
+      const grants = accessByAccount.get(String(row.account_id)) || [];
+      const approvedRoots = grants.filter((g) => g.status === "approved").map((g) => g.root_category_id);
+      return {
       id: row.public_id,
       userId: String(row.id),
       accountId: row.account_public_id,
@@ -1201,12 +1254,14 @@ export async function listAdminIndividuals({ status = "all", search = "", page =
       address: null,
       listings: int(row.listing_count) ?? 0,
       listingCount: int(row.listing_count) ?? 0,
-      enabledCategories: row.account_type_code === "lister" ? ["realEstate"] : [],
-      primaryCategory: row.account_type_code === "lister" ? "realEstate" : null,
+      enabledCategories: categoryIdsFor(approvedRoots),
+      requestedCategories: categoryIdsFor(grants.filter((g) => g.status === "requested").map((g) => g.root_category_id)),
+      primaryCategory: categoryIdsFor(approvedRoots)[0] ?? null,
       agentId: row.agent_public_id,
       dateAdded: isoDate(row.created_at),
       lastActivityAt: isoDate(row.last_seen_at || row.created_at),
-    })),
+      };
+    }),
     total,
     page: safePage,
     pageSize: safeSize,
@@ -1674,7 +1729,16 @@ export async function listOwnerListings({ ownerType, ownerId, page = 1, pageSize
   const [rows, total] = await Promise.all([
     query(
       `SELECT l.id, l.public_id, l.reference, l.title, l.status, l.moderation_status, l.price,
-              l.currency_code, l.cover_image_url, l.created_at, l.published_at, l.updated_at,
+              l.currency_code, l.created_at, l.published_at, l.updated_at,
+              COALESCE(
+                l.cover_image_url,
+                (SELECT lm.url FROM listing_media lm
+                   WHERE lm.listing_id = l.id AND lm.media_type = 'image'
+                   ORDER BY lm.is_cover DESC, lm.sort_order ASC, lm.id ASC LIMIT 1),
+                (SELECT lm.url FROM listing_media lm JOIN media_assets ma ON ma.id = lm.media_asset_id
+                   WHERE lm.listing_id = l.id AND ma.media_type = 'image'
+                   ORDER BY lm.sort_order ASC, lm.id ASC LIMIT 1)
+              ) AS cover_image_url,
               l.view_count, l.inquiry_count, l.root_category_id, cat.name AS category_name,
               CONCAT_WS(', ', NULLIF(cm.name, ''), NULLIF(ct.name, ''), NULLIF(co.name, '')) AS location,
               COALESCE(org.name, u.display_name) AS owner, org.public_id AS organization_public_id,

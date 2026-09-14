@@ -92,21 +92,28 @@ export async function categoryTypes(rootCategoryId) {
   return rows.map((row) => ({ ...pair(row.code || String(row.id), row.name), slug: row.slug }));
 }
 
-export async function brandsOfKind(kind) {
+/**
+ * `segment` disambiguates a `kind` two categories share — today only
+ * `aircraft_manufacturer` (jets `fixed_wing` vs helicopters `rotorcraft`,
+ * `brands.aircraft_segment`, migration 0046). Every other kind has none.
+ */
+export async function brandsOfKind(kind, segment = null) {
   const rows = await query(
-    "SELECT id, name, slug FROM brands WHERE kind = ? AND deleted_at IS NULL AND is_active = 1 ORDER BY name ASC LIMIT 400",
-    [kind]
+    `SELECT id, name, slug FROM brands
+      WHERE kind = ? AND deleted_at IS NULL AND is_active = 1${segment ? " AND aircraft_segment = ?" : ""}
+      ORDER BY name ASC LIMIT 400`,
+    segment ? [kind, segment] : [kind]
   );
   return rows.map((row) => ({ ...pair(String(row.id), row.name), slug: row.slug }));
 }
 
-export async function brandModels(kind) {
+export async function brandModels(kind, segment = null) {
   const rows = await query(
     `SELECT bm.id, bm.name, bm.slug, bm.brand_id
        FROM brand_models bm JOIN brands b ON b.id = bm.brand_id
-      WHERE b.kind = ? AND bm.is_active = 1
+      WHERE b.kind = ? AND bm.is_active = 1${segment ? " AND b.aircraft_segment = ?" : ""}
       ORDER BY bm.name ASC LIMIT 600`,
-    [kind]
+    segment ? [kind, segment] : [kind]
   );
   return rows.map((row) => ({ ...pair(String(row.id), row.name), slug: row.slug, brandId: String(row.brand_id) }));
 }

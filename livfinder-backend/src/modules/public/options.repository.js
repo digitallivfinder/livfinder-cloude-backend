@@ -17,6 +17,14 @@ const BRAND_KIND = {
   watches: "watch_brand",
 };
 
+/**
+ * Jets and helicopters share `brands.kind = 'aircraft_manufacturer'` (deliberately —
+ * see `search.repository.js`), so `kind` alone cannot tell a jet maker from a
+ * helicopter maker. `brands.aircraft_segment` (migration 0046) is the finer signal;
+ * every other kind has exactly one segment, so it does not apply to them.
+ */
+const AIRCRAFT_SEGMENT = { jets: "fixed_wing", helicopters: "rotorcraft" };
+
 /** Matches the frontend's entity id vocabulary exactly. */
 const PARENT_TYPE = { cars: "make", watches: "brand", "real-estate": "developer" };
 const CHILD_TYPE = { watches: "collection" };
@@ -65,6 +73,11 @@ export async function listBrands(listingType, { q = null, limit = 40, onlyWithLi
   const definition = resolveCategory(listingType);
   const params = [kind];
   const conditions = ["b.kind = ?", "b.is_active = 1", "b.deleted_at IS NULL"];
+  const segment = AIRCRAFT_SEGMENT[listingType];
+  if (segment) {
+    conditions.push("b.aircraft_segment = ?");
+    params.push(segment);
+  }
   if (q) {
     conditions.push("(b.name LIKE ? OR b.slug LIKE ?)");
     params.push(`${q}%`, `${q}%`);
@@ -120,6 +133,11 @@ export async function listModels(listingType, { brandSlug = null, q = null, limi
   const definition = resolveCategory(listingType);
   const params = [kind];
   const conditions = ["b.kind = ?", "bm.is_active = 1", "b.is_active = 1", "b.deleted_at IS NULL"];
+  const segment = AIRCRAFT_SEGMENT[listingType];
+  if (segment) {
+    conditions.push("b.aircraft_segment = ?");
+    params.push(segment);
+  }
   if (brandSlug) {
     conditions.push("b.slug = ?");
     params.push(String(brandSlug).replace(/^[a-z]+:/, ""));
@@ -287,7 +305,7 @@ const FACET_KEY_COLUMN = {
  * `filterKey` is the frontend's own naming (carModel, yachtType, brand …); the
  * mapping to a data source lives here so the frontend keeps its vocabulary.
  */
-export async function filterOptions(category, filterKey, { q = null, parent = null, limit = 30, preferCountry = null } = {}) {
+export async function filterOptions(category, filterKey, { q = null, parent = null, limit = 30, preferCountry = null, all = false } = {}) {
   const definition = resolveCategory(category);
   const listingType = definition?.listingType || "real-estate";
 
@@ -316,11 +334,11 @@ export async function filterOptions(category, filterKey, { q = null, parent = nu
   }
 
   if (["make", "brand", "builder", "manufacturer", "developer"].includes(filterKey)) {
-    return listBrands(listingType, { q, limit });
+    return listBrands(listingType, { q, limit, onlyWithListings: !all });
   }
 
   if (["model", "carModel", "yachtModel", "aircraftModel", "helicopterModel", "watchModel", "collection"].includes(filterKey)) {
-    return listModels(listingType, { brandSlug: parent, q, limit });
+    return listModels(listingType, { brandSlug: parent, q, limit, onlyWithListings: !all });
   }
 
   if (filterKey === "year") {

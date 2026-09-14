@@ -91,10 +91,35 @@ const FACET_FILTERS = {
  * Filters that cannot be served from the projection and require the detail
  * table. Requesting one adds a single join — it does not degrade the common path.
  */
+/**
+ * A colour filter asks for a family, not a paint code.
+ *
+ * `exterior_color` / `interior_color` hold the maker's own names — "Rosso Corsa", "Blu Pozzi",
+ * "Nero Daytona", "Cognac Leather" — and the filter offers families: Red, Blue, Black, Tan. A
+ * plain LIKE on the family word matched none of the Italian and French names, so "Blue" and
+ * "Red" returned nothing on a catalogue full of blue and red cars. A value that is not a known
+ * family still matches as free text.
+ */
+export const COLOUR_FAMILIES = {
+  black: ["black", "nero", "noir", "schwarz", "onyx", "obsidian", "carbon"],
+  white: ["white", "bianco", "blanc", "weiss", "pearl", "arctic"],
+  silver: ["silver", "argento", "argent", "platinum"],
+  grey: ["grey", "gray", "grigio", "anthracite", "titanium", "graphite", "charcoal", "gunmetal"],
+  blue: ["blue", "blu", "bleu", "navy", "azzurro"],
+  red: ["red", "rosso", "rouge", "burgundy", "bordeaux"],
+  green: ["green", "verde", "vert"],
+  yellow: ["yellow", "giallo", "jaune"],
+  gold: ["gold", "champagne", "oro", "bronze"],
+  orange: ["orange", "arancio"],
+  brown: ["brown", "cognac", "marrone", "chocolate", "saddle", "tan"],
+  tan: ["tan", "cognac", "saddle", "caramel"],
+  beige: ["beige", "cream", "sand", "ivory"],
+};
+
 const DETAIL_FILTERS = {
   cars: {
-    exteriorColor: { table: "listing_vehicle", alias: "d_veh", column: "exterior_color", op: "like" },
-    interiorColor: { table: "listing_vehicle", alias: "d_veh", column: "interior_color", op: "like" },
+    exteriorColor: { table: "listing_vehicle", alias: "d_veh", column: "exterior_color", op: "colour" },
+    interiorColor: { table: "listing_vehicle", alias: "d_veh", column: "interior_color", op: "colour" },
     drivetrain: { table: "listing_vehicle", alias: "d_veh", column: "drivetrain", op: "eq" },
     bodyType: { table: "listing_vehicle", alias: "d_veh", column: "body_type", op: "eq" },
   },

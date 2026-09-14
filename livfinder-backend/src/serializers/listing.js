@@ -1,5 +1,6 @@
 import { bool, int, isoDate, isoDay, jsonField, money, num } from "./primitives.js";
 import { categoryByRootId } from "../utils/categories.js";
+import { descriptionToHtml, descriptionToText } from "../utils/richText.js";
 
 /**
  * Card projection.
@@ -283,6 +284,10 @@ export function serializeListingDetail({ listing, detail, media = [], features =
     slug: listing.slug,
     propertyUrl: listing.slug,
     description: listing.description || "",
+    // What a page renders — sanitised rich text, or plain text as escaped paragraphs — and
+    // the words alone for meta descriptions and structured data.
+    descriptionHtml: descriptionToHtml(listing.description),
+    descriptionText: descriptionToText(listing.description),
     canonicalUrl: listing.canonical_path,
     canonicalPath: listing.canonical_path,
     price: money(listing.price, listing.currency_code),
@@ -315,6 +320,15 @@ export function serializeListingDetail({ listing, detail, media = [], features =
       community: listing.community_name || null,
       subCommunity: listing.sub_community_name || null,
     },
+    // The ids behind `locationNames`, so an edit form reopens the same selection
+    // rather than guessing a place back from its name.
+    locationIds: {
+      country: int(listing.country_id),
+      state: int(listing.state_id),
+      city: int(listing.city_id),
+      community: int(listing.community_id),
+      subCommunity: int(listing.sub_community_id),
+    },
     address: bool(listing.hide_exact_location) ? null : listing.address || null,
     addressDisplayPrecision: bool(listing.hide_exact_location) ? "locality" : "exact",
     latitude: bool(listing.hide_exact_location) ? null : num(listing.latitude),
@@ -325,10 +339,13 @@ export function serializeListingDetail({ listing, detail, media = [], features =
       ? { url: listing.cover_image_url, alt: listing.cover_image_alt || listing.title }
       : gallery[0] || null,
     documents: media
-      .filter((item) => ["document", "floor_plan", "virtual_tour"].includes(item.media_type))
+      .filter((item) => ["document", "floor_plan", "virtual_tour", "video"].includes(item.media_type))
       .map((item) => ({
         id: item.public_id || String(item.id),
+        // The `listing_media` row id — what the edit, retype and remove calls address.
+        mediaId: String(item.id),
         type: item.media_type,
+        documentType: item.tag || null,
         url: item.url,
         label: item.caption || item.alt_text || item.media_type,
       })),

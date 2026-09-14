@@ -126,7 +126,9 @@ FROM (
   UNION ALL SELECT 'luxhabitat', 'private.luxhabitat.com',    1, 1, 1,    'United Kingdom',       NULL,   540,  41
   UNION ALL SELECT 'luxhabitat', 'ar.luxhabitat.com',         0, 0, 2,    NULL,                   NULL,   300,  41
   UNION ALL SELECT 'knight',     'market.knightyachts.fr',    1, 1, 3,    'France',               NULL,   430,  9
-  UNION ALL SELECT 'aurum',      'jets.aurumaviation.com',    1, 1, 1,    'United Kingdom',       NULL,   300,  73
+  -- cert_age 73 left 17 days of validity at seed time, so the "certificate expiring within
+  -- fourteen days" alert fired three days after every reseed. 45 keeps a realistic mix.
+  UNION ALL SELECT 'aurum',      'jets.aurumaviation.com',    1, 1, 1,    'United Kingdom',       NULL,   300,  45
   UNION ALL SELECT 'monaco',     'www.rivierapartners.mc',    1, 1, 3,    'Monaco',               NULL,   210,  30
   UNION ALL SELECT 'embed',      'widgets.livfinder.com',     1, 1, 1,    NULL,                   NULL,   150,  12
   UNION ALL SELECT 'staging',    'staging.livfinder.com',     1, 1, 1,    NULL,                   NULL,   30,   30

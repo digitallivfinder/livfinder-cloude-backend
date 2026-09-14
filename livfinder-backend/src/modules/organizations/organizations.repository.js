@@ -35,10 +35,11 @@ async function decorateOrganizations(rows) {
       ids
     ),
     query(
-      `SELECT oca.organization_id, COALESCE(c.root_category_id, c.id) AS root_category_id
-         FROM organization_category_access oca
-         JOIN categories c ON c.id = oca.category_id
-        WHERE oca.organization_id IN (${placeholders}) AND oca.status = 'approved'`,
+      `SELECT o.id AS organization_id, COALESCE(c.root_category_id, c.id) AS root_category_id
+         FROM organizations o
+         JOIN account_category_access aca ON aca.account_id = o.account_id AND aca.status = 'approved'
+         JOIN categories c ON c.id = aca.category_id
+        WHERE o.id IN (${placeholders})`,
       ids
     ),
     query(
@@ -97,8 +98,8 @@ export async function listPublicOrganizations({
     params.push(kind);
   }
   if (rootCategoryId) {
-    joins.push(`JOIN organization_category_access oca ON oca.organization_id = o.id AND oca.status = 'approved'
-                JOIN categories oc ON oc.id = oca.category_id AND COALESCE(oc.root_category_id, oc.id) = ?`);
+    joins.push(`JOIN account_category_access aca ON aca.account_id = o.account_id AND aca.status = 'approved'
+                JOIN categories oc ON oc.id = aca.category_id AND COALESCE(oc.root_category_id, oc.id) = ?`);
     params.unshift(Number(rootCategoryId));
   }
 

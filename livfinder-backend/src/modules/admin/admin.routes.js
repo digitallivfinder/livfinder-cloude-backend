@@ -115,11 +115,32 @@ router.get(
   requirePermission("listings.view"),
   asyncHandler(async (req, res) => {
     const { getListingDetail } = await import("../listings/listings.repository.js");
+    const { listListingMedia } = await import("../media/listingMedia.service.js");
     const result = await getListingDetail({ publicId: req.params.id, reference: req.params.id }, { source: "any", includePrivate: true });
     if (!result) throw AppError.notFound("That listing was not found.");
     assertRootCategoryScope(req, result.raw.root_category_id);
-    const [summary] = (await catalog.listAdminListings({ search: result.raw.reference, pageSize: 1 })).items;
-    return res.json(detailResponse({ ...result.detail, admin: summary ?? null, status: result.raw.status, moderationStatus: result.raw.moderation_status }));
+    const [[summary], engagement, media] = await Promise.all([
+      catalog.listAdminListings({ search: result.raw.reference, pageSize: 1 }).then((page) => page.items),
+      crm.getAdminListingEngagement({ listingId: result.raw.id }),
+      // The full media list, every type, exactly as the client portal detail
+      // endpoint returns it — the serializer's `gallery` is filtered to
+      // `media_type = 'image'`, which hides image files uploaded as a floor plan
+      // or document.
+      listListingMedia(result.raw.id, { includePrivate: true }),
+    ]);
+    return res.json(
+      detailResponse({
+        ...result.detail,
+        admin: summary ?? null,
+        status: result.raw.status,
+        moderationStatus: result.raw.moderation_status,
+        // The moderator's own screen showed "Rejected" with no reason (developments show it).
+        // Only while rejected: a reason belongs to one rejection.
+        rejectionReason: result.raw.moderation_status === "rejected" ? result.raw.rejection_reason || null : null,
+        engagement,
+        mediaItems: media,
+      })
+    );
   })
 );
 
@@ -207,6 +228,12 @@ router.patch(
   scopeDevelopmentParam(),
   validate({ body: mutations.developmentSchema.partial().extend({ name: z.string().trim().min(1).max(200) }) }),
   asyncHandler(async (req, res) => {
+    // Same rule as listings: a rejection has to tell the developer why.
+    if (req.body.moderationStatus === "rejected" && !String(req.body.rejectionReason || "").trim()) {
+      throw AppError.validation("Some information is invalid.", {
+        rejectionReason: "A reason is required to reject a development.",
+      });
+    }
     const result = await mutations.upsertDevelopment({ identifier: req.params.id, payload: req.body, userId: req.auth.user.id });
     await auditFromRequest(req, { action: "development.updated", subjectType: "project", subjectLabel: req.params.id, changes: req.body });
     return res.json(detailResponse(result));
@@ -319,6 +346,22 @@ router.patch(
       userId: req.auth.user.id,
     });
     await auditFromRequest(req, { action: "category_access.decided", subjectType: "organization", subjectLabel: req.params.id, changes: req.body });
+    return res.json(detailResponse(result));
+  })
+);
+
+router.patch(
+  "/individuals/:id/category-access",
+  writeLimiter,
+  requirePermission("categoryAccess.decide"),
+  validate({ body: mutations.categoryAccessSchema }),
+  asyncHandler(async (req, res) => {
+    const result = await mutations.decideCategoryAccess({
+      userPublicId: req.params.id,
+      ...req.body,
+      userId: req.auth.user.id,
+    });
+    await auditFromRequest(req, { action: "category_access.decided", subjectType: "account", subjectLabel: req.params.id, changes: req.body });
     return res.json(detailResponse(result));
   })
 );

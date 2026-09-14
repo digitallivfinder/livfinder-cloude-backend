@@ -66,8 +66,8 @@ export const realEstateDetail = z.object({
   yearBuilt: optionalInt(1500, 2200),
   completionStatus: z.enum(["ready", "off_plan", "under_construction", "shell_and_core"]).optional().nullable(),
   handoverDate: z.string().max(20).optional().nullable(),
-  furnishing: z.enum(["unfurnished", "semi_furnished", "furnished", "fully_fitted", "shell"]).optional().nullable(),
-  ownershipType: z.enum(["freehold", "leasehold", "usufruct", "commonhold", "share_of_freehold"]).optional().nullable(),
+  furnishing: z.enum(["unfurnished", "semi_furnished", "furnished", "fully_fitted"]).optional().nullable(),
+  ownershipType: z.enum(["freehold", "leasehold", "usufruct", "musataha", "commonhold", "share_of_freehold"]).optional().nullable(),
   viewType: optionalText(120),
   rentPeriod: z.enum(["yearly", "monthly", "weekly", "daily"]).optional().nullable(),
   chequesAccepted: optionalInt(0, 12),
@@ -83,7 +83,8 @@ export const vehicleDetail = z.object({
   bodyType: optionalText(60),
   transmission: z.enum(["manual", "automatic", "semi_automatic", "cvt", "dual_clutch", "single_speed"]).optional().nullable(),
   fuelType: z.enum(["petrol", "diesel", "hybrid", "plug_in_hybrid", "electric", "hydrogen", "other"]).optional().nullable(),
-  drivetrain: z.enum(["fwd", "rwd", "awd", "four_wd"]).optional().nullable(),
+  drivetrain: z.enum(["fwd", "rwd", "awd", "4wd"]).optional().nullable(),
+  serviceHistory: z.enum(["none", "partial", "full", "full_dealer"]).optional().nullable(),
   engineSizeCc: optionalInt(0, 100_000),
   cylinders: optionalInt(0, 24),
   horsepower: optionalInt(0, 5000),
@@ -93,7 +94,7 @@ export const vehicleDetail = z.object({
   interiorColor: optionalText(60),
   doors: optionalInt(0, 10),
   seats: optionalInt(0, 30),
-  conditionType: z.enum(["new", "used", "certified_pre_owned", "classic", "restored", "project"]).optional().nullable(),
+  conditionType: z.enum(["new", "used", "certified_pre_owned", "classic", "salvage", "restored", "project"]).optional().nullable(),
   steeringSide: z.enum(["left", "right"]).optional().nullable(),
   vin: optionalText(40),
   regionalSpec: optionalText(60),
@@ -110,8 +111,17 @@ export const marineDetail = z.object({
   beamM: optionalNumber(0, 200),
   draftM: optionalNumber(0, 100),
   grossTonnage: optionalNumber(0, 1_000_000),
-  vesselType: optionalText(60),
-  hullMaterial: optionalText(60),
+  vesselType: z
+    .enum([
+      "motor_yacht", "sailing_yacht", "superyacht", "mega_yacht", "catamaran", "trimaran",
+      "explorer", "sport_fisher", "gulet", "classic", "tender", "houseboat",
+    ])
+    .optional()
+    .nullable(),
+  hullMaterial: z
+    .enum(["grp", "steel", "aluminium", "wood", "composite", "ferrocement"])
+    .optional()
+    .nullable(),
   cabins: optionalInt(0, 100),
   berths: optionalInt(0, 200),
   heads: optionalInt(0, 100),
@@ -130,7 +140,14 @@ export const marineDetail = z.object({
 });
 
 export const aviationDetail = z.object({
-  aircraftType: optionalText(60),
+  aircraftType: z
+    .enum([
+      "very_light_jet", "light_jet", "midsize_jet", "super_midsize_jet", "heavy_jet",
+      "ultra_long_range", "vip_airliner", "turboprop",
+      "light_helicopter", "medium_helicopter", "heavy_helicopter",
+    ])
+    .optional()
+    .nullable(),
   yearBuilt: optionalInt(1900, 2200),
   yearRefurbished: optionalInt(1900, 2200),
   totalTimeHours: optionalInt(0, 500_000),
@@ -163,17 +180,17 @@ export const timepieceDetail = z.object({
   dialColor: optionalText(60),
   dialType: optionalText(60),
   braceletMaterial: optionalText(60),
-  movementType: z.enum(["automatic", "manual", "quartz", "spring_drive", "solar", "kinetic", "mechanical"]).optional().nullable(),
+  movementType: z.enum(["automatic", "manual", "quartz", "spring_drive", "solar", "mechanical_digital"]).optional().nullable(),
   caliber: optionalText(60),
   powerReserveHours: optionalInt(0, 10_000),
   jewels: optionalInt(0, 200),
   waterResistanceM: optionalInt(0, 20_000),
-  conditionGrade: z.enum(["new", "unworn", "excellent", "very_good", "good", "fair", "for_parts"]).optional().nullable(),
+  conditionGrade: z.enum(["new", "unworn", "excellent", "very_good", "good", "fair", "restored"]).optional().nullable(),
   hasOriginalBox: z.boolean().optional(),
   hasOriginalPapers: z.boolean().optional(),
   isFullSet: z.boolean().optional(),
   isLimitedEdition: z.boolean().optional(),
-  gender: z.enum(["mens", "womens", "unisex"]).optional().nullable(),
+  gender: z.enum(["mens", "ladies", "unisex"]).optional().nullable(),
 });
 
 export const DETAIL_SCHEMAS = {
@@ -201,6 +218,10 @@ export const createListingSchema = z
 export const updateListingSchema = z.object({
   ...Object.fromEntries(Object.entries(commonListing).map(([key, schema]) => [key, schema.optional()])),
   detail: z.record(z.string(), z.unknown()).optional(),
+  // The edit form's "Save draft" / "Submit for review". Without it here, zod stripped it and
+  // "Submit for review" on an edited rejected listing never resubmitted it. Publishing stays a
+  // moderator action; a live listing an owner edits goes back to review regardless.
+  status: z.enum(["draft", "pending_review"]).optional(),
 });
 
 export const listingStatusSchema = z.object({

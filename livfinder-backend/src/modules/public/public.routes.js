@@ -345,6 +345,34 @@ router.get(
 
 
 /* --------------------------------------------------------------------------
+ * Features
+ * ------------------------------------------------------------------------ */
+
+/**
+ * The features a category's listings may carry — the list the portal form offers, so a
+ * lister picks from the catalogue rather than typing tags nothing can filter by.
+ */
+router.get(
+  "/features",
+  asyncHandler(async (req, res) => {
+    const definition = resolveCategory(String(req.query.category || ""));
+    if (!definition) throw AppError.validation("Some information is invalid.", { category: "Unknown category." });
+    const rows = await query(
+      `SELECT f.id, f.slug, f.name, fg.name AS group_name
+         FROM category_features cf
+         JOIN features f ON f.id = cf.feature_id
+         LEFT JOIN feature_groups fg ON fg.id = f.feature_group_id
+        WHERE cf.category_id = ?
+        ORDER BY fg.sort_order ASC, cf.sort_order ASC, f.name ASC`,
+      [definition.rootId]
+    );
+    return res.json(
+      detailResponse(rows.map((row) => ({ id: Number(row.id), slug: row.slug, name: row.name, group: row.group_name || null })))
+    );
+  })
+);
+
+/* --------------------------------------------------------------------------
  * Locations and countries
  * ------------------------------------------------------------------------ */
 
@@ -463,8 +491,12 @@ router.get(
   asyncHandler(async (req, res) => {
     const parent = await locationsRepo.resolveLocation(req.params.id);
     if (!parent) throw AppError.notFound("That location could not be found.");
-    const rows = await locationsRepo.listChildren(parent.id, { limit: Number(req.query.limit) || 100 });
-    return res.json({ options: rows.map(locationsRepo.toEntity) });
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
+    const q = String(req.query.q ?? "").trim().slice(0, 120) || null;
+    const rows = await locationsRepo.listChildren(parent.id, { limit, q });
+    // `hasMore` tells a picker the page is not the whole list, so it searches the
+    // server instead of filtering what it already holds.
+    return res.json({ options: rows.map(locationsRepo.toEntity), hasMore: rows.length === limit });
   })
 );
 
@@ -481,6 +513,9 @@ router.get(
       limit: Number(req.query.limit) || 30,
       // The header's selected country. Orders the location list; never restricts it.
       preferCountry: req.query.preferCountry || null,
+      // Search menus offer only makes/models/types the marketplace has inventory for;
+      // the add-listing form needs the whole catalogue, so it asks for `all`.
+      all: req.query.all === "true" || req.query.all === "1",
     });
     return res.json({ options, data: options });
   })

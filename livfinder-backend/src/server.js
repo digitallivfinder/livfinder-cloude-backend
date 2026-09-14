@@ -39,6 +39,16 @@ const server = app.listen(env.PORT, async () => {
   } catch (error) {
     logger.error({ err: error }, "permission catalogue could not be loaded");
   }
+  // Time-triggered listing maintenance — expiry, stale projections, sitemap, rollup counters.
+  // There was no scheduler at all, so an expired listing stayed "active" everywhere but the view.
+  if (env.NODE_ENV !== "test") {
+    try {
+      const { startListingMaintenance } = await import("./modules/listings/listings.jobs.js");
+      startListingMaintenance();
+    } catch (error) {
+      logger.error({ err: error }, "listing maintenance could not be started");
+    }
+  }
 });
 
 async function shutdown(signal) {

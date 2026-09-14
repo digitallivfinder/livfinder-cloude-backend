@@ -1,6 +1,6 @@
 import { query, queryValue } from "../../db/query.js";
 import { resolveLocation } from "../locations/locations.repository.js";
-import { normalizeSearchInput, SORT_MAP, RANGE_FILTERS, FACET_FILTERS, DETAIL_FILTERS } from "./searchFilters.js";
+import { normalizeSearchInput, SORT_MAP, RANGE_FILTERS, FACET_FILTERS, DETAIL_FILTERS, COLOUR_FAMILIES } from "./searchFilters.js";
 import { serializeListingCard } from "../../serializers/listing.js";
 
 /**
@@ -260,7 +260,11 @@ export async function buildSearchQuery(rawFilters = {}) {
     if (!joins.some((join) => join.includes(` ${spec.alias} `))) {
       joins.push(`JOIN ${spec.table} ${spec.alias} ON ${spec.alias}.listing_id = ls.listing_id`);
     }
-    if (spec.op === "like") {
+    if (spec.op === "colour") {
+      const words = COLOUR_FAMILIES[String(value).trim().toLowerCase()] || [String(value).slice(0, 60)];
+      conditions.push(`(${words.map(() => `${spec.alias}.${spec.column} LIKE ?`).join(" OR ")})`);
+      params.push(...words.map((word) => `%${word}%`));
+    } else if (spec.op === "like") {
       conditions.push(`${spec.alias}.${spec.column} LIKE ?`);
       params.push(`%${String(value).slice(0, 60)}%`);
     } else if (spec.op === "bool") {

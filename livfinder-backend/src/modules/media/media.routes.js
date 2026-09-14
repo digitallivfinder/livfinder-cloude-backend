@@ -4,7 +4,8 @@ import { z } from "zod";
 import { asyncHandler } from "../../middleware/errors.js";
 import { validate } from "../../middleware/validation.js";
 import { uploadLimiter } from "../../middleware/rateLimit.js";
-import { requireAuth } from "../../middleware/auth.js";
+import { requireAuth, requireAccountCapability } from "../../middleware/auth.js";
+import * as devAttachments from "../projects/developmentAttachments.service.js";
 import { AppError } from "../../utils/errors.js";
 import { detailResponse } from "../../utils/http.js";
 import { getStorage } from "../../config/storage.js";
@@ -12,6 +13,7 @@ import { LocalStorageAdapter } from "../../storage/localStorage.js";
 import * as mediaService from "./media.service.js";
 import * as listingMedia from "./listingMedia.service.js";
 import { assertListingAccess } from "../portal/authorization.js";
+import { categoryAllowsMedia, categoryDocumentTypes } from "../../utils/categoryMedia.js";
 import { auditFromRequest } from "../system/audit.service.js";
 import { readVerificationDocument } from "../accounts/verification.service.js";
 import { queryOne } from "../../db/query.js";
@@ -117,8 +119,12 @@ router.post(
         caption: req.body.caption ? String(req.body.caption).slice(0, 500) : null,
       });
       results.push({
+        // Both ids are the public id: every attach path (listing create,
+        // `POST /listings/:id/media`) resolves media by `public_id`, and the
+        // listing-media serializer reports `assetId` the same way. Handing back
+        // the numeric row id here silently broke gallery attach on create.
         id: asset.public_id,
-        assetId: String(asset.id),
+        assetId: asset.public_id,
         url: asset.url,
         thumbnailUrl: mediaService.thumbnailFrom(asset.renditions || [], asset.url),
         width: asset.width,
@@ -206,6 +212,19 @@ router.get(
   })
 );
 
+/**
+ * Any media change an owner makes to a live listing — a photo added, removed, reordered or
+ * re-captioned, a file or a link — sends it back for review, exactly like an edit to its text:
+ * the public page would otherwise show media no moderator has seen. A platform user is not the
+ * owner and their change sends nothing back.
+ */
+async function sendBackIfLive(req, listing, reason) {
+  if (req.auth.platform?.roles?.length) return;
+  if (listing.status !== "active") return;
+  const { sendBackForReview } = await import("../listings/listings.service.js");
+  await sendBackForReview({ listingId: listing.id, userId: req.auth.user.id, reason: `${reason} by the owner after approval` });
+}
+
 router.post(
   "/listings/:listingId/media",
   uploadLimiter,
@@ -245,7 +264,7 @@ router.post(
     // Attaching an existing library asset: it must belong to this account, or
     // be an unowned platform asset.
     for (const publicId of attachAssetIds) {
-      const asset = await mediaService.getAssetByPublicId(publicId);
+      const asset = await mediaService.resolveAssetRef(publicId);
       if (!asset) throw AppError.badRequest("One of the selected media items no longer exists.");
       if (asset.account_id && String(asset.account_id) !== String(req.auth.activeAccountId)) {
         throw AppError.forbidden("That media item belongs to another account.");
@@ -256,6 +275,7 @@ router.post(
     await listingMedia.syncListingMediaCounters(listing.id);
     const { refreshListingSearch } = await import("../listings/listings.repository.js");
     await refreshListingSearch(listing.id);
+    await sendBackIfLive(req, listing, "Photos added");
 
     await auditFromRequest(req, {
       action: "listing.media_added",
@@ -265,6 +285,122 @@ router.post(
     });
 
     return res.status(201).json({ data: await listingMedia.listListingMedia(listing.id, { includePrivate: true }) });
+  })
+);
+
+/**
+ * Floor plans and documents: a PDF or an image, attached under its own media type so it
+ * never joins the gallery or becomes the cover. A document carries its type — title deed,
+ * brochure, NOC — in `tag`.
+ */
+const FILE_MEDIA_TYPES = ["floor_plan", "document"];
+
+router.post(
+  "/listings/:listingId/files",
+  uploadLimiter,
+  requireAuth,
+  validate({ params: listingIdParam }),
+  upload.array("files", 10),
+  asyncHandler(async (req, res) => {
+    const listing = await assertListingAccess(req, req.params.listingId, "edit");
+    const files = req.files || [];
+    if (!files.length) throw AppError.badRequest("Attach at least one file.");
+
+    const mediaType = String(req.body.mediaType || "");
+    if (!FILE_MEDIA_TYPES.includes(mediaType)) {
+      throw AppError.validation("Some information is invalid.", { mediaType: "Choose floor plan or document." });
+    }
+    if (mediaType === "floor_plan" && !categoryAllowsMedia(listing.root_category_id, "floor_plan")) {
+      throw AppError.validation("Some information is invalid.", { mediaType: "Floor plans are only for real estate listings." });
+    }
+    const tag = req.body.tag ? String(req.body.tag) : null;
+    if (mediaType === "document") {
+      const allowed = categoryDocumentTypes(listing.root_category_id);
+      if (!listingMedia.LISTING_DOCUMENT_TYPES.includes(tag) || !allowed.includes(tag)) {
+        throw AppError.validation("Some information is invalid.", { tag: "Choose a document type for this category." });
+      }
+    }
+    const caption = String(req.body.caption || "").trim().slice(0, 500) || null;
+
+    for (const file of files) {
+      const owner = { buffer: file.buffer, originalFileName: file.originalname, accountId: req.auth.activeAccountId, userId: req.auth.user.id };
+      let stored;
+      if (mediaService.isPdf(file.buffer)) {
+        stored = await mediaService.storeDocument({ ...owner, caption });
+      } else {
+        try {
+          stored = await mediaService.storeImage({ ...owner, scope: "listings", caption });
+        } catch (error) {
+          if (error?.status === 415) throw AppError.unsupportedMedia("Upload a PDF, JPG, PNG or WebP file.");
+          throw error;
+        }
+      }
+      await listingMedia.attachAssetToListing({
+        listingId: listing.id,
+        assetId: stored.id,
+        mediaType,
+        caption: caption || String(file.originalname || "").slice(0, 500) || null,
+        tag: mediaType === "document" ? tag : null,
+        isCover: false,
+      });
+    }
+
+    await listingMedia.syncListingMediaCounters(listing.id);
+    const { refreshListingSearch } = await import("../listings/listings.repository.js");
+    await refreshListingSearch(listing.id);
+    await sendBackIfLive(req, listing, "Files added");
+    await auditFromRequest(req, {
+      action: "listing.media_added",
+      subjectType: "listing",
+      subjectId: listing.id,
+      metadata: { uploaded: files.length, mediaType },
+    });
+    return res.status(201).json({ data: await listingMedia.listListingMedia(listing.id, { includePrivate: true }) });
+  })
+);
+
+const httpsUrl = z
+  .string()
+  .trim()
+  .url()
+  .max(700)
+  .refine((value) => /^https:\/\//i.test(value), "Use an https:// link.");
+
+/** Videos and virtual tours are links to where they are hosted, never uploaded bytes. */
+router.post(
+  "/listings/:listingId/links",
+  requireAuth,
+  validate({
+    params: listingIdParam,
+    body: z.object({
+      mediaType: z.enum(["video", "virtual_tour"]),
+      url: httpsUrl,
+      caption: z.string().trim().max(500).optional(),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const listing = await assertListingAccess(req, req.params.listingId, "edit");
+    if (!categoryAllowsMedia(listing.root_category_id, req.body.mediaType)) {
+      throw AppError.validation("Some information is invalid.", {
+        mediaType: req.body.mediaType === "virtual_tour"
+          ? "Virtual tours are only for real estate listings."
+          : "That media type is not available for this category.",
+      });
+    }
+    const data = await listingMedia.addListingLink({
+      listingId: listing.id,
+      mediaType: req.body.mediaType,
+      url: req.body.url,
+      caption: req.body.caption || null,
+    });
+    await sendBackIfLive(req, listing, "Link added");
+    await auditFromRequest(req, {
+      action: "listing.media_added",
+      subjectType: "listing",
+      subjectId: listing.id,
+      metadata: { linked: 1, mediaType: req.body.mediaType },
+    });
+    return res.status(201).json({ data });
   })
 );
 
@@ -281,6 +417,7 @@ router.patch(
       listingId: listing.id,
       orderedIds: req.body.order,
     });
+    await sendBackIfLive(req, listing, "Photos reordered");
     await auditFromRequest(req, { action: "listing.media_reordered", subjectType: "listing", subjectId: listing.id });
     return res.json({ data });
   })
@@ -296,6 +433,7 @@ router.patch(
       caption: z.string().trim().max(500).optional(),
       tag: z.string().trim().max(80).optional(),
       isCover: z.boolean().optional(),
+      url: httpsUrl.optional(),
     }),
   }),
   asyncHandler(async (req, res) => {
@@ -305,6 +443,7 @@ router.patch(
       mediaId: req.params.mediaId,
       ...req.body,
     });
+    await sendBackIfLive(req, listing, "Media updated");
     await auditFromRequest(req, {
       action: "listing.media_updated",
       subjectType: "listing",
@@ -325,6 +464,7 @@ router.delete(
       listingId: listing.id,
       mediaId: req.params.mediaId,
     });
+    await sendBackIfLive(req, listing, "Media removed");
     await auditFromRequest(req, {
       action: "listing.media_removed",
       subjectType: "listing",
@@ -332,6 +472,130 @@ router.delete(
       metadata: { mediaId: req.params.mediaId },
     });
     return res.json({ data });
+  })
+);
+
+/* --------------------------------------------------------------------------
+ * Development files and links — the developer's own, from the portal
+ *
+ * Floor plans, the brochure and documents (PDF or image), a video and virtual tours. Only the
+ * admin wizard could add these before; the portal had no way to attach a floor plan or a
+ * brochure to a development. A change to a published development sends it back for review.
+ * ------------------------------------------------------------------------ */
+const developmentParams = z.object({ projectId: z.string().trim().min(1).max(200) });
+
+async function afterDevelopmentChange(req, project) {
+  if (req.auth.platform?.roles?.length) return;
+  await devAttachments.sendDevelopmentBackForReview(project);
+}
+
+router.get(
+  "/developments/:projectId/attachments",
+  requireAuth,
+  validate({ params: developmentParams }),
+  asyncHandler(async (req, res) => {
+    const project = await devAttachments.ownedDevelopment(req.auth.activeAccountId, req.params.projectId);
+    return res.json({ data: await devAttachments.developmentAttachments(project.id) });
+  })
+);
+
+router.post(
+  "/developments/:projectId/files",
+  uploadLimiter,
+  requireAuth,
+  requireAccountCapability("can_manage_listings"),
+  validate({ params: developmentParams }),
+  upload.array("files", 10),
+  asyncHandler(async (req, res) => {
+    const project = await devAttachments.ownedDevelopment(req.auth.activeAccountId, req.params.projectId);
+    const files = req.files || [];
+    if (!files.length) throw AppError.badRequest("Attach at least one file.");
+    const mediaType = String(req.body.mediaType || "");
+    if (!FILE_MEDIA_TYPES.includes(mediaType)) {
+      throw AppError.validation("Some information is invalid.", { mediaType: "Choose floor plan or document." });
+    }
+    const tag = req.body.tag ? String(req.body.tag) : null;
+    if (mediaType === "document" && !devAttachments.DEVELOPMENT_DOCUMENT_TYPES.includes(tag)) {
+      throw AppError.validation("Some information is invalid.", { tag: "Choose a document type for this development." });
+    }
+    const caption = String(req.body.caption || "").trim().slice(0, 255) || null;
+
+    for (const file of files) {
+      const owner = { buffer: file.buffer, originalFileName: file.originalname, accountId: req.auth.activeAccountId, userId: req.auth.user.id };
+      let stored;
+      if (mediaService.isPdf(file.buffer)) {
+        stored = await mediaService.storeDocument({ ...owner, caption });
+      } else {
+        try {
+          stored = await mediaService.storeImage({ ...owner, scope: "listings", caption });
+        } catch (error) {
+          if (error?.status === 415) throw AppError.unsupportedMedia("Upload a PDF, JPG, PNG or WebP file.");
+          throw error;
+        }
+      }
+      await devAttachments.attachDevelopmentFile({
+        projectId: project.id,
+        assetId: stored.id,
+        mediaType,
+        documentType: tag,
+        caption: caption || String(file.originalname || "").slice(0, 255) || null,
+        userId: req.auth.user.id,
+      });
+    }
+
+    await afterDevelopmentChange(req, project);
+    await auditFromRequest(req, {
+      action: "development.media_added",
+      subjectType: "project",
+      subjectId: project.id,
+      metadata: { uploaded: files.length, mediaType },
+    });
+    return res.status(201).json({ data: await devAttachments.developmentAttachments(project.id) });
+  })
+);
+
+router.post(
+  "/developments/:projectId/links",
+  requireAuth,
+  requireAccountCapability("can_manage_listings"),
+  validate({
+    params: developmentParams,
+    body: z.object({
+      mediaType: z.enum(["video", "virtual_tour"]),
+      url: httpsUrl,
+      caption: z.string().trim().max(255).optional(),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const project = await devAttachments.ownedDevelopment(req.auth.activeAccountId, req.params.projectId);
+    await devAttachments.addDevelopmentLink({ projectId: project.id, ...req.body });
+    await afterDevelopmentChange(req, project);
+    await auditFromRequest(req, {
+      action: "development.media_added",
+      subjectType: "project",
+      subjectId: project.id,
+      metadata: { linked: 1, mediaType: req.body.mediaType },
+    });
+    return res.status(201).json({ data: await devAttachments.developmentAttachments(project.id) });
+  })
+);
+
+router.delete(
+  "/developments/:projectId/attachments/:attachmentId",
+  requireAuth,
+  requireAccountCapability("can_manage_listings"),
+  validate({ params: developmentParams.extend({ attachmentId: z.string().trim().min(1).max(120) }) }),
+  asyncHandler(async (req, res) => {
+    const project = await devAttachments.ownedDevelopment(req.auth.activeAccountId, req.params.projectId);
+    await devAttachments.removeDevelopmentAttachment({ projectId: project.id, attachmentId: req.params.attachmentId });
+    await afterDevelopmentChange(req, project);
+    await auditFromRequest(req, {
+      action: "development.media_removed",
+      subjectType: "project",
+      subjectId: project.id,
+      metadata: { attachmentId: req.params.attachmentId },
+    });
+    return res.json({ data: await devAttachments.developmentAttachments(project.id) });
   })
 );
 

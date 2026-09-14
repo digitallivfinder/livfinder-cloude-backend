@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { client, ensureTestPassword, adminEmail, queryOne, execute } from "../helpers/testApp.js";
+import { client, ensureTestPassword, createDisposableStaffUser, cleanupUsers, queryOne, execute } from "../helpers/testApp.js";
 import { closePool } from "../../src/db/pool.js";
 import { totpCode, verifyTotp, base32Encode, base32Decode } from "../../src/modules/auth/mfa.service.js";
 
@@ -16,6 +16,7 @@ import { totpCode, verifyTotp, base32Encode, base32Decode } from "../../src/modu
 const PASSWORD = "LivFinder!2026";
 const admin = client();
 let userId = null;
+let staffEmail = null;
 let secret = null;
 let recoveryCodes = [];
 
@@ -23,20 +24,20 @@ const currentCode = () => totpCode(secret, Math.floor(Date.now() / 1000 / 30));
 
 beforeAll(async () => {
   await ensureTestPassword(PASSWORD);
-  await admin.login(await adminEmail("super_admin"), PASSWORD);
-  const row = await queryOne("SELECT id FROM users WHERE email = ?", [await adminEmail("super_admin")]);
-  userId = row.id;
-  // Start from a known state; an earlier run may have left a factor behind.
-  await execute("DELETE FROM user_mfa_factors WHERE user_id = ?", [userId]);
-  await execute("UPDATE users SET mfa_enabled = 0 WHERE id = ?", [userId]);
+  // A throwaway super admin, never the real one. This suite deletes the account's MFA factors,
+  // enrols and disables MFA and clears step-up on every one of its sessions; run against
+  // admin@livfinder.com it silently stripped the real administrator's MFA on every run.
+  // Super admin because the step-up cases create roles.
+  const staff = await createDisposableStaffUser({ prefix: "mfa-admin", password: PASSWORD, roleCode: "super_admin" });
+  staffEmail = staff.email;
+  userId = staff.id;
+  await admin.login(staff.email, PASSWORD);
 });
 
 afterAll(async () => {
-  if (userId) {
-    await execute("DELETE FROM user_mfa_factors WHERE user_id = ?", [userId]);
-    await execute("UPDATE users SET mfa_enabled = 0 WHERE id = ?", [userId]);
-    await execute("UPDATE user_sessions SET stepped_up_at = NULL WHERE user_id = ?", [userId]);
-  }
+  // Removes the user with its sessions, role and MFA factors. Audit rows may pin it; a leftover
+  // example.test account is harmless.
+  if (staffEmail) await cleanupUsers([staffEmail]).catch(() => {});
   await closePool();
 });
 

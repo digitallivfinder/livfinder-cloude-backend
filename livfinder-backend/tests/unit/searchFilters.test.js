@@ -59,7 +59,10 @@ describe("search filter normalisation", () => {
 
 describe("filter registry coverage", () => {
   it("defines a spec map for every marketplace category", () => {
-    for (const definition of CATEGORY_DEFINITIONS) {
+    // Developments are projects, not listings — searched via `project_search`,
+    // not the listing filter registry. Every category with a listing detail
+    // table must be covered here.
+    for (const definition of CATEGORY_DEFINITIONS.filter((entry) => entry.detailTable)) {
       expect(SPEC_MAP[definition.listingType], definition.listingType).toBeDefined();
       expect(RANGE_FILTERS[definition.listingType], definition.listingType).toBeDefined();
       expect(FACET_FILTERS[definition.listingType], definition.listingType).toBeDefined();

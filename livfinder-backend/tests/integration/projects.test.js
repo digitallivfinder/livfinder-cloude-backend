@@ -342,9 +342,20 @@ describe("filters", () => {
 
 describe("attached listings", () => {
   it("finds a project's listings by its public id and by its slug", async () => {
-    const byId = await api.get("/v1/public/listings", { category: "real-estate", project: "01K2F2DKG04KY2KT1EXSETV70E" });
-    const bySlug = await api.get("/v1/public/listings", { category: "real-estate", project: "creek-waters-2" });
-    expect(byId.body.pageInfo.total).toBeGreaterThan(0);
+    // Whichever published development currently has a unit on the market — the seed files
+    // same-community listings into developments, and which of those are live depends on the date.
+    const withUnits = await queryOne(
+      `SELECT p.public_id, p.slug, COUNT(*) AS units
+         FROM listing_search ls
+         JOIN projects p ON p.id = ls.project_id
+        WHERE p.deleted_at IS NULL AND p.moderation_status = 'published'
+        GROUP BY p.id, p.public_id, p.slug
+        ORDER BY p.id LIMIT 1`
+    );
+    expect(withUnits).toBeTruthy();
+    const byId = await api.get("/v1/public/listings", { category: "real-estate", project: withUnits.public_id });
+    const bySlug = await api.get("/v1/public/listings", { category: "real-estate", project: withUnits.slug });
+    expect(byId.body.pageInfo.total).toBe(Number(withUnits.units));
     expect(bySlug.body.pageInfo.total).toBe(byId.body.pageInfo.total);
   });
 
@@ -678,6 +689,97 @@ describe("admin write contract", () => {
     expect(result.options.locations.every((option) => typeof option.label === "string")).toBe(true);
   });
 
+  it("persists floor plans and documents with their files and survives a partial re-PATCH", async () => {
+    const assets = await query("SELECT public_id FROM media_assets WHERE deleted_at IS NULL ORDER BY id LIMIT 2");
+    const [planAsset, docAsset] = assets.map((row) => row.public_id);
+
+    await upsertDevelopment({
+      identifier: project.public_id,
+      userId: null,
+      payload: developmentSchema.partial().parse({
+        name: "Integration Test Residences",
+        floorPlans: [{ name: "Type A", unitType: "Apartment", bedrooms: 2, mediaAssetId: planAsset, areaSqm: 120 }],
+        documents: [{ title: "Price list", documentType: "price_list", visibility: "gated", mediaAssetId: docAsset }],
+      }),
+    });
+
+    const afterWrite = await getAdminDevelopment(project.public_id);
+    const plan = afterWrite.media.floorPlans.find((item) => item.title === "Type A");
+    expect(plan).toMatchObject({ unitType: "Apartment", bedrooms: 2, mediaAssetId: planAsset });
+    expect(plan.url).toBeTruthy();
+    const doc = afterWrite.media.documents.find((item) => item.title === "Price list");
+    expect(doc).toMatchObject({ type: "price_list", mediaAssetId: docAsset });
+    expect(doc.url).toBeTruthy();
+
+    // Re-send exactly what the detail tab reads back: the DELETE + reinsert in
+    // writeMedia must not lose the file because the payload carried the asset id.
+    await upsertDevelopment({
+      identifier: project.public_id,
+      userId: null,
+      payload: developmentSchema.partial().parse({
+        name: "Integration Test Residences",
+        floorPlans: afterWrite.media.floorPlans.map((item) => ({
+          name: item.title,
+          unitType: item.unitType || undefined,
+          bedrooms: item.bedrooms ?? undefined,
+          mediaAssetId: item.mediaAssetId || undefined,
+          areaSqm: item.areaSqm ?? undefined,
+        })),
+        documents: afterWrite.media.documents.map((item) => ({
+          title: item.title,
+          documentType: item.type || undefined,
+          visibility: item.visibility || undefined,
+          mediaAssetId: item.mediaAssetId || undefined,
+        })),
+      }),
+    });
+
+    const afterRepatch = await getAdminDevelopment(project.public_id);
+    expect(afterRepatch.media.floorPlans.find((item) => item.title === "Type A")?.url).toBe(plan.url);
+    expect(afterRepatch.media.documents.find((item) => item.title === "Price list")?.url).toBe(doc.url);
+  });
+
+  it("persists a hosted video URL, swaps it for an uploaded file, and clears it", async () => {
+    await upsertDevelopment({
+      identifier: project.public_id,
+      userId: null,
+      payload: developmentSchema.partial().parse({
+        name: "Integration Test Residences",
+        videoUrl: "https://youtu.be/rollout-demo",
+      }),
+    });
+    let record = await getAdminDevelopment(project.public_id);
+    expect(record.media.video).toEqual({ url: "https://youtu.be/rollout-demo", uploadType: "URL" });
+
+    // An uploaded file wins over the URL, and the detail tab clears the URL when
+    // it sets one.
+    const videoAsset = await queryOne("SELECT public_id FROM media_assets WHERE deleted_at IS NULL ORDER BY id LIMIT 1");
+    await upsertDevelopment({
+      identifier: project.public_id,
+      userId: null,
+      payload: developmentSchema.partial().parse({
+        name: "Integration Test Residences",
+        video: [{ mediaAssetId: videoAsset.public_id }],
+        videoUrl: "",
+      }),
+    });
+    record = await getAdminDevelopment(project.public_id);
+    expect(record.media.video).toMatchObject({ uploadType: "Upload", id: videoAsset.public_id });
+
+    // Clearing both leaves no video.
+    await upsertDevelopment({
+      identifier: project.public_id,
+      userId: null,
+      payload: developmentSchema.partial().parse({
+        name: "Integration Test Residences",
+        video: [],
+        videoUrl: "",
+      }),
+    });
+    record = await getAdminDevelopment(project.public_id);
+    expect(record.media.video).toBeNull();
+  });
+
   it("takes an archived project out of the public projection", async () => {
     const community = await seededCommunity();
     const throwaway = await upsertDevelopment({
@@ -695,5 +797,95 @@ describe("admin write contract", () => {
 
     await archiveDevelopment({ identifier: throwaway.id });
     expect(await queryOne("SELECT COUNT(*) AS total FROM project_search WHERE project_id = ?", [row.id])).toMatchObject({ total: 0 });
+  });
+
+  describe("rejection reason (0047_project_rejection_reason.sql)", () => {
+    let throwaway = null;
+
+    beforeAll(async () => {
+      const community = await seededCommunity();
+      const result = await upsertDevelopment({
+        identifier: null,
+        userId: null,
+        payload: developmentSchema.parse({
+          name: "Integration Rejection Reason Project",
+          communityId: community.id,
+          moderationStatus: "draft",
+        }),
+      });
+      throwaway = result.id;
+      created.push(throwaway);
+    });
+
+    it("persists the reason sent alongside a rejection", async () => {
+      await upsertDevelopment({
+        identifier: throwaway,
+        userId: null,
+        payload: developmentSchema.partial().parse({
+          name: "Integration Rejection Reason Project",
+          moderationStatus: "rejected",
+          rejectionReason: "Missing DLD escrow account number.",
+        }),
+      });
+      const record = await getAdminDevelopment(throwaway);
+      expect(record.moderationStatus).toBe("rejected");
+      expect(record.rejectionReason).toBe("Missing DLD escrow account number.");
+    });
+
+    it("clears the reason automatically once the status moves off rejected", async () => {
+      // Publish without resending a reason — the caller (the admin "Approve &
+      // publish" action) never does.
+      await upsertDevelopment({
+        identifier: throwaway,
+        userId: null,
+        payload: developmentSchema.partial().parse({
+          name: "Integration Rejection Reason Project",
+          moderationStatus: "published",
+        }),
+      });
+      const record = await getAdminDevelopment(throwaway);
+      expect(record.moderationStatus).toBe("published");
+      expect(record.rejectionReason).toBeNull();
+
+      const row = await queryOne("SELECT rejection_reason FROM projects WHERE public_id = ?", [throwaway]);
+      expect(row.rejection_reason).toBeNull();
+    });
+
+    it("does not clear a reason sent for a fresh rejection", async () => {
+      // Reject again with a new reason in the same call that sets moderationStatus.
+      await upsertDevelopment({
+        identifier: throwaway,
+        userId: null,
+        payload: developmentSchema.partial().parse({
+          name: "Integration Rejection Reason Project",
+          moderationStatus: "rejected",
+          rejectionReason: "Floor plans do not match the DLD-approved layout.",
+        }),
+      });
+      const record = await getAdminDevelopment(throwaway);
+      expect(record.rejectionReason).toBe("Floor plans do not match the DLD-approved layout.");
+    });
+
+    it("never reports a stale reason once the status is no longer rejected, even if the column briefly lagged", async () => {
+      // Serializer-level defence: rejectionReason is only ever surfaced when
+      // moderationStatus is actually "rejected", regardless of column contents.
+      await execute("UPDATE projects SET rejection_reason = 'leftover text' WHERE public_id = ?", [throwaway]);
+      await upsertDevelopment({
+        identifier: throwaway,
+        userId: null,
+        payload: developmentSchema.partial().parse({
+          name: "Integration Rejection Reason Project",
+          moderationStatus: "draft",
+        }),
+      });
+      const record = await getAdminDevelopment(throwaway);
+      expect(record.moderationStatus).toBe("draft");
+      expect(record.rejectionReason).toBeNull();
+    });
+
+    it("accepts rejectionReason up to 500 characters and refuses more", async () => {
+      expect(() => developmentSchema.partial().parse({ rejectionReason: "x".repeat(500) })).not.toThrow();
+      expect(() => developmentSchema.partial().parse({ rejectionReason: "x".repeat(501) })).toThrow();
+    });
   });
 });

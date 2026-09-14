@@ -194,6 +194,19 @@ describe("locations", () => {
     expect(invalid.body.status).toBe("not-found");
   });
 
+  it("narrows a location's children by name, and says when a page is not the whole list", async () => {
+    const uae = await queryOne("SELECT id FROM locations WHERE level = 'country' AND slug = 'united-arab-emirates'");
+
+    const page = await api.get(`/v1/public/locations/${uae.id}/children`, { limit: 2 });
+    expect(page.body.options).toHaveLength(2);
+    expect(page.body.hasMore).toBe(true);
+
+    const matches = await api.get(`/v1/public/locations/${uae.id}/children`, { q: "dub" });
+    expect(matches.body.options.map((option) => option.label)).toContain("Dubai");
+    expect(matches.body.options.every((option) => /dub/i.test(option.label))).toBe(true);
+    expect(matches.body.hasMore).toBe(false);
+  });
+
   it("returns countries that actually have listings", async () => {
     const response = await api.get("/v1/public/countries");
     expect(response.body.data.length).toBeGreaterThan(0);

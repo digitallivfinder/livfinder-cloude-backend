@@ -121,6 +121,31 @@ is_post_seed_migration() {
   case "$(basename "$1")" in
     0031_admin_permission_catalog.sql|0032_permission_model.sql|0034_drop_category_encoded_permissions.sql)
       return 0 ;;
+    # 0040 backfills account_category_access from the seeded organisation grants,
+    # so on a fresh `all` load it must run after the identity seeds.
+    0040_account_category_access.sql)
+      return 0 ;;
+    # 0041's category_features rows reference the categories seeded in 030.
+    0041_car_watch_features.sql)
+      return 0 ;;
+    # 0043's category_features rows reference categories 4, 5 and 7 (seeded in 030).
+    0043_aviation_development_features.sql)
+      return 0 ;;
+    # 0046's backfill UPDATEs reference the aircraft brand slugs seeded in 031_brands.sql.
+    0046_aircraft_brand_segment.sql)
+      return 0 ;;
+    # 0048's backfill reads the seeded listings/organizations to grant category access.
+    0048_category_access_backfill.sql)
+      return 0 ;;
+    # 0051's backfill reads the seeded projects/organizations to grant developments access.
+    0051_developments_access_backfill.sql)
+      return 0 ;;
+    # 0052 recomputes allowance usage from the seeded listings and category grants.
+    0052_listing_usage_recompute.sql)
+      return 0 ;;
+    # 0053 redefines the counter rollup and recomputes counters from the seeded rows.
+    0053_entity_counters_slot_rule.sql)
+      return 0 ;;
     *)
       return 1 ;;
   esac
@@ -158,9 +183,21 @@ if [ "$COMMAND" = "seed" ] || [ "$COMMAND" = "all" ]; then
   # `051_demo_seed_images.sql` writes `/media/seed/...` paths; the files those name travel with
   # the seeds and have to be copied into the API's storage directory, which is not in version
   # control. Without this the demo catalogue seeds correctly and renders grey placeholders.
-  if [ -x "$DB_DIR/tools/install-seed-media.sh" ]; then
+  #
+  # Skipped, not failed, when that directory is not reachable from here. The loader legitimately
+  # runs somewhere the storage mount does not exist — `db_loader` in docker-compose.test.yml sees
+  # only `./db/db:/db:ro` — and the seeding itself is complete and correct in that case. Saying so
+  # and moving on beats failing a good load, as long as it says it loudly enough to act on.
+  media_storage="${STORAGE_DIR:-$(cd "$DB_DIR/../.." 2>/dev/null && pwd)/livfinder-backend/storage}"
+  if [ ! -x "$DB_DIR/tools/install-seed-media.sh" ]; then
+    :
+  elif [ -d "$media_storage" ]; then
     echo "Installing seed media…"
-    "$DB_DIR/tools/install-seed-media.sh" || failed=1
+    STORAGE_DIR="$media_storage" "$DB_DIR/tools/install-seed-media.sh" || failed=1
+  else
+    echo "Seed media NOT installed — no storage directory at $media_storage"
+    echo "  The catalogue will render placeholders until you run, on the API's own host:"
+    echo "    STORAGE_DIR=/path/to/livfinder-backend/storage $DB_DIR/tools/install-seed-media.sh"
   fi
 fi
 

@@ -216,7 +216,16 @@ async function listingStatusOverview() {
 async function recentInventory() {
   const rows = await query(
     `SELECT l.public_id, l.reference, l.title, l.status, l.price, l.currency_code,
-            l.cover_image_url, l.created_at, l.root_category_id,
+            COALESCE(
+              l.cover_image_url,
+              (SELECT lm.url FROM listing_media lm
+                 WHERE lm.listing_id = l.id AND lm.media_type = 'image'
+                 ORDER BY lm.is_cover DESC, lm.sort_order ASC, lm.id ASC LIMIT 1),
+              (SELECT lm.url FROM listing_media lm JOIN media_assets ma ON ma.id = lm.media_asset_id
+                 WHERE lm.listing_id = l.id AND ma.media_type = 'image'
+                 ORDER BY lm.sort_order ASC, lm.id ASC LIMIT 1)
+            ) AS cover_image_url,
+            l.created_at, l.root_category_id,
             cat.name AS category_name,
             CONCAT_WS(', ', NULLIF(cm.name, ''), NULLIF(ct.name, ''), NULLIF(co.name, '')) AS location,
             COALESCE(org.name, u.display_name) AS owner,
@@ -485,7 +494,16 @@ export async function categoryDashboard(categorySlug, { period = "30d" } = {}) {
       [root]
     ),
     query(
-      `SELECT l.public_id, l.reference, l.title, l.view_count, l.inquiry_count, l.cover_image_url,
+      `SELECT l.public_id, l.reference, l.title, l.view_count, l.inquiry_count,
+              COALESCE(
+                l.cover_image_url,
+                (SELECT lm.url FROM listing_media lm
+                   WHERE lm.listing_id = l.id AND lm.media_type = 'image'
+                   ORDER BY lm.is_cover DESC, lm.sort_order ASC, lm.id ASC LIMIT 1),
+                (SELECT lm.url FROM listing_media lm JOIN media_assets ma ON ma.id = lm.media_asset_id
+                   WHERE lm.listing_id = l.id AND ma.media_type = 'image'
+                   ORDER BY lm.sort_order ASC, lm.id ASC LIMIT 1)
+              ) AS cover_image_url,
               l.price, l.currency_code, l.status
          FROM listings l
         WHERE l.root_category_id = ? AND l.deleted_at IS NULL AND l.status = 'active'

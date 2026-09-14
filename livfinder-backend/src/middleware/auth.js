@@ -14,16 +14,48 @@ function readSessionToken(req) {
 }
 
 /**
+ * Every session cookie the request carries, the parsed one first.
+ *
+ * A browser can hold two `livfinder_session` cookies for one host — one left behind by an
+ * earlier cookie configuration that a later sign-out could not clear. cookie-parser keeps
+ * only the first, which can be the dead one, while the Next server forwards the last; the
+ * same browser then reads as signed in on server-rendered pages and signed out to every
+ * request it makes itself, such as an upload. Trying each in turn makes the two agree.
+ */
+function readSessionTokens(req) {
+  const tokens = [];
+  const add = (value) => {
+    if (value && !tokens.includes(value)) tokens.push(value);
+  };
+  add(readSessionToken(req));
+  const prefix = `${env.SESSION_COOKIE_NAME}=`;
+  for (const part of String(req.headers?.cookie || "").split(";")) {
+    const pair = part.trim();
+    if (!pair.startsWith(prefix)) continue;
+    try {
+      add(decodeURIComponent(pair.slice(prefix.length)));
+    } catch {
+      // A malformed value is not a token.
+    }
+  }
+  return tokens;
+}
+
+/**
  * Populates req.auth when a valid session cookie is present. Never rejects —
  * requireAuth and the permission guards do that, so public endpoints can also
  * personalise (favourite state, for example) without branching.
  */
 export async function attachSession(req, res, next) {
   try {
-    const token = readSessionToken(req);
-    if (!token) return next();
+    const tokens = readSessionTokens(req);
+    if (!tokens.length) return next();
 
-    const session = await resolveSession(token);
+    let session = null;
+    for (const token of tokens) {
+      session = await resolveSession(token);
+      if (session) break;
+    }
     if (!session) return next();
 
     const [platform, memberships, agent] = await Promise.all([

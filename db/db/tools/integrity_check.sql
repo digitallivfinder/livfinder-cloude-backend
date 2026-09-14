@@ -445,8 +445,11 @@ SELECT 'building unit count disagrees with property_units' AS check_name,
 
 SELECT 'unit listing count disagrees with listings' AS check_name, COUNT(*) AS failures
   FROM (SELECT u.id FROM property_units u
+          -- Soft-deleted listings do not count: the same definition the service maintains
+          -- (listings.service.js syncUnitListingCountersForListing). The check used to count
+          -- them, so a deleted listing made its unit "disagree" forever.
           LEFT JOIN (SELECT unit_id, COUNT(*) n FROM listings
-                      WHERE unit_id IS NOT NULL GROUP BY unit_id) l ON l.unit_id = u.id
+                      WHERE unit_id IS NOT NULL AND deleted_at IS NULL GROUP BY unit_id) l ON l.unit_id = u.id
          WHERE u.listing_count <> COALESCE(l.n, 0)) x;
 
 SELECT 'current ownership shares do not sum to 100' AS check_name, COUNT(*) AS failures
@@ -589,3 +592,49 @@ SELECT 'tenant with no canonical domain' AS check_name, COUNT(*) AS failures
 SELECT 'certificate expiring within fourteen days' AS check_name, COUNT(*) AS failures
   FROM tenant_domains
  WHERE status = 'active' AND ssl_expires_at < DATE_ADD(NOW(3), INTERVAL 14 DAY);
+
+SELECT '--- category access ---' AS check_group;
+
+-- Every listing's owning account must hold approved access to that listing's
+-- category — otherwise the category is unreachable in the account's own
+-- dashboard even though it has live inventory there. Caught this exact gap for
+-- helicopters (0048_category_access_backfill.sql): 24 listings, 18 accounts,
+-- zero approved grants.
+SELECT 'listing owned by an account without approved category access' AS check_name, COUNT(*) AS failures
+  FROM listings l
+  JOIN organizations o ON o.id = l.organization_id AND o.deleted_at IS NULL
+  LEFT JOIN account_category_access aca
+         ON aca.account_id = o.account_id AND aca.category_id = l.root_category_id AND aca.status = 'approved'
+ WHERE l.deleted_at IS NULL AND aca.id IS NULL;
+
+-- A website enquiry only ever creates a lead *for a listing*
+-- (engagement.routes.js linkInquiryToLead), and live code only soft-deletes
+-- listings. `leads.primary_listing_id` is ON DELETE SET NULL, so a web-form lead
+-- with no listing means something hard-deleted a listing out from under it —
+-- that is exactly how a test cleanup left 54 of these behind on 2026-09-11, and
+-- the admin Leads page crashed on every one.
+SELECT 'website-enquiry lead whose listing was hard-deleted' AS check_name, COUNT(*) AS failures
+  FROM leads
+ WHERE deleted_at IS NULL AND channel = 'web_form' AND primary_listing_id IS NULL AND project_id IS NULL;
+
+-- A development's owning developer must hold Real Estate Developments access, or they
+-- cannot open it, submit it or work its enquiries in the portal (0051).
+SELECT 'development owned by an account without approved developments access' AS check_name, COUNT(*) AS failures
+  FROM projects p
+  JOIN organizations o ON o.id = p.organization_id AND o.deleted_at IS NULL
+  LEFT JOIN account_category_access aca
+         ON aca.account_id = o.account_id AND aca.category_id = 7 AND aca.status = 'approved'
+ WHERE p.deleted_at IS NULL AND aca.id IS NULL;
+
+-- Allowance usage is what the portal checks before a new listing ("allowance used").
+-- It is recomputed from the rows on every change (listings.service.js
+-- `syncAccountListingUsage`, 0052); a mismatch means a write bypassed the service.
+-- The old counter was only ever incremented and 47 accounts had drifted, one to
+-- 500/500 while owning 26 listings.
+SELECT 'account listing usage disagrees with its listings' AS check_name, COUNT(*) AS failures
+  FROM accounts a
+ WHERE a.listing_used <> (
+         SELECT COUNT(*) FROM listings l
+          WHERE l.account_id = a.id AND l.deleted_at IS NULL
+            AND l.status IN ('draft', 'pending_review', 'active', 'rejected')
+       );

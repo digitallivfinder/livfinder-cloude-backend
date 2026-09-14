@@ -1,6 +1,6 @@
 import { query, queryOne, queryValue } from "../../db/query.js";
 import { bool, int, isoDate, isoDay, num } from "../../serializers/primitives.js";
-import { frontendCategoryId, resolveCategory, CATEGORY_DEFINITIONS } from "../../utils/categories.js";
+import { frontendCategoryId, listingTypeFor, resolveCategory, CATEGORY_DEFINITIONS } from "../../utils/categories.js";
 import { assertCategoryScope, categoryScopeFilter } from "../../middleware/auth.js";
 
 /**
@@ -31,8 +31,18 @@ export function adminList({ items, total, page, pageSize, summary = undefined, o
   };
 }
 
+/**
+ * The category access lists (`enabledCategories`, `primaryCategory`,
+ * `requestedCategories`) that the admin Companies / Individuals screens read.
+ *
+ * Those screens key on `listingType` ("real-estate", "yachts") — the value
+ * `marketplaceCategories.js` calls `listingType` and the category-access API
+ * accepts as `categoryId`. `frontendCategoryId` returns the different `id`
+ * spelling ("realEstate", "yacht"), which the panels could not match, so a real
+ * company showed every category as disabled.
+ */
 export function categoryIdsFor(rootCategoryIds = []) {
-  return [...new Set(rootCategoryIds.map((id) => frontendCategoryId(id)).filter(Boolean))];
+  return [...new Set(rootCategoryIds.map((id) => listingTypeFor(id)).filter(Boolean))];
 }
 
 export function rootIdFor(categoryValue) {

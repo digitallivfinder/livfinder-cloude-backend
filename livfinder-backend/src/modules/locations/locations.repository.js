@@ -288,14 +288,26 @@ export async function listCountries({ onlyWithListings = true, limit = 250 } = {
   );
 }
 
-export async function listChildren(parentId, { limit = 100 } = {}) {
+export async function listChildren(parentId, { limit = 100, q = null } = {}) {
   const safeLimit = Math.min(500, Math.max(1, Number(limit) || 100));
+  const params = [Number(parentId)];
+  let search = "";
+  let ranking = "l.active_listing_count DESC, l.name ASC";
+  if (q) {
+    // One parent's children can outrun a page — a state holds up to 1,757 cities — so a
+    // picker narrows within the parent. Contains rather than prefix, since the set is
+    // already small, with prefix matches first so "Dub" lists Dubai before Old Dubai Road.
+    const like = String(q).replace(/[\\%_]/g, "\\$&");
+    search = " AND (l.name LIKE ? OR l.name_ascii LIKE ?)";
+    params.push(`%${like}%`, `%${like}%`, `${like}%`);
+    ranking = `CASE WHEN l.name LIKE ? THEN 0 ELSE 1 END, ${ranking}`;
+  }
   return query(
     `SELECT ${SELECT_COLUMNS} ${FROM_CLAUSE}
-      WHERE l.parent_id = ? AND l.deleted_at IS NULL AND l.status = 'active'
-      ORDER BY l.active_listing_count DESC, l.name ASC
+      WHERE l.parent_id = ? AND l.deleted_at IS NULL AND l.status = 'active'${search}
+      ORDER BY ${ranking}
       LIMIT ${safeLimit}`,
-    [Number(parentId)]
+    params
   );
 }
 

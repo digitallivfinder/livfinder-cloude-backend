@@ -162,8 +162,10 @@ export async function syncListingMediaCounters(listingId, executor) {
 
 export async function reorderListingMedia({ listingId, orderedIds }) {
   await withTransaction(async (connection) => {
+    // The gallery is the images. Floor plans, documents and tour links are listing media
+    // too, but they are never reordered with the photographs or made the cover.
     const rows = await query(
-      "SELECT id FROM listing_media WHERE listing_id = ?",
+      "SELECT id FROM listing_media WHERE listing_id = ? AND media_type = 'image'",
       [Number(listingId)],
       connection
     );
@@ -186,14 +188,22 @@ export async function reorderListingMedia({ listingId, orderedIds }) {
   return listListingMedia(listingId);
 }
 
-export async function updateListingMediaItem({ listingId, mediaId, altText, caption, tag, isCover }) {
+export async function updateListingMediaItem({ listingId, mediaId, altText, caption, tag, isCover, url }) {
   await withTransaction(async (connection) => {
     const row = await queryOne(
-      "SELECT id FROM listing_media WHERE id = ? AND listing_id = ?",
+      "SELECT id, media_asset_id, media_type FROM listing_media WHERE id = ? AND listing_id = ?",
       [Number(mediaId), Number(listingId)],
       connection
     );
     if (!row) throw AppError.notFound("That gallery item was not found.");
+    if (isCover === true && row.media_type !== "image") {
+      throw AppError.badRequest("Only an image can be the cover.");
+    }
+    // Only a linked video or tour has an address of its own; an uploaded file's URL is
+    // where its bytes are stored and is not the caller's to repoint.
+    if (url !== undefined && row.media_asset_id) {
+      throw AppError.badRequest("Only a linked video or tour has an address to change.");
+    }
 
     if (isCover === true) {
       await execute("UPDATE listing_media SET is_cover = 0 WHERE listing_id = ?", [Number(listingId)], connection);
@@ -203,12 +213,14 @@ export async function updateListingMediaItem({ listingId, mediaId, altText, capt
           SET alt_text = COALESCE(?, alt_text),
               caption  = COALESCE(?, caption),
               tag      = COALESCE(?, tag),
+              url      = COALESCE(?, url),
               is_cover = COALESCE(?, is_cover)
         WHERE id = ? AND listing_id = ?`,
       [
         altText ?? null,
         caption ?? null,
         tag ?? null,
+        url ?? null,
         isCover === undefined ? null : isCover ? 1 : 0,
         Number(mediaId),
         Number(listingId),
@@ -238,7 +250,7 @@ export async function removeListingMedia({ listingId, mediaId }) {
 
     // Close the gap left in sort_order so the next reorder is not sparse.
     const remaining = await query(
-      "SELECT id FROM listing_media WHERE listing_id = ? ORDER BY is_cover DESC, sort_order ASC, id ASC",
+      "SELECT id FROM listing_media WHERE listing_id = ? AND media_type = 'image' ORDER BY is_cover DESC, sort_order ASC, id ASC",
       [Number(listingId)],
       connection
     );
@@ -255,6 +267,55 @@ export async function removeListingMedia({ listingId, mediaId }) {
   if (assetId) await softDeleteAsset(assetId);
   await refreshListingSearch(Number(listingId));
   return listListingMedia(listingId);
+}
+
+/**
+ * What a listing document can be. `documents.document_type` in the schema, less
+ * `floor_plan`, which is its own media type with its own section. Held in `tag`.
+ */
+export const LISTING_DOCUMENT_TYPES = Object.freeze([
+  "brochure",
+  "price_list",
+  "payment_plan",
+  "title_deed",
+  "survey",
+  "inspection_report",
+  "service_charge",
+  "spec_sheet",
+  "maintenance_log",
+  "registration",
+  "insurance",
+  "contract",
+  "noc",
+  "valuation",
+  "other",
+]);
+
+/**
+ * A video or virtual tour held as a link — YouTube, Vimeo, Matterport — rather than as
+ * uploaded bytes, so it has no media asset behind it and never joins the gallery.
+ */
+export async function addListingLink({ listingId, mediaType, url, caption = null }) {
+  await withTransaction(async (connection) => {
+    const nextSort = Number(
+      (await queryValue(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM listing_media WHERE listing_id = ?",
+        [Number(listingId)],
+        connection
+      )) || 0
+    );
+    await execute(
+      `INSERT INTO listing_media
+         (listing_id, media_asset_id, media_type, url, thumbnail_url, alt_text, caption, tag,
+          sort_order, is_cover, is_public, created_at)
+       VALUES (?, NULL, ?, ?, NULL, NULL, ?, NULL, ?, 0, 1, NOW(3))`,
+      [Number(listingId), mediaType, url, caption, nextSort],
+      connection
+    );
+    await syncListingMediaCounters(listingId, connection);
+  });
+  await refreshListingSearch(Number(listingId));
+  return listListingMedia(listingId, { includePrivate: true });
 }
 
 export { getStorage };

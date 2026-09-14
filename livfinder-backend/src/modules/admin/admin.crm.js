@@ -11,6 +11,31 @@ import { adminListingStatus } from "./admin.dashboard.js";
  * These map onto the existing `leads`/`crm_contacts` pipeline tables — there is
  * no separate admin lead store.
  */
+/**
+ * `leads.status` is only the coarse open/won/lost outcome; the working state the Leads screen
+ * shows (tabs and status tags: new / qualified / follow-up / viewing / closed / lost) lives in the
+ * pipeline stage. One mapping, matching leadSummary() below, so a row's tag, the tab it is counted
+ * under and the tab filter agree. Before this the rows sent the raw "open", and the tab filter
+ * compared "new" etc. against `leads.status` — every tab except Lost listed nothing.
+ */
+export function screenLeadStatus(status, stageType) {
+  if (status === "lost") return "lost";
+  if (status && status !== "open") return "closed";
+  if (stageType === "qualified") return "qualified";
+  if (stageType === "contacted" || stageType === "nurturing") return "follow-up";
+  if (stageType === "proposal" || stageType === "negotiation") return "viewing";
+  return "new";
+}
+
+const SCREEN_STATUS_FILTER = {
+  new: "l.status = 'open' AND st.stage_type = 'new'",
+  qualified: "l.status = 'open' AND st.stage_type = 'qualified'",
+  "follow-up": "l.status = 'open' AND st.stage_type IN ('contacted','nurturing')",
+  viewing: "l.status = 'open' AND st.stage_type IN ('proposal','negotiation')",
+  closed: "l.status IN ('won','lost','disqualified')",
+  lost: "l.status = 'lost'",
+};
+
 export async function listAdminLeads({
   category = "real-estate",
   status = "all",
@@ -32,9 +57,13 @@ export async function listAdminLeads({
     conditions.push("l.root_category_id = ?");
     params.push(rootId);
   }
-  if (status !== "all") {
-    conditions.push("l.status = ?");
-    params.push(status);
+  if (status && status !== "all") {
+    if (SCREEN_STATUS_FILTER[status]) {
+      conditions.push(`(${SCREEN_STATUS_FILTER[status]})`);
+    } else {
+      conditions.push("l.status = ?");
+      params.push(status);
+    }
   }
   if (inquiryType) {
     conditions.push("l.intent = ?");
@@ -49,16 +78,16 @@ export async function listAdminLeads({
     params.push(agent);
   }
   if (property) {
-    conditions.push("li.public_id = ?");
-    params.push(property);
+    conditions.push("(li.public_id = ? OR pj.public_id = ?)");
+    params.push(property, property);
   }
   if (community) {
     conditions.push("cm.slug = ?");
     params.push(community);
   }
   if (search) {
-    conditions.push("(l.reference LIKE ? OR l.name LIKE ? OR l.email LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ? OR li.title LIKE ?)");
-    params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
+    conditions.push("(l.reference LIKE ? OR l.name LIKE ? OR l.email LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ? OR li.title LIKE ? OR pj.name LIKE ?)");
+    params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
   }
 
   const where = `WHERE ${conditions.join(" AND ")}`;
@@ -72,7 +101,8 @@ export async function listAdminLeads({
      LEFT JOIN agents ag ON ag.id = l.owner_agent_id
      LEFT JOIN listings li ON li.id = l.primary_listing_id
      LEFT JOIN locations cm ON cm.id = li.community_id
-     LEFT JOIN locations ct ON ct.id = li.city_id`;
+     LEFT JOIN locations ct ON ct.id = li.city_id
+     LEFT JOIN projects pj ON pj.id = l.project_id`;
 
   const [rows, total, summary, options] = await Promise.all([
     query(
@@ -83,11 +113,12 @@ export async function listAdminLeads({
               c.primary_email, c.primary_phone_e164,
               COALESCE(c.display_name, l.name) AS contact_name,
               src.name AS source_name, src.code AS source_code,
-              st.name AS stage_name,
+              st.name AS stage_name, st.stage_type AS pipeline_stage_type,
               ag.public_id AS agent_public_id, ag.display_name AS agent_name, ag.photo_url AS agent_photo,
               li.public_id AS listing_public_id, li.reference AS listing_reference,
               li.title AS listing_title, li.price AS listing_price, li.currency_code AS listing_currency,
               li.cover_image_url AS listing_image, li.status AS listing_status,
+              pj.public_id AS project_public_id, pj.name AS project_name, pj.cover_image_url AS project_image,
               cm.name AS community_name, cm.slug AS community_slug, ct.name AS city_name
          FROM leads l ${joins} ${where}
         ORDER BY ${orderBy} LIMIT ${safeSize} OFFSET ${offset}`,
@@ -103,7 +134,9 @@ export async function listAdminLeads({
       id: row.public_id,
       leadId: String(row.id),
       reference: row.reference,
-      status: row.status,
+      status: screenLeadStatus(row.status, row.pipeline_stage_type),
+      rawStatus: row.status,
+      stageType: row.pipeline_stage_type ?? null,
       priority: row.priority,
       score: int(row.score),
       inquiryType: row.intent,
@@ -126,7 +159,8 @@ export async function listAdminLeads({
         primaryEmail: row.primary_email,
         primaryPhone: row.primary_phone_e164,
       },
-      propertyId: row.listing_public_id,
+      propertyId: row.listing_public_id ?? row.project_public_id ?? null,
+      // A development lead's "property" is the development itself (leads.project_id).
       property: row.listing_public_id
         ? {
             id: row.listing_public_id,
@@ -137,14 +171,24 @@ export async function listAdminLeads({
             community: row.community_slug,
             location: [row.community_name, row.city_name].filter(Boolean).join(", "),
           }
-        : null,
+        : row.project_public_id
+          ? {
+              id: row.project_public_id,
+              reference: row.project_public_id,
+              title: row.project_name,
+              image: row.project_image,
+              status: null,
+              community: null,
+              location: "",
+            }
+          : null,
       agentId: row.agent_public_id,
       agent: row.agent_public_id
         ? { id: row.agent_public_id, name: row.agent_name, role: "Agent", image: row.agent_photo }
         : null,
       community: row.community_slug,
       location: [row.community_name, row.city_name].filter(Boolean).join(", "),
-      title: row.listing_title,
+      title: row.listing_title ?? row.project_name,
       name: row.contact_name,
     })),
     total,
@@ -240,24 +284,27 @@ export async function getAdminLead(identifier) {
 
   const [activities, stageHistory, otherContactLeads, otherListingInquiries, requirements] = await Promise.all([
     query(
-      `SELECT public_id, activity_type, subject, body, occurred_at, created_by_user_id,
-              (SELECT display_name FROM users u WHERE u.id = activities.created_by_user_id) AS actor_name
-         FROM activities WHERE lead_id = ? ORDER BY occurred_at DESC LIMIT 50`,
+      `SELECT a.public_id, a.activity_type, a.subject_line AS subject, a.body, a.occurred_at,
+              COALESCE(u.display_name, ag.display_name) AS actor_name
+         FROM activities a
+         LEFT JOIN users u ON u.id = a.user_id
+         LEFT JOIN agents ag ON ag.id = a.agent_id
+        WHERE a.lead_id = ? AND a.deleted_at IS NULL ORDER BY a.occurred_at DESC LIMIT 50`,
       [row.id]
     ).catch(() => []),
     query(
-      `SELECT h.changed_at, h.note, f.name AS from_stage, t.name AS to_stage,
+      `SELECT h.created_at AS changed_at, h.reason AS note, f.name AS from_stage, t.name AS to_stage,
               u.display_name AS actor_name
          FROM lead_stage_history h
          LEFT JOIN lead_pipeline_stages f ON f.id = h.from_stage_id
          LEFT JOIN lead_pipeline_stages t ON t.id = h.to_stage_id
          LEFT JOIN users u ON u.id = h.changed_by_user_id
-        WHERE h.lead_id = ? ORDER BY h.changed_at DESC LIMIT 50`,
+        WHERE h.lead_id = ? ORDER BY h.created_at DESC LIMIT 50`,
       [row.id]
     ).catch(() => []),
     row.contact_id
       ? query(
-          `SELECT l.public_id, l.reference, l.status, l.created_at,
+          `SELECT l.public_id, l.reference, l.status, l.stage_type, l.created_at,
                   li.public_id AS listing_public_id, li.title AS listing_title
              FROM leads l LEFT JOIN listings li ON li.id = l.primary_listing_id
             WHERE l.contact_id = ? AND l.id <> ? AND l.deleted_at IS NULL
@@ -298,7 +345,7 @@ export async function getAdminLead(identifier) {
     otherContactLeads: otherContactLeads.map((entry) => ({
       id: entry.public_id,
       reference: entry.reference,
-      status: entry.status,
+      status: screenLeadStatus(entry.status, entry.stage_type),
       propertyId: entry.listing_public_id,
       property: { id: entry.listing_public_id, title: entry.listing_title },
       inquiryAt: isoDate(entry.created_at),
@@ -312,6 +359,176 @@ export async function getAdminLead(identifier) {
     })),
     requirements: requirements.map((requirement) => ({ ...requirement })),
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Listing engagement (the admin listing detail's Leads and Activity tabs)     */
+/* -------------------------------------------------------------------------- */
+
+const LEAD_INTENT_LABEL = {
+  buy: "Buying", rent: "Renting", sell: "Selling", let: "Letting", invest: "Investment",
+  charter: "Charter", valuation: "Valuation", finance: "Finance", other: "General enquiry",
+};
+
+const ACTIVITY_EVENT_TYPE = {
+  note: "note", call: "lead", email: "lead", sms: "lead", whatsapp: "lead", meeting: "lead",
+  viewing: "lead", task: "lead", stage_change: "status", assignment: "status",
+  document: "document", offer: "pricing", payment: "pricing", system: "status",
+  import: "status", other: "status",
+};
+
+/**
+ * The two data-backed tabs on the admin listing detail screen. Leads come from
+ * the `leads` pipeline keyed by `primary_listing_id`; the activity feed merges
+ * the listing's `activities` rows with its `listing_status_history`. Both are
+ * shaped for the tab that renders them, and every list is present (never
+ * undefined) so an empty listing renders an empty state rather than throwing.
+ */
+export async function getAdminListingEngagement({ listingId }) {
+  if (!listingId) {
+    return { leads: { records: [], summary: emptyLeadSummary() }, activity: { events: [], summary: emptyActivitySummary() } };
+  }
+
+  const [leadRows, activityRows, statusRows] = await Promise.all([
+    query(
+      `SELECT l.public_id, l.reference, l.status, l.stage_type, l.priority, l.intent,
+              l.is_qualified, l.created_at, l.last_activity_at, l.next_action_at,
+              l.public_id AS lead_public_id,
+              c.public_id AS contact_public_id,
+              COALESCE(c.display_name, NULLIF(TRIM(CONCAT_WS(' ', c.first_name, c.last_name)), ''), l.name) AS contact_name,
+              COALESCE(c.primary_email, l.email) AS email,
+              COALESCE(c.primary_phone_e164, l.phone_e164) AS phone,
+              src.name AS source_name,
+              st.name AS stage_name,
+              ag.display_name AS agent_name
+         FROM leads l
+         LEFT JOIN crm_contacts c ON c.id = l.contact_id
+         LEFT JOIN lead_sources src ON src.id = l.source_id
+         LEFT JOIN lead_pipeline_stages st ON st.id = l.stage_id
+         LEFT JOIN agents ag ON ag.id = l.owner_agent_id
+        WHERE l.primary_listing_id = ? AND l.deleted_at IS NULL
+        ORDER BY l.created_at DESC
+        LIMIT 200`,
+      [listingId]
+    ).catch(() => []),
+    query(
+      `SELECT a.public_id, a.activity_type, a.direction, a.subject_line, a.preview, a.body, a.occurred_at,
+              COALESCE(u.display_name, ag.display_name) AS actor_name
+         FROM activities a
+         LEFT JOIN users u ON u.id = a.user_id
+         LEFT JOIN agents ag ON ag.id = a.agent_id
+        WHERE a.subject_type = 'listing' AND a.subject_id = ? AND a.deleted_at IS NULL
+        ORDER BY a.occurred_at DESC
+        LIMIT 200`,
+      [listingId]
+    ).catch(() => []),
+    query(
+      `SELECT h.from_status, h.to_status, h.reason, h.actor_type, h.changed_at,
+              u.display_name AS actor_name
+         FROM listing_status_history h
+         LEFT JOIN users u ON u.id = h.changed_by_user_id
+        WHERE h.listing_id = ?
+        ORDER BY h.changed_at DESC
+        LIMIT 200`,
+      [listingId]
+    ).catch(() => []),
+  ]);
+
+  const records = leadRows.map((row) => ({
+    id: row.lead_public_id,
+    reference: row.reference,
+    name: row.contact_name || "Unknown contact",
+    email: row.email || null,
+    phone: row.phone || null,
+    contactId: row.contact_public_id || null,
+    source: row.source_name || "—",
+    interest: LEAD_INTENT_LABEL[row.intent] || "General enquiry",
+    status: row.status,
+    stage: row.stage_name || null,
+    stageType: row.stage_type || null,
+    priority: row.priority || "normal",
+    agent: row.agent_name || "Unassigned",
+    inquiryDate: isoDate(row.created_at),
+    lastActivity: isoDate(row.last_activity_at),
+  }));
+
+  const isFollowUp = (row) =>
+    row.status === "open" && ["contacted", "nurturing", "proposal", "negotiation"].includes(row.stageType);
+  const summary = {
+    total: records.length,
+    new: leadRows.filter((row) => row.status === "open" && row.stage_type === "new").length,
+    qualified: leadRows.filter((row) => bool(row.is_qualified) || row.stage_type === "qualified").length,
+    followUp: records.filter(isFollowUp).length,
+    closed: leadRows.filter((row) => ["won", "lost"].includes(row.status)).length,
+  };
+
+  const events = [
+    ...activityRows.map((row) => ({
+      id: row.public_id,
+      type: ACTIVITY_EVENT_TYPE[row.activity_type] || "status",
+      title: row.subject_line || `${activityVerb(row.activity_type)}`,
+      description: row.preview || row.body || "",
+      user: row.actor_name || "System",
+      category: row.direction === "inbound" ? "Inbound" : row.direction === "outbound" ? "Outbound" : "Internal",
+      timestamp: isoDate(row.occurred_at),
+    })),
+    ...statusRows.map((row, index) => ({
+      id: `status-${index}`,
+      type: "status",
+      title: row.from_status
+        ? `Status changed from ${humanStatus(row.from_status)} to ${humanStatus(row.to_status)}`
+        : `Listing set to ${humanStatus(row.to_status)}`,
+      description: row.reason || "",
+      user: row.actor_name || (row.actor_type === "system" ? "System" : "Admin"),
+      category: "Status",
+      timestamp: isoDate(row.changed_at),
+    })),
+  ]
+    .filter((event) => event.timestamp)
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  const activitySummary = {
+    total: events.length,
+    lastUpdated: events[0] ? relativeShort(events[0].timestamp) : "—",
+    lastEditedBy: events[0]?.user || "—",
+    recentLeads: records.length,
+  };
+
+  return { leads: { records, summary }, activity: { events, summary: activitySummary } };
+}
+
+function emptyLeadSummary() {
+  return { total: 0, new: 0, qualified: 0, followUp: 0, closed: 0 };
+}
+function emptyActivitySummary() {
+  return { total: 0, lastUpdated: "—", lastEditedBy: "—", recentLeads: 0 };
+}
+function activityVerb(type) {
+  return (
+    {
+      note: "Note added", call: "Call logged", email: "Email sent", sms: "SMS sent",
+      whatsapp: "WhatsApp message", meeting: "Meeting", viewing: "Viewing", task: "Task",
+      stage_change: "Stage changed", assignment: "Lead assigned", document: "Document added",
+      offer: "Offer recorded", payment: "Payment recorded", system: "System update", import: "Imported",
+    }[type] || "Activity"
+  );
+}
+function humanStatus(value) {
+  return String(value || "")
+    .split(/[_-]/)
+    .filter(Boolean)
+    .map((word) => word[0].toUpperCase() + word.slice(1))
+    .join(" ");
+}
+function relativeShort(value) {
+  const then = new Date(value).getTime();
+  if (Number.isNaN(then)) return "—";
+  const diff = Date.now() - then;
+  const day = 86_400_000;
+  if (diff < 3_600_000) return `${Math.max(1, Math.round(diff / 60_000))}m ago`;
+  if (diff < day) return `${Math.round(diff / 3_600_000)}h ago`;
+  if (diff < 30 * day) return `${Math.round(diff / day)}d ago`;
+  return isoDate(value);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -552,8 +769,8 @@ export async function getAdminContact(identifier) {
       [row.id]
     ),
     query(
-      `SELECT public_id, activity_type, subject, body, occurred_at FROM activities
-        WHERE contact_id = ? ORDER BY occurred_at DESC LIMIT 50`,
+      `SELECT public_id, activity_type, subject_line AS subject, body, occurred_at FROM activities
+        WHERE contact_id = ? AND deleted_at IS NULL ORDER BY occurred_at DESC LIMIT 50`,
       [row.id]
     ).catch(() => []),
     query(
@@ -618,17 +835,18 @@ async function leadFilterOptions() {
         WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 300`
     ).catch(() => []),
     query(
-      `SELECT public_id, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', first_name, last_name)), ''), email) AS name
-         FROM crm_contacts ORDER BY created_at DESC LIMIT 300`
+      `SELECT public_id, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', first_name, last_name)), ''), primary_email) AS name
+         FROM crm_contacts WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 300`
     ).catch(() => []),
-    query("SELECT id, name FROM lead_sources ORDER BY name ASC LIMIT 100").catch(() => []),
+    query("SELECT id, code, name FROM lead_sources ORDER BY name ASC LIMIT 100").catch(() => []),
   ]);
   return {
     agents,
     communities,
     properties: properties.map((row) => ({ id: row.public_id, name: row.title, value: row.public_id, label: row.title })),
     contacts: contacts.map((row) => ({ id: row.public_id, name: row.name, value: row.public_id, label: row.name })),
-    sources: sources.map((row) => ({ id: String(row.id), name: row.name, value: String(row.id), label: row.name })),
+    // The leads list filters on `src.code`, so the option value must be the code, not the row id.
+    sources: sources.map((row) => ({ id: String(row.id), name: row.name, value: row.code, label: row.name })),
     statuses: options.staticOptions(["new", "working", "qualified", "unqualified", "converted", "lost", "dormant"]),
     categories: options.marketplaceCategories(),
   };
@@ -639,7 +857,7 @@ async function contactFilterOptions() {
   const [agents, countries, sources] = await Promise.all([
     options.agents(),
     options.countries(),
-    query("SELECT id, name FROM lead_sources ORDER BY name ASC LIMIT 100").catch(() => []),
+    query("SELECT id, code, name FROM lead_sources ORDER BY name ASC LIMIT 100").catch(() => []),
   ]);
   return {
     agents,

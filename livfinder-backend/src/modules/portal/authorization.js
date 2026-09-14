@@ -15,7 +15,7 @@ export async function assertListingAccess(req, identifier, action = "view") {
 
   const listing = await queryOne(
     `SELECT id, public_id, reference, account_id, organization_id, agent_id, created_by_user_id,
-            status, moderation_status, root_category_id, category_id, purpose_id, slug,
+            status, moderation_status, rejection_reason, root_category_id, category_id, purpose_id, slug,
             canonical_path, title
        FROM listings
       WHERE (public_id = ? OR reference = ? OR (id = ? AND ? > 0))

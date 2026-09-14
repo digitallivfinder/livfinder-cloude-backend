@@ -153,6 +153,19 @@ export async function signupPersonal(input, { ip, userAgent } = {}) {
       connection
     );
 
+    // A lister can list real estate from day one — the grant every personal
+    // lister used to get implicitly, now a real row an admin can also revoke or
+    // add to. A plain personal account gets nothing until an admin grants it.
+    if (typeCode === "lister") {
+      await execute(
+        `INSERT INTO account_category_access
+           (account_id, category_id, status, listing_used, requested_at, reviewed_at, created_at)
+         VALUES (?, 1, 'approved', 0, NOW(3), NOW(3), NOW(3))`,
+        [accountId],
+        connection
+      );
+    }
+
     await execute(
       "UPDATE users SET default_account_id = ? WHERE id = ?",
       [accountId, userId],
@@ -377,11 +390,11 @@ export async function signupOrganization(input, { ip, userAgent } = {}) {
 
     // Category access starts as a request; approval is an admin action.
     await execute(
-      `INSERT INTO organization_category_access
-         (organization_id, category_id, status, listing_quota, listing_used, requested_at,
+      `INSERT INTO account_category_access
+         (account_id, category_id, status, listing_quota, listing_used, requested_at,
           requested_by_user_id, created_at)
        VALUES (?, ?, 'requested', NULL, 0, NOW(3), ?, NOW(3))`,
-      [organizationId, definition.rootId, userId],
+      [accountId, definition.rootId, userId],
       connection
     );
 

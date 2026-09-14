@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { client, ensureTestPassword, adminEmail, findPortalOwner, queryOne, query, execute } from "../helpers/testApp.js";
+import { client, ensureTestPassword, adminEmail, findPortalOwner, createDisposablePortalOwner, cleanupUsers, queryOne, query, execute } from "../helpers/testApp.js";
 import { closePool } from "../../src/db/pool.js";
 import { decryptSecret } from "../../src/utils/secrets.js";
 
@@ -66,6 +66,32 @@ describe("admin reads", () => {
     expect(response.body.items.length).toBeGreaterThan(0);
     const reference = response.body.items[0].reference;
     expect((await client().get(`/v1/public/listings/${reference}`)).status).toBe(404);
+  });
+
+  it("returns a listing detail with the leads and activity engagement blocks", async () => {
+    const list = await superAdmin.get("/v1/admin/listings", { category: "real-estate", pageSize: 1 });
+    const id = list.body.items[0].id;
+    const response = await superAdmin.get(`/v1/admin/listings/${id}`);
+    expect(response.status).toBe(200);
+    const { engagement, gallery, documents } = response.body.data;
+    expect(Array.isArray(gallery)).toBe(true);
+    expect(Array.isArray(documents)).toBe(true);
+    expect(Array.isArray(engagement.leads.records)).toBe(true);
+    expect(engagement.leads.summary).toMatchObject({
+      total: expect.any(Number),
+      new: expect.any(Number),
+      qualified: expect.any(Number),
+      followUp: expect.any(Number),
+      closed: expect.any(Number),
+    });
+    expect(Array.isArray(engagement.activity.events)).toBe(true);
+    expect(engagement.activity.summary).toHaveProperty("total");
+    const listingRow = await queryOne("SELECT id FROM listings WHERE public_id = ?", [id]);
+    const leadCount = await queryOne(
+      "SELECT COUNT(*) AS total FROM leads WHERE primary_listing_id = ? AND deleted_at IS NULL",
+      [listingRow.id]
+    );
+    expect(engagement.leads.summary.total).toBe(Number(leadCount.total));
   });
 
   it("redacts credentials in a system log entry", async () => {
@@ -219,11 +245,11 @@ describe("verification decisions", () => {
   it("suspending a company takes its live listings off the marketplace", async () => {
     if (!organizationId) return;
     const row = await queryOne("SELECT id FROM organizations WHERE public_id = ?", [organizationId]);
-    const activeBefore = await queryOne(
-      "SELECT COUNT(*) AS total FROM listings WHERE organization_id = ? AND status = 'active'",
+    const activeBefore = await query(
+      "SELECT id FROM listings WHERE organization_id = ? AND status = 'active'",
       [row.id]
     );
-    if (Number(activeBefore.total) === 0) return;
+    if (activeBefore.length === 0) return;
 
     await superAdmin.send("patch", `/v1/admin/companies/${organizationId}/status`, {
       status: "suspended",
@@ -235,9 +261,110 @@ describe("verification decisions", () => {
     );
     expect(Number(activeAfter.total)).toBe(0);
 
-    // Restore what the test changed.
-    await execute("UPDATE listings SET status = 'active' WHERE organization_id = ? AND status = 'withdrawn'", [row.id]);
+    // Restore exactly what the test changed: only the listings it took down. The old restore set
+    // every withdrawn listing of the company active, including ones withdrawn before the test.
+    await execute(
+      `UPDATE listings SET status = 'active' WHERE id IN (${activeBefore.map(() => "?").join(",")}) AND status = 'withdrawn'`,
+      activeBefore.map((listing) => listing.id)
+    );
     await execute("CALL sp_refresh_listing_search(NULL)", []);
+  });
+
+  it("grants a company access to another category, in the slug the admin screens use", async () => {
+    const org = await queryOne(
+      "SELECT o.id, o.public_id, o.account_id FROM organizations o WHERE o.deleted_at IS NULL LIMIT 1"
+    );
+    // Pick a category the account does not already have.
+    const existing = await query(
+      "SELECT c.code FROM account_category_access aca JOIN categories c ON c.id = aca.category_id WHERE aca.account_id = ?",
+      [org.account_id]
+    );
+    const have = new Set(existing.map((entry) => entry.code));
+    const target = ["yachts", "cars", "jets", "helicopters", "watches"].find((slug) => !have.has(slug));
+    // Only a category the company does not already hold. The old `|| "yachts"` fallback
+    // "granted" yachts to a company that already had it, then deleted that real grant below.
+    if (!target) return;
+
+    const response = await superAdmin.send("patch", `/v1/admin/companies/${org.public_id}/category-access`, {
+      categoryId: target,
+      decision: "approve",
+    });
+    expect(response.status).toBe(200);
+
+    const rootId = { yachts: 3, cars: 2, jets: 4, helicopters: 5, watches: 6 }[target];
+    const granted = await queryOne(
+      "SELECT status FROM account_category_access WHERE account_id = ? AND category_id = ?",
+      [org.account_id, rootId]
+    );
+    expect(granted.status).toBe("approved");
+
+    // The company detail reads it back with the `listingType` slug the admin panels key on.
+    const detail = (await superAdmin.get(`/v1/admin/companies/${org.public_id}`)).body.data;
+    expect(detail.enabledCategories).toContain(target);
+    expect(detail.enabledCategories).not.toContain("realEstate");
+
+    await execute("DELETE FROM account_category_access WHERE account_id = ? AND category_id = ?", [org.account_id, rootId]);
+  });
+
+  it("grants Real Estate Developments as its own seventh category", async () => {
+    const org = await queryOne(
+      "SELECT o.id, o.public_id, o.account_id FROM organizations o WHERE o.deleted_at IS NULL LIMIT 1"
+    );
+    const before = await queryOne(
+      "SELECT status FROM account_category_access WHERE account_id = ? AND category_id = 7",
+      [org.account_id]
+    );
+
+    const on = await superAdmin.send("patch", `/v1/admin/companies/${org.public_id}/category-access`, {
+      categoryId: "real-estate-developments",
+      decision: "approve",
+    });
+    expect(on.status).toBe(200);
+    expect(on.body.data.categoryId).toBe("realEstateDevelopment");
+
+    const row = await queryOne(
+      "SELECT status FROM account_category_access WHERE account_id = ? AND category_id = 7",
+      [org.account_id]
+    );
+    expect(row.status).toBe("approved");
+
+    const detail = (await superAdmin.get(`/v1/admin/companies/${org.public_id}`)).body.data;
+    expect(detail.enabledCategories).toContain("real-estate-developments");
+
+    // Cleanup.
+    if (before) {
+      await execute("UPDATE account_category_access SET status = ? WHERE account_id = ? AND category_id = 7", [before.status, org.account_id]);
+    } else {
+      await execute("DELETE FROM account_category_access WHERE account_id = ? AND category_id = 7", [org.account_id]);
+    }
+  });
+
+  it("grants a category to an individual, independent of their account type", async () => {
+    const individual = (await superAdmin.get("/v1/admin/individuals", { pageSize: 1 })).body.items[0];
+    expect(individual).toBeTruthy();
+    const account = await queryOne(
+      `SELECT am.account_id FROM users u
+         JOIN account_members am ON am.user_id = u.id AND am.role = 'owner' AND am.status = 'active'
+        WHERE u.public_id = ? LIMIT 1`,
+      [individual.id]
+    );
+
+    const response = await superAdmin.send("patch", `/v1/admin/individuals/${individual.id}/category-access`, {
+      categoryId: "yachts",
+      decision: "approve",
+    });
+    expect(response.status).toBe(200);
+
+    const granted = await queryOne(
+      "SELECT status FROM account_category_access WHERE account_id = ? AND category_id = 3",
+      [account.account_id]
+    );
+    expect(granted.status).toBe("approved");
+
+    const detail = (await superAdmin.get(`/v1/admin/individuals/${individual.id}`)).body.data;
+    expect(detail.enabledCategories).toContain("yachts");
+
+    await execute("DELETE FROM account_category_access WHERE account_id = ? AND category_id = 3", [account.account_id]);
   });
 });
 
@@ -314,20 +441,25 @@ describe("access management", () => {
   });
 
   it("suspending a user ends their live sessions", async () => {
-    const target = client();
-    await target.login(portalOwner.email, PASSWORD);
-    expect((await target.get("/v1/auth/session")).body.data.authenticated).toBe(true);
+    // A throwaway user: suspending bumps the session epoch, and doing it to the real seeded
+    // portal owner signed that person out of their own browser on every run.
+    const disposable = await createDisposablePortalOwner({ prefix: "suspend-target", password: PASSWORD });
+    try {
+      const target = client();
+      await target.login(disposable.email, PASSWORD);
+      expect((await target.get("/v1/auth/session")).body.data.authenticated).toBe(true);
 
-    const userPublicId = await queryOne("SELECT public_id FROM users WHERE id = ?", [portalOwner.id]);
-    const response = await superAdmin.send("patch", `/v1/admin/users/${userPublicId.public_id}/status`, {
-      status: "suspended",
-      reason: "integration",
-    });
-    expect(response.status).toBe(200);
+      const response = await superAdmin.send("patch", `/v1/admin/users/${disposable.publicId}/status`, {
+        status: "suspended",
+        reason: "integration",
+      });
+      expect(response.status).toBe(200);
 
-    expect((await target.get("/v1/auth/session")).body.data).toBeNull();
-
-    await execute("UPDATE users SET status = 'active', suspended_reason = NULL WHERE id = ?", [portalOwner.id]);
+      expect((await target.get("/v1/auth/session")).body.data).toBeNull();
+    } finally {
+      // Audit rows may keep a suspended throwaway user alive; an example.test account is harmless.
+      await cleanupUsers([disposable.email]).catch(() => {});
+    }
   });
 
   it("refuses a self-lockout and refuses to strip the last active Super Administrator", async () => {

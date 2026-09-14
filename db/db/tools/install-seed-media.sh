@@ -30,6 +30,28 @@ TARGET="$STORAGE_DIR/public/seed"
 
 [ -d "$SOURCE" ] || { echo "no seed media at $SOURCE" >&2; exit 1; }
 
+# The storage root must already exist.
+#
+# It is a deployment artifact — a bind mount, a volume, a directory someone created for the
+# service — and never something this script should invent. Creating it means the target resolved
+# somewhere the API cannot read, and the most likely place for that is inside a container that
+# has no storage mount: `db_loader` in docker-compose.test.yml mounts only `./db/db:/db:ro`, so a
+# `mkdir -p` there would write the images into a throwaway filesystem and report success while
+# the running API went on serving placeholders. Refusing is what makes that visible.
+if [ ! -d "$STORAGE_DIR" ]; then
+  cat >&2 <<MSG
+storage directory not found: $STORAGE_DIR
+
+Nothing was copied. Run this on the host that owns the API's storage, and point it there:
+
+  STORAGE_DIR=/path/to/livfinder-backend/storage $0
+
+In Docker, that is the host side of the api service's storage bind mount, not a path inside the
+database loader container.
+MSG
+  exit 1
+fi
+
 mkdir -p "$TARGET"
 copied=0
 for dir in "$SOURCE"/*/; do

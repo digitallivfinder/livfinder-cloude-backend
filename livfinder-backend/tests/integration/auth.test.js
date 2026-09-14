@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { client, ensureTestPassword, findPortalOwner, adminEmail, cleanupUsers, queryOne, query, execute } from "../helpers/testApp.js";
+import { client, ensureTestPassword, createDisposablePortalOwner, adminEmail, cleanupUsers, queryOne, query, execute } from "../helpers/testApp.js";
 import { closePool } from "../../src/db/pool.js";
 import { sentMessages, clearSentMessages } from "../../src/modules/system/mail.service.js";
 
@@ -17,7 +17,11 @@ let owner = null;
 
 beforeAll(async () => {
   await ensureTestPassword(PASSWORD);
-  owner = await findPortalOwner();
+  // A throwaway owner. These tests sign out, bump the session epoch and rewrite the password
+  // hash; run against the real lowest-id seeded owner, that signed the person using that account
+  // out of their own browser on every run.
+  owner = await createDisposablePortalOwner({ prefix: "auth-owner", password: PASSWORD });
+  createdEmails.push(owner.email);
 });
 
 afterAll(async () => {
@@ -243,8 +247,8 @@ describe("signup", () => {
     expect(licence.license_number).toBe(`REG-${suffix}`);
 
     const access = await queryOne(
-      "SELECT status FROM organization_category_access WHERE organization_id = ? LIMIT 1",
-      [organization.id]
+      "SELECT status FROM account_category_access WHERE account_id = ? LIMIT 1",
+      [user.default_account_id]
     );
     expect(access.status).toBe("requested");
   });
