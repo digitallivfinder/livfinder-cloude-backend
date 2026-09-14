@@ -1014,15 +1014,31 @@ export async function updateLocation({ identifier, payload }) {
 }
 
 export async function archiveLocation({ identifier }) {
-  const location = await queryOne("SELECT id, public_id FROM locations WHERE public_id = ? AND deleted_at IS NULL", [identifier]);
+  const location = await queryOne("SELECT id, public_id, level FROM locations WHERE public_id = ? AND deleted_at IS NULL", [identifier]);
   if (!location) throw AppError.notFound("That location was not found.");
+
+  // A listing keeps every ancestor's id, not just its own level's — `country_id` and
+  // `state_id` were missing here, so archiving a country or state with live listings under
+  // it (rather than filed directly at that exact level) passed this check and silently
+  // orphaned them: still on the site, pointing at a location that no longer resolves.
   const inUse = await queryValue(
-    "SELECT COUNT(*) FROM listings WHERE (location_id = ? OR city_id = ? OR community_id = ? OR sub_community_id = ?) AND deleted_at IS NULL",
-    [location.id, location.id, location.id, location.id]
+    `SELECT COUNT(*) FROM listings
+      WHERE (location_id = ? OR country_id = ? OR state_id = ? OR city_id = ? OR community_id = ? OR sub_community_id = ?)
+        AND deleted_at IS NULL`,
+    [location.id, location.id, location.id, location.id, location.id, location.id]
   );
   if (Number(inUse) > 0) {
-    throw AppError.conflict(`${inUse} listings still reference that location. Move them first.`);
+    throw AppError.conflict(`${inUse} listing${Number(inUse) === 1 ? "" : "s"} still reference that location. Move them first.`);
   }
+
+  // Deleting a country or state with cities still under it left those rows pointing at a
+  // parent_id that no longer exists — the same silent-orphan failure, one level up. A leaf
+  // (sub-community) has nothing under it and always passes this.
+  const childCount = await queryValue("SELECT COUNT(*) FROM locations WHERE parent_id = ? AND deleted_at IS NULL", [location.id]);
+  if (Number(childCount) > 0) {
+    throw AppError.conflict(`${childCount} location${Number(childCount) === 1 ? "" : "s"} still exist under it. Remove those first.`);
+  }
+
   await execute("UPDATE locations SET status = 'inactive', deleted_at = NOW(3) WHERE id = ?", [location.id]);
   return { id: location.public_id, archived: true };
 }

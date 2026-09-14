@@ -1008,9 +1008,11 @@ router.post(
  * submitted.")}` — no request, no row, and a confirmation either way. The schema for
  * this has always existed (`reports`, `report_reasons`), so the surface is real now.
  *
- * Open to signed-out visitors, like the inquiry form, and rate-limited for the same
- * reason. The reporter's IP is stored for abuse handling; the reason must be one the
- * database actually defines for that subject type, so the UI cannot invent reasons.
+ * Unlike the inquiry and contact forms, a report requires a signed-in account — the
+ * frontend already gated this behind login, but the endpoint itself accepted an
+ * anonymous call. The reporter's IP is stored for abuse handling regardless; the
+ * reason must be one the database actually defines for that subject type, so the UI
+ * cannot invent reasons.
  */
 router.get(
   "/reports/reasons",
@@ -1045,6 +1047,7 @@ const reportSchema = z.object({
 router.post(
   "/reports",
   writeLimiter,
+  requireAuth,
   idempotency({ scope: "engagement" }),
   validate({ body: reportSchema }),
   asyncHandler(async (req, res) => {
@@ -1092,7 +1095,7 @@ router.post(
           JSON.stringify({ reference: listing.reference, title: listing.title }),
           reasons[0].id,
           details,
-          req.auth?.user?.id ?? null,
+          req.auth.user.id,
           req.body.email || null,
           // `reporter_ip` is varbinary(16); INET6_ATON does the encoding and returns
           // NULL for anything malformed, so a strange proxy header cannot break the write.

@@ -525,21 +525,100 @@ export async function getAdminReview(identifier) {
   return single.items.find((item) => item.id === identifier) || null;
 }
 
-export async function adminReviewerHistory(reviewerId) {
-  const rows = await query(
-    `SELECT r.public_id, r.rating, r.title, r.status, r.created_at, o.name AS organization_name
-       FROM reviews r LEFT JOIN organizations o ON o.id = r.organization_id
-      WHERE r.author_user_id = ? AND r.deleted_at IS NULL ORDER BY r.created_at DESC LIMIT 50`,
-    [Number(reviewerId)]
-  );
-  return rows.map((row) => ({
-    id: row.public_id,
-    rating: num(row.rating),
-    title: row.title,
-    status: row.status,
-    target: row.organization_name,
-    submittedAt: isoDate(row.created_at),
-  }));
+/**
+ * The "Reviewer History" tab needs a customer profile plus their other reviews and
+ * lead activity — the admin-only marketplace context described in the UI. A review's
+ * author is not always a registered user (guest checkout reviews have no
+ * `author_user_id`), so this falls back to the name/email captured on the review
+ * itself rather than failing the whole tab.
+ */
+export async function adminReviewerHistory(reviewerId, fallback = {}) {
+  const userId = Number(reviewerId) || 0;
+  const user = userId
+    ? await queryOne(
+        `SELECT u.id, u.email, u.phone_e164, u.display_name, u.status AS account_status, u.created_at,
+                at.code AS account_type_code
+           FROM users u
+           LEFT JOIN accounts a ON a.id = u.default_account_id
+           LEFT JOIN account_types at ON at.id = a.account_type_id
+          WHERE u.id = ? AND u.deleted_at IS NULL`,
+        [userId]
+      )
+    : null;
+
+  const [reviewRows, reviewSummary, leadRows, leadSummary] = userId
+    ? await Promise.all([
+        query(
+          `SELECT r.id, r.public_id, r.subject_type, r.subject_id, r.rating, r.title, r.status, r.created_at,
+                  o.name AS organization_name
+             FROM reviews r LEFT JOIN organizations o ON o.id = r.organization_id
+            WHERE r.author_user_id = ? AND r.deleted_at IS NULL
+            ORDER BY r.created_at DESC LIMIT 50`,
+          [userId]
+        ),
+        queryOne(
+          `SELECT COUNT(*) AS total, SUM(status = 'published') AS published, SUM(status = 'rejected') AS rejected
+             FROM reviews WHERE author_user_id = ? AND deleted_at IS NULL`,
+          [userId]
+        ),
+        query(
+          `SELECT l.reference, l.status, l.created_at, c.name AS category_name, li.title AS listing_title
+             FROM leads l
+             LEFT JOIN categories c ON c.id = l.category_id
+             LEFT JOIN listings li ON li.id = l.primary_listing_id
+            WHERE l.user_id = ? AND l.deleted_at IS NULL
+            ORDER BY l.created_at DESC LIMIT 20`,
+          [userId]
+        ),
+        queryOne(
+          `SELECT COUNT(*) AS totalLeads, COUNT(DISTINCT primary_listing_id) AS listingsContacted,
+                  MAX(last_activity_at) AS lastInteraction
+             FROM leads WHERE user_id = ? AND deleted_at IS NULL`,
+          [userId]
+        ),
+      ])
+    : [[], null, [], null];
+
+  const targets = await resolveReviewTargets(reviewRows);
+
+  return {
+    reviewer: {
+      name: user?.display_name || fallback.name || "Unknown reviewer",
+      reference: user ? `IND-${String(user.id).padStart(5, "0")}` : "—",
+      email: user?.email || fallback.email || null,
+      phone: user?.phone_e164 || null,
+      accountType: user?.account_type_code || "visitor",
+      accountStatus: user?.account_status || "guest",
+      memberSince: user ? isoDate(user.created_at) : null,
+    },
+    reviewSummary: {
+      total: int(reviewSummary?.total) ?? 0,
+      published: int(reviewSummary?.published) ?? 0,
+      rejected: int(reviewSummary?.rejected) ?? 0,
+    },
+    reviews: reviewRows.map((row) => ({
+      id: row.public_id,
+      reference: `RV-${String(row.id).padStart(6, "0")}`,
+      target: reviewTarget(row, targets),
+      targetType: row.subject_type,
+      rating: num(row.rating),
+      status: row.status,
+      submittedAt: isoDate(row.created_at),
+    })),
+    leadSummary: {
+      totalLeads: int(leadSummary?.totalLeads) ?? 0,
+      listingsContacted: int(leadSummary?.listingsContacted) ?? 0,
+      lastInteraction: leadSummary?.lastInteraction ? isoDate(leadSummary.lastInteraction) : null,
+    },
+    leads: leadRows.map((row) => ({
+      id: row.reference,
+      reference: row.reference,
+      listing: row.listing_title,
+      category: row.category_name,
+      status: row.status,
+      date: isoDate(row.created_at),
+    })),
+  };
 }
 
 /* -------------------------------------------------------------------------- */

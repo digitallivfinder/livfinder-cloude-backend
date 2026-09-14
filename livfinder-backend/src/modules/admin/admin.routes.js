@@ -914,8 +914,10 @@ router.get(
   requirePermission("moderation.view"),
   asyncHandler(async (req, res) => {
     const review = await content.getAdminReview(req.params.id);
-    if (!review?.reviewerId) return res.json({ data: [] });
-    return res.json({ data: await content.adminReviewerHistory(review.reviewerId) });
+    if (!review) throw AppError.notFound("That review was not found.");
+    return res.json({
+      data: await content.adminReviewerHistory(review.reviewerId, { name: review.reviewerName, email: review.reviewerEmail }),
+    });
   })
 );
 
