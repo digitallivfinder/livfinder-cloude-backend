@@ -308,6 +308,6 @@ describe("editorial", () => {
     expect(article.topics).toEqual(["buying-guides"]);
     expect(article.tags).toEqual(["Dubai"]);
     expect(article.format).toBe("Guide");
-    expect(article.publishedAt).toBe("2026-07-18");
+    expect(article.publishedAt).toBe("2026-07-18T00:00:00.000Z");
   });
 });

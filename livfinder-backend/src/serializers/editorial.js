@@ -1,4 +1,4 @@
-import { bool, int, isoDay, jsonField } from "./primitives.js";
+import { bool, int, isoDate, isoDay, jsonField } from "./primitives.js";
 
 const ENTITIES = {
   "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&apos;": "'",
@@ -133,8 +133,12 @@ export function serializeArticle(row, { terms = [], author = null, includeBody =
       region: null,
     })),
     author: serializeAuthor(author),
-    publishedAt: isoDay(row.published_at),
-    updatedAt: isoDay(row.updated_at),
+    // Full timestamps, not just the day: the website reads these as "2 hours ago" for
+    // anything published this week. The "Updated" line on the article page compares
+    // just the day portion of the two, so a publish and its own insert timestamp
+    // landing a few milliseconds apart never reads as an edit.
+    publishedAt: isoDate(row.published_at),
+    updatedAt: isoDate(row.updated_at),
     readingTimeMinutes: int(row.reading_time_minutes) ?? 5,
     featured: bool(row.is_featured),
     featuredPriority: bool(row.is_pinned) ? 1 : null,
