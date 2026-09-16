@@ -17,6 +17,7 @@ import accountsRouter from "./modules/accounts/accounts.routes.js";
 import mediaRouter, { publicRouter as mediaPublicRouter } from "./modules/media/media.routes.js";
 import portalRouter from "./modules/portal/portal.routes.js";
 import adminRouter from "./modules/admin/admin.routes.js";
+import devBoardRouter from "./modules/devBoard/devBoard.routes.js";
 import engagementRouter from "./modules/engagement/engagement.routes.js";
 import { legacyMediaRewrite } from "./middleware/legacyMedia.js";
 
@@ -96,6 +97,9 @@ export function createApp() {
   app.use("/v1/media", mediaRouter);
   app.use("/v1/portal", portalRouter);
   app.use("/v1/admin", adminRouter);
+  // Self-contained, like projects — its own tree and its own API, not folded
+  // into admin.routes.js.
+  app.use("/v1/admin/dev-board", devBoardRouter);
   app.use("/v1", engagementRouter);
 
   app.use(notFoundHandler);
