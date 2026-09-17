@@ -134,6 +134,11 @@ export async function generalSettingsOptions() {
       { value: "manual", label: "Manual review" },
       { value: "auto", label: "Publish immediately" },
     ],
+    // Mirrors `reviews.subject_type` (agent/organization/listing/platform) — the
+    // frontend never received this at all, so the "Allowed Review Targets" row
+    // called `.map()` on `undefined` and crashed the whole tab. "platform"
+    // reviews of LivFinder itself aren't a marketplace review target to toggle.
+    reviewTargetOptions: ["Agent", "Company", "Listing"],
     verificationExpiryOptions: [30, 90, 180, 365].map((value) => ({ value, label: `${value} days` })),
     sortOptions: [
       { value: "featured", label: "Featured" },

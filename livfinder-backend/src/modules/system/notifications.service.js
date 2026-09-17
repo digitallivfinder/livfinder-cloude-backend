@@ -247,3 +247,77 @@ export async function notifyNewMessage({ conversationId, senderUserId, preview }
     return 0;
   }
 }
+
+/* -------------------------------------------------------------------------- */
+/* Billing                                                                     */
+/* -------------------------------------------------------------------------- */
+// No payment provider is connected, so these are triggered by the events that
+// genuinely happen: an owner or admin switching the account's plan
+// (`accounts.service.js#assignPlanToAccount`), and `billing.jobs.js`'s sweep
+// finding an invoice past its due date or a subscription past its renewal
+// date — the same two moments a real gateway's "payment failed" webhook would
+// fire on, reached here without one.
+
+export async function notifyPlanChanged({ accountId, organizationId, planName }, connection) {
+  return notifyAccount(
+    { accountId, organizationId },
+    {
+      type: "billing.plan_changed",
+      title: `Your plan changed to ${planName}`,
+      body: "Your listing, featured and team limits updated immediately. No charge was raised.",
+      actionUrl: "/portal/billing",
+      icon: "credit-card",
+      subjectType: "account",
+      subjectId: accountId,
+    },
+    connection
+  );
+}
+
+export async function notifyInvoiceOverdue({ accountId, organizationId, invoice }, connection) {
+  return notifyAccount(
+    { accountId, organizationId },
+    {
+      type: "billing.invoice_overdue",
+      title: `Invoice ${invoice.invoice_number} is overdue`,
+      body: `Payment of ${invoice.currency_code} ${Number(invoice.total).toLocaleString()} was due and has not been received.`,
+      actionUrl: "/portal/billing",
+      icon: "alert-triangle",
+      subjectType: "invoice",
+      subjectId: invoice.id,
+    },
+    connection
+  );
+}
+
+export async function notifyInvoicePaid({ accountId, organizationId, invoice }, connection) {
+  return notifyAccount(
+    { accountId, organizationId },
+    {
+      type: "billing.invoice_paid",
+      title: `Payment received for invoice ${invoice.invoice_number}`,
+      body: `${invoice.currency_code} ${Number(invoice.total).toLocaleString()} was received. Thank you.`,
+      actionUrl: "/portal/billing",
+      icon: "check",
+      subjectType: "invoice",
+      subjectId: invoice.id,
+    },
+    connection
+  );
+}
+
+export async function notifySubscriptionPastDue({ accountId, organizationId, subscriptionId }, connection) {
+  return notifyAccount(
+    { accountId, organizationId },
+    {
+      type: "billing.subscription_past_due",
+      title: "Your subscription is past due",
+      body: "Choose a plan again from Billing & Plans, or contact support, to keep your paid features active.",
+      actionUrl: "/portal/billing",
+      icon: "alert-triangle",
+      subjectType: "subscription",
+      subjectId: subscriptionId,
+    },
+    connection
+  );
+}

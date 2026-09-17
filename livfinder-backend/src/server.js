@@ -49,6 +49,17 @@ const server = app.listen(env.PORT, async () => {
       logger.error({ err: error }, "listing maintenance could not be started");
     }
   }
+  // Time-triggered billing maintenance — no payment provider exists to report a failed renewal
+  // or a missed invoice itself, so this applies that outcome once it is genuinely overdue and
+  // notifies the account, instead of the account looking permanently current.
+  if (env.NODE_ENV !== "test") {
+    try {
+      const { startBillingMaintenance } = await import("./modules/accounts/billing.jobs.js");
+      startBillingMaintenance();
+    } catch (error) {
+      logger.error({ err: error }, "billing maintenance could not be started");
+    }
+  }
 });
 
 async function shutdown(signal) {

@@ -11,6 +11,7 @@ import { htmlToBlocks } from "../../serializers/editorial.js";
 import { callProcedure } from "../../db/query.js";
 import { splitPhone } from "../../utils/phone.js";
 import { notifyListingModeration, notifyVerificationDecision } from "../system/notifications.service.js";
+import { assignPlanToAccount } from "../accounts/accounts.service.js";
 
 /**
  * Admin write operations.
@@ -1483,18 +1484,150 @@ export async function upsertAgent({ identifier, payload, userId }) {
   });
 }
 
+/**
+ * Create/edit a plan and its per-currency prices.
+ *
+ * A quota field left blank (`null`) means genuinely unlimited — see migration
+ * 0057. `0` is a real, valid cap (Free's "not included at all") and is
+ * distinct from that; the two are never coalesced into one another here.
+ */
+const quotaField = z.union([z.coerce.number().int().min(0).max(1000000), z.null()]).optional();
+export const planSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  code: z.string().trim().min(1).max(60).optional(),
+  description: z.string().trim().max(500).optional().or(z.literal("")),
+  tier: z.coerce.number().int().min(0).max(20).optional(),
+  billingInterval: z.enum(["monthly", "quarterly", "yearly", "one_time", "custom"]).optional(),
+  trialDays: z.coerce.number().int().min(0).max(365).optional(),
+  listingQuota: quotaField,
+  featuredQuota: quotaField,
+  agentSeatQuota: quotaField,
+  leadQuota: quotaField,
+  isActive: z.coerce.boolean().optional(),
+  isPublic: z.coerce.boolean().optional(),
+  sortOrder: z.coerce.number().int().min(0).max(10000).optional(),
+  prices: z
+    .array(
+      z.object({
+        currency: z.string().trim().length(3),
+        amount: z.coerce.number().min(0).max(100000000),
+        setupFee: z.coerce.number().min(0).max(100000000).optional(),
+      })
+    )
+    .max(20)
+    .optional(),
+});
+
+async function upsertPlanPrices(planId, prices, connection) {
+  if (!prices) return;
+  for (const price of prices) {
+    // A blank amount means "leave this currency's price as it is" — the edit
+    // form always sends all four currencies, most of them unedited.
+    if (price.amount === null || price.amount === undefined) continue;
+    const currency = price.currency.toUpperCase();
+    const existing = await queryOne(
+      "SELECT id FROM plan_prices WHERE plan_id = ? AND currency_code = ? AND country_id IS NULL",
+      [planId, currency],
+      connection
+    );
+    if (existing) {
+      await execute(
+        "UPDATE plan_prices SET amount = ?, setup_fee = ? WHERE id = ?",
+        [price.amount, price.setupFee ?? 0, existing.id],
+        connection
+      );
+    } else {
+      await execute(
+        "INSERT INTO plan_prices (plan_id, currency_code, amount, setup_fee, is_active) VALUES (?, ?, ?, ?, 1)",
+        [planId, currency, price.amount, price.setupFee ?? 0],
+        connection
+      );
+    }
+  }
+}
+
+export async function upsertPlan({ identifier, payload, userId }) {
+  return withTransaction(async (connection) => {
+    if (identifier) {
+      const plan = await queryOne("SELECT id, public_id FROM plans WHERE public_id = ?", [identifier], connection);
+      if (!plan) throw AppError.notFound("That plan was not found.");
+      const assignments = [];
+      const params = [];
+      const set = (column, value) => {
+        assignments.push(`${column} = ?`);
+        params.push(value);
+      };
+      if (payload.name !== undefined) set("name", payload.name);
+      if (payload.description !== undefined) set("description", payload.description || null);
+      if (payload.tier !== undefined) set("tier", payload.tier);
+      if (payload.billingInterval !== undefined) set("billing_interval", payload.billingInterval);
+      if (payload.trialDays !== undefined) set("trial_days", payload.trialDays);
+      if (payload.listingQuota !== undefined) set("listing_quota", payload.listingQuota);
+      if (payload.featuredQuota !== undefined) set("featured_quota", payload.featuredQuota);
+      if (payload.agentSeatQuota !== undefined) set("agent_seat_quota", payload.agentSeatQuota);
+      if (payload.leadQuota !== undefined) set("lead_quota", payload.leadQuota);
+      if (payload.isActive !== undefined) set("is_active", payload.isActive ? 1 : 0);
+      if (payload.isPublic !== undefined) set("is_public", payload.isPublic ? 1 : 0);
+      if (payload.sortOrder !== undefined) set("sort_order", payload.sortOrder);
+      if (assignments.length) {
+        await execute(`UPDATE plans SET ${assignments.join(", ")}, updated_at = NOW(3) WHERE id = ?`, [...params, plan.id], connection);
+      }
+      await upsertPlanPrices(plan.id, payload.prices, connection);
+      return { id: plan.public_id, updated: true };
+    }
+
+    if (!payload.code) throw AppError.validation("Some information is invalid.", { code: "A plan code is required." });
+    const existingCode = await queryOne("SELECT id FROM plans WHERE code = ? OR slug = ?", [payload.code, slugify(payload.code)], connection);
+    if (existingCode) throw AppError.validation("Some information is invalid.", { code: "That plan code is already in use." });
+
+    const publicId = ulid();
+    const result = await execute(
+      `INSERT INTO plans
+         (public_id, code, name, slug, description, tier, billing_interval, trial_days,
+          listing_quota, featured_quota, agent_seat_quota, lead_quota, is_active, is_public, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+      [
+        publicId,
+        payload.code,
+        payload.name,
+        // `slug` is a required, unique column with no default — omitting it
+        // failed every create with a raw MySQL error ("doesn't have a default
+        // value"). `code` is already checked unique above, and is itself a
+        // slug-safe identifier, so deriving from it keeps the two in step.
+        slugify(payload.code),
+        payload.description || null,
+        payload.tier ?? 0,
+        payload.billingInterval ?? "monthly",
+        payload.trialDays ?? 0,
+        payload.listingQuota ?? 0,
+        payload.featuredQuota ?? 0,
+        payload.agentSeatQuota ?? 0,
+        payload.leadQuota ?? 0,
+        payload.isActive === false ? 0 : 1,
+        payload.isPublic === false ? 0 : 1,
+        payload.sortOrder ?? 100,
+      ],
+      connection
+    );
+    await upsertPlanPrices(result.insertId, payload.prices, connection);
+    return { id: publicId, planId: String(result.insertId), created: true };
+  });
+}
+
 export const packageChangeSchema = z.object({
-  packageId: z.coerce.number().int().positive(),
+  // Plans are addressed everywhere else in the admin API by their public_id
+  // (that's what `listAdminPackages()` publishes as a plan's `id`, and what the
+  // Change Package modal submits back) — this used to coerce that ULID to a
+  // number, which is always NaN, so every package change failed validation.
+  packageId: z.string().trim().min(1),
   note: z.string().trim().max(500).optional(),
 });
 
 /**
- * Moves an account onto a different plan.
- *
- * Deliberately does not take money. There is no billing provider connected, and a screen that
- * silently implied a charge had been raised would be worse than one that plainly does not.
- * The plan and its entitlements change; the invoice is a separate concern for when payments
- * exist.
+ * Moves an account onto a different plan. The actual write (plan lookup,
+ * subscription switch, quota mirroring) is shared with the portal's own
+ * self-service "Choose Plan" — see `accounts.service.js#assignPlanToAccount`.
+ * This wrapper only resolves the admin's account/org identifier.
  */
 export async function changeAccountPackage({ identifier, payload }) {
   const account = await queryOne(
@@ -1505,47 +1638,8 @@ export async function changeAccountPackage({ identifier, payload }) {
   );
   if (!account) throw AppError.notFound("That account was not found.");
 
-  const plan = await queryOne(
-    "SELECT id, name, listing_quota, featured_quota, billing_interval FROM plans WHERE id = ? AND is_active = 1",
-    [payload.packageId]
-  );
-  if (!plan) throw AppError.validation("Some information is invalid.", { packageId: "That package is not available." });
-
-  // The plan lives on `subscriptions`, not on the account: an account can have had several over
-  // time and the history is what billing and entitlement questions are answered from. So the
-  // current one is switched, or one is opened if the account has never had a plan.
-  await withTransaction(async (connection) => {
-    const current = await queryOne(
-      "SELECT id FROM subscriptions WHERE account_id = ? AND status IN ('active','trialing','past_due') ORDER BY created_at DESC LIMIT 1",
-      [account.id],
-      connection
-    );
-    if (current) {
-      await execute(
-        `UPDATE subscriptions SET plan_id = ?, listing_quota = ?, featured_quota = ?, billing_interval = ?, updated_at = NOW(3)
-          WHERE id = ?`,
-        [plan.id, plan.listing_quota ?? 0, plan.featured_quota ?? 0, plan.billing_interval ?? "monthly", current.id],
-        connection
-      );
-    } else {
-      await execute(
-        `INSERT INTO subscriptions (public_id, account_id, plan_id, status, amount, currency_code, billing_interval,
-                                    current_period_start, current_period_end, listing_quota, listing_used,
-                                    featured_quota, featured_used, auto_renew, created_at, updated_at)
-         VALUES (?, ?, ?, 'active', 0, 'AED', ?, NOW(3), DATE_ADD(NOW(3), INTERVAL 1 MONTH), ?, 0, ?, 0, 1, NOW(3), NOW(3))`,
-        [ulid(), account.id, plan.id, plan.billing_interval ?? "monthly", plan.listing_quota ?? 0, plan.featured_quota ?? 0],
-        connection
-      );
-    }
-    // The account's own quota mirrors the plan so quota checks stay one indexed read.
-    await execute(
-      "UPDATE accounts SET listing_quota = ?, featured_quota = ?, updated_at = NOW(3) WHERE id = ?",
-      [plan.listing_quota ?? 0, plan.featured_quota ?? 0, account.id],
-      connection
-    );
-  });
-
-  return { id: account.public_id, packageId: String(plan.id), packageName: plan.name, chargeRaised: false };
+  const result = await assignPlanToAccount({ accountId: account.id, packageId: payload.packageId });
+  return { id: account.public_id, ...result };
 }
 
 /* -------------------------------------------------------------------------- */

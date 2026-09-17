@@ -9,6 +9,7 @@ import { recordAudit } from "../system/audit.service.js";
 import { resolveCategory } from "../../utils/categories.js";
 import { resolveLocation } from "../locations/locations.repository.js";
 import { sendMail } from "../system/mail.service.js";
+import { notifyPlanChanged } from "../system/notifications.service.js";
 import env from "../../config/env.js";
 import { issueToken, normalizeEmail } from "../auth/auth.service.js";
 import { splitPhone } from "../../utils/phone.js";
@@ -549,4 +550,79 @@ export async function latestVerificationRequest({ subjectType, subjectId }) {
       ORDER BY id DESC LIMIT 1`,
     [subjectType, subjectId]
   );
+}
+
+/**
+ * Moves an account onto a different plan — shared by the admin "Change
+ * Package" action and the portal's own self-service "Choose Plan". Both
+ * deliberately do not take money: there is no billing provider connected, and
+ * a screen that implied a charge had been raised would be worse than one that
+ * plainly does not. The plan and its entitlements change; the invoice is a
+ * separate concern for when payments exist.
+ */
+export async function assignPlanToAccount({ accountId, packageId, publicOnly = false }) {
+  const plan = await queryOne(
+    // AED is the platform's base currency (see `currencies.is_base`) — the
+    // same price row the package pickers show, so the amount recorded on the
+    // subscription matches what was on screen when it was chosen.
+    // `publicOnly` (the portal's self-service path) excludes plans like
+    // Partner (`is_public = 0`) — never offered as a "Choose Plan" card, so an
+    // account should not be able to grant it to itself by calling the API
+    // directly with a copied plan id. The admin path has no such restriction.
+    `SELECT p.id, p.public_id, p.name, p.listing_quota, p.featured_quota, p.billing_interval,
+            pp.amount, pp.currency_code
+       FROM plans p
+       LEFT JOIN plan_prices pp ON pp.plan_id = p.id AND pp.currency_code = 'AED' AND pp.is_active = 1
+      WHERE p.public_id = ? AND p.is_active = 1 ${publicOnly ? "AND p.is_public = 1" : ""}`,
+    [packageId]
+  );
+  if (!plan) throw AppError.validation("Some information is invalid.", { packageId: "That package is not available." });
+
+  const amount = plan.amount ?? 0;
+  const currency = plan.currency_code || "AED";
+
+  // The plan lives on `subscriptions`, not on the account: an account can have had several over
+  // time and the history is what billing and entitlement questions are answered from. So the
+  // current one is switched, or one is opened if the account has never had a plan.
+  await withTransaction(async (connection) => {
+    const current = await queryOne(
+      "SELECT id FROM subscriptions WHERE account_id = ? AND status IN ('active','trialing','past_due') ORDER BY created_at DESC LIMIT 1",
+      [accountId],
+      connection
+    );
+    if (current) {
+      await execute(
+        `UPDATE subscriptions SET plan_id = ?, amount = ?, currency_code = ?, listing_quota = ?, featured_quota = ?, billing_interval = ?, updated_at = NOW(3)
+          WHERE id = ?`,
+        [plan.id, amount, currency, plan.listing_quota ?? 0, plan.featured_quota ?? 0, plan.billing_interval ?? "monthly", current.id],
+        connection
+      );
+    } else {
+      await execute(
+        `INSERT INTO subscriptions (public_id, account_id, plan_id, status, amount, currency_code, billing_interval,
+                                    current_period_start, current_period_end, listing_quota, listing_used,
+                                    featured_quota, featured_used, auto_renew, created_at, updated_at)
+         VALUES (?, ?, ?, 'active', ?, ?, ?, NOW(3), DATE_ADD(NOW(3), INTERVAL 1 MONTH), ?, 0, ?, 0, 1, NOW(3), NOW(3))`,
+        [ulid(), accountId, plan.id, amount, currency, plan.billing_interval ?? "monthly", plan.listing_quota ?? 0, plan.featured_quota ?? 0],
+        connection
+      );
+    }
+    // The account's own quota mirrors the plan so quota checks stay one indexed read
+    // (`POST /listings` only ever looks at `accounts.listing_quota`, and treats NULL
+    // as its "unlimited" sentinel). `plan.listing_quota` is NULL for a genuinely
+    // unlimited plan (Enterprise) and a real number everywhere else, including a
+    // literal 0 for Free ("no listing capability") — passed straight through, not
+    // coalesced to 0, or "unlimited" would become a hard cap of zero.
+    await execute(
+      "UPDATE accounts SET listing_quota = ?, featured_quota = ?, updated_at = NOW(3) WHERE id = ?",
+      [plan.listing_quota, plan.featured_quota ?? 0, accountId],
+      connection
+    );
+  });
+
+  // Best-effort: `notify`/`notifyAccount` already swallow their own errors, so
+  // a notification failure never undoes or masks the plan change above.
+  await notifyPlanChanged({ accountId, planName: plan.name });
+
+  return { packageId: plan.public_id, packageName: plan.name, chargeRaised: false };
 }

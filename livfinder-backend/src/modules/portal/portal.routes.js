@@ -23,6 +23,9 @@ import { getAdminDevelopment } from "../admin/admin.catalog.js";
 import { developmentAttachments } from "../projects/developmentAttachments.service.js";
 import { withTransaction } from "../../db/transaction.js";
 import { ulid } from "../../utils/ids.js";
+import { assignPlanToAccount } from "../accounts/accounts.service.js";
+import { createInvoiceCheckout } from "../system/payments.service.js";
+import env from "../../config/env.js";
 
 const router = Router();
 
@@ -987,6 +990,45 @@ router.get(
   asyncHandler(async (req, res) => {
     const params = q(req) || {};
     return res.json(detailResponse(await engagement.accountBilling({ accountId: requireAccountId(req), ...params })));
+  })
+);
+
+router.patch(
+  "/billing/plan",
+  writeLimiter,
+  requireAccountCapability("can_manage_billing"),
+  validate({ body: z.object({ packageId: z.string().trim().min(1) }) }),
+  asyncHandler(async (req, res) => {
+    // Self-service equivalent of the admin's "Change Package": same write path
+    // (`assignPlanToAccount`), just triggered by the account owner instead of
+    // an operator. No payment provider is connected, so this deliberately
+    // never claims a charge was raised — see the shared function's own note.
+    const accountId = requireAccountId(req);
+    const result = await assignPlanToAccount({ accountId, packageId: req.body.packageId, publicOnly: true });
+    await auditFromRequest(req, { action: "account.package_changed", subjectType: "account", subjectLabel: String(accountId), changes: { packageId: result.packageId } });
+    return res.json(detailResponse(result));
+  })
+);
+
+router.post(
+  "/billing/invoices/:id/checkout",
+  writeLimiter,
+  requireAccountCapability("can_manage_billing"),
+  asyncHandler(async (req, res) => {
+    const accountId = requireAccountId(req);
+    const invoiceRow = await queryOne("SELECT id FROM invoices WHERE public_id = ? AND account_id = ?", [req.params.id, accountId]);
+    if (!invoiceRow) throw AppError.notFound("That invoice was not found.");
+    const result = await createInvoiceCheckout({
+      invoiceId: invoiceRow.id,
+      accountId,
+      userId: req.auth.user.id,
+      successUrl: `${env.FRONTEND_URL}/portal/billing?paid=1`,
+      cancelUrl: `${env.FRONTEND_URL}/portal/billing`,
+    });
+    if (result.paid) {
+      await auditFromRequest(req, { action: "invoice.paid", subjectType: "invoice", subjectLabel: req.params.id });
+    }
+    return res.json(detailResponse(result));
   })
 );
 

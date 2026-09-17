@@ -1043,15 +1043,32 @@ export async function listPayments({ accountId, search = "", from, to, status = 
   };
 }
 
+// `plans.listing_quota`/`agent_seat_quota` distinguish NULL ("unlimited", e.g.
+// Enterprise) from a literal 0 ("not included at all", e.g. Free's listings).
+// A plain `quota ? ... : "Unlimited"` ternary treated both the same way.
+function quotaBenefit(quota, unit) {
+  if (quota === null || quota === undefined) return `Unlimited ${unit}`;
+  if (quota === 0) return null;
+  return `${quota} ${unit}`;
+}
+
 export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
   const { page: safePage, pageSize: safeSize, offset } = paginate({ page, pageSize }, 5);
   const [subscription, plans, invoices, invoiceTotal, seatsUsed] = await Promise.all([
     queryOne(
+      // `s.listing_quota`/`listing_used`/`featured_quota`/`featured_used` are never
+      // populated (every subscription row has them at 0) — the real, enforced
+      // numbers live on `accounts`, and the plan's own nominal quota (used for the
+      // "N listings" / "Unlimited listings" benefit copy) lives on `plans`.
       `SELECT s.public_id, s.status, s.amount, s.currency_code, s.billing_interval,
               s.current_period_start, s.current_period_end, s.auto_renew,
-              s.listing_quota, s.listing_used, s.featured_quota, s.featured_used,
-              p.name AS plan_name, p.code AS plan_code, p.tier, p.agent_seat_quota, p.lead_quota
-         FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+              p.name AS plan_name, p.code AS plan_code, p.tier, p.agent_seat_quota, p.lead_quota,
+              p.listing_quota AS plan_listing_quota, p.featured_quota AS plan_featured_quota,
+              a.listing_quota AS account_listing_quota, a.listing_used AS account_listing_used,
+              a.featured_quota AS account_featured_quota, a.featured_used AS account_featured_used
+         FROM subscriptions s
+         JOIN plans p ON p.id = s.plan_id
+         JOIN accounts a ON a.id = s.account_id
         WHERE s.account_id = ? AND s.status IN ('trialing','active','past_due')
         ORDER BY s.id DESC LIMIT 1`,
       [accountId]
@@ -1083,7 +1100,11 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
     ),
   ]);
 
-  const planPrices = await planPricing(plans.map((plan) => plan.public_id));
+  // Quote each plan in the account's own billing currency where one exists, so the
+  // "Available Plans" grid doesn't compare a different currency than the account is
+  // actually billed in (a brand-new account with no subscription yet falls back to
+  // AED, the platform base currency).
+  const planPrices = await planPricing(plans.map((plan) => plan.public_id), subscription?.currency_code || "AED");
 
   return {
     currentPlan: subscription
@@ -1105,9 +1126,9 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
             : null,
           autoRenew: bool(subscription.auto_renew),
           benefits: [
-            subscription.listing_quota ? `${subscription.listing_quota} listings` : "Unlimited listings",
-            subscription.featured_quota ? `${subscription.featured_quota} featured slots` : null,
-            subscription.agent_seat_quota ? `${subscription.agent_seat_quota} agent seats` : null,
+            quotaBenefit(subscription.plan_listing_quota, "listings"),
+            subscription.plan_featured_quota ? `${subscription.plan_featured_quota} featured slots` : null,
+            quotaBenefit(subscription.agent_seat_quota, "agent seats"),
             subscription.lead_quota ? `${subscription.lead_quota} leads / month` : null,
           ].filter(Boolean),
         }
@@ -1115,22 +1136,24 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
     usage: subscription
       ? {
           listings: {
-            used: int(subscription.listing_used) ?? 0,
-            limit: int(subscription.listing_quota) ?? 0,
-            percent: subscription.listing_quota
-              ? Math.round(((int(subscription.listing_used) ?? 0) / int(subscription.listing_quota)) * 100)
+            used: int(subscription.account_listing_used) ?? 0,
+            limit: int(subscription.account_listing_quota),
+            percent: subscription.account_listing_quota
+              ? Math.round(((int(subscription.account_listing_used) ?? 0) / int(subscription.account_listing_quota)) * 100)
               : 0,
           },
           featured: {
-            used: int(subscription.featured_used) ?? 0,
-            limit: int(subscription.featured_quota) ?? 0,
-            percent: subscription.featured_quota
-              ? Math.round(((int(subscription.featured_used) ?? 0) / int(subscription.featured_quota)) * 100)
+            used: int(subscription.account_featured_used) ?? 0,
+            limit: int(subscription.account_featured_quota),
+            percent: subscription.account_featured_quota
+              ? Math.round(((int(subscription.account_featured_used) ?? 0) / int(subscription.account_featured_quota)) * 100)
               : 0,
           },
           teamMembers: {
             used: int(seatsUsed) ?? 0,
-            limit: int(subscription.agent_seat_quota) ?? 0,
+            // No `?? 0` fallback: NULL is Enterprise's real "unlimited seats"
+            // value, and coalescing it to 0 would show "X / 0" instead.
+            limit: int(subscription.agent_seat_quota),
             percent: subscription.agent_seat_quota
               ? Math.round(((int(seatsUsed) ?? 0) / int(subscription.agent_seat_quota)) * 100)
               : 0,
@@ -1150,9 +1173,9 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
         ? formatMoney(planPrices.get(plan.public_id))
         : null,
       benefits: [
-        plan.listing_quota ? `${plan.listing_quota} listings` : "Unlimited listings",
+        quotaBenefit(plan.listing_quota, "listings"),
         plan.featured_quota ? `${plan.featured_quota} featured slots` : null,
-        plan.agent_seat_quota ? `${plan.agent_seat_quota} agent seats` : null,
+        quotaBenefit(plan.agent_seat_quota, "agent seats"),
         plan.lead_quota ? `${plan.lead_quota} leads / month` : null,
       ].filter(Boolean),
       current: subscription?.plan_code === plan.code,
@@ -1184,16 +1207,31 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
   };
 }
 
-async function planPricing(publicIds) {
+async function planPricing(publicIds, preferredCurrency = "AED") {
   if (!publicIds.length) return new Map();
+  // Each plan has one active price row per currency. Joining on `is_active = 1`
+  // alone returns all of them, so the caller ended up with whichever currency's
+  // row MySQL happened to return last for a given plan — the "Available Plans"
+  // grid could show a different, effectively random currency on every load.
   const rows = await query(
     `SELECT p.public_id, pp.amount, pp.currency_code
        FROM plans p
-       LEFT JOIN plan_prices pp ON pp.plan_id = p.id AND pp.is_active = 1
+       JOIN plan_prices pp ON pp.plan_id = p.id AND pp.is_active = 1
       WHERE p.public_id IN (${publicIds.map(() => "?").join(", ")})`,
     publicIds
   ).catch(() => []);
-  return new Map(rows.filter((row) => row.amount !== null).map((row) => [row.public_id, { amount: num(row.amount), currency: row.currency_code }]));
+  const byPlan = new Map();
+  for (const row of rows) {
+    if (row.amount === null) continue;
+    if (!byPlan.has(row.public_id)) byPlan.set(row.public_id, new Map());
+    byPlan.get(row.public_id).set(row.currency_code, { amount: num(row.amount), currency: row.currency_code });
+  }
+  const result = new Map();
+  for (const [planId, byCurrency] of byPlan) {
+    const chosen = byCurrency.get(preferredCurrency) ?? byCurrency.get("AED") ?? byCurrency.values().next().value;
+    if (chosen) result.set(planId, chosen);
+  }
+  return result;
 }
 
 export async function accountPayouts({ accountId, page = 1, pageSize = 10 }) {

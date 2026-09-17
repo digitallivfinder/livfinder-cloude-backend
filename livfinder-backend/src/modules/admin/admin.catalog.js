@@ -941,7 +941,7 @@ export async function getDeveloper(identifier) {
 /* Companies, individuals and agents                                           */
 /* -------------------------------------------------------------------------- */
 
-export async function listAdminCompanies({ status = "all", search = "", category = "", country = "", page = 1, pageSize = 10 } = {}) {
+export async function listAdminCompanies({ status = "all", search = "", category = "", country = "", packageId = "", page = 1, pageSize = 10 } = {}) {
   const conditions = ["o.deleted_at IS NULL"];
   const params = [];
   if (status !== "all") {
@@ -955,6 +955,14 @@ export async function listAdminCompanies({ status = "all", search = "", category
   if (country) {
     conditions.push("co.slug = ?");
     params.push(country);
+  }
+  // `options.packages()` (the filter dropdown) publishes the plan's numeric id, not its
+  // public_id like everywhere else — matched here the same way it's offered.
+  if (packageId) {
+    conditions.push(
+      `EXISTS (SELECT 1 FROM subscriptions s WHERE s.account_id = o.account_id AND s.plan_id = ? AND s.status IN ('active','trialing','past_due'))`
+    );
+    params.push(packageId);
   }
   const rootId = category ? rootIdFor(category) : null;
   const joins = [];
@@ -978,7 +986,13 @@ export async function listAdminCompanies({ status = "all", search = "", category
               ct.id AS city_id, ct.name AS city_name,
               a.public_id AS account_public_id, o.account_id,
               (SELECT COUNT(*) FROM inquiries i WHERE i.organization_id = o.id AND i.deleted_at IS NULL) AS inquiry_count,
-              (SELECT MAX(l.updated_at) FROM listings l WHERE l.organization_id = o.id) AS last_activity_at
+              (SELECT MAX(l.updated_at) FROM listings l WHERE l.organization_id = o.id) AS last_activity_at,
+              (SELECT p.public_id FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+                WHERE s.account_id = o.account_id AND s.status IN ('active','trialing','past_due')
+                ORDER BY s.id DESC LIMIT 1) AS package_id,
+              (SELECT p.name FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+                WHERE s.account_id = o.account_id AND s.status IN ('active','trialing','past_due')
+                ORDER BY s.id DESC LIMIT 1) AS package_name
          FROM organizations o
          ${joins.join("\n")}
          LEFT JOIN accounts a ON a.id = o.account_id
@@ -1059,6 +1073,7 @@ export async function listAdminCompanies({ status = "all", search = "", category
         listingCount: int(row.listing_count) ?? 0,
         agentCount: int(row.agent_count) ?? 0,
         inquiries: int(row.inquiry_count) ?? 0,
+        package: row.package_id ? { id: row.package_id, name: row.package_name } : null,
         enabledCategories: categoryIdsFor(access.filter((entry) => entry.status === "approved").map((entry) => entry.root_category_id)),
         requestedCategories: categoryIdsFor(access.filter((entry) => entry.status === "requested").map((entry) => entry.root_category_id)),
         primaryCategory: categoryIdsFor(access.filter((entry) => entry.status === "approved").map((entry) => entry.root_category_id))[0] ?? null,
@@ -1093,7 +1108,7 @@ export async function getAdminCompany(identifier) {
   const company = result.items.find((item) => item.organizationId === String(row.id));
   if (!company) return null;
 
-  const [agents, listings, activity, subscription] = await Promise.all([
+  const [agents, listings, activity, subscription, inquiryCount, invoices] = await Promise.all([
     query(
       `SELECT public_id, display_name, email, phone, status, created_at
          FROM agents WHERE organization_id = ? AND deleted_at IS NULL ORDER BY display_name`,
@@ -1110,10 +1125,32 @@ export async function getAdminCompany(identifier) {
       [row.id]
     ),
     queryOne(
-      `SELECT s.status, s.current_period_end, s.amount, s.currency_code, p.name AS plan_name, p.public_id AS plan_public_id
-         FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+      // The plan's real limits and the account's real usage columns both come
+      // along here — the Package tab used to receive neither and rendered
+      // "undefined Plan" with all-zero, always-"unlimited" usage meters.
+      `SELECT s.status, s.current_period_start, s.current_period_end, s.amount, s.currency_code, s.billing_interval,
+              p.name AS plan_name, p.public_id AS plan_public_id, p.description AS plan_description,
+              p.listing_quota AS plan_listing_quota, p.featured_quota AS plan_featured_quota,
+              p.agent_seat_quota AS plan_agent_seat_quota, p.lead_quota AS plan_lead_quota, p.tier AS plan_tier,
+              a.listing_quota AS account_listing_quota, a.listing_used AS account_listing_used,
+              a.featured_quota AS account_featured_quota, a.featured_used AS account_featured_used
+         FROM subscriptions s
+         JOIN plans p ON p.id = s.plan_id
          JOIN organizations o ON o.account_id = s.account_id
+         JOIN accounts a ON a.id = s.account_id
         WHERE o.id = ? AND s.status IN ('trialing','active','past_due') ORDER BY s.id DESC LIMIT 1`,
+      [row.id]
+    ),
+    queryValue(`SELECT total FROM v_organization_inquiry_counts WHERE organization_id = ?`, [row.id]).catch(() => 0),
+    query(
+      // Same invoice → plan join the client's own Billing page uses, scoped to
+      // this organization's account, so the admin sees the same real records.
+      `SELECT i.public_id, i.invoice_number, i.status, i.total, i.currency_code, i.issued_at, i.pdf_url, p.name AS plan_name
+         FROM invoices i
+         JOIN organizations o ON o.account_id = i.account_id
+         LEFT JOIN subscriptions s ON s.id = i.subscription_id
+         LEFT JOIN plans p ON p.id = s.plan_id
+        WHERE o.id = ? ORDER BY i.issued_at DESC LIMIT 12`,
       [row.id]
     ),
   ]);
@@ -1147,15 +1184,54 @@ export async function getAdminCompany(identifier) {
       ? {
           planName: subscription.plan_name,
           status: subscription.status,
+          startedOn: isoDay(subscription.current_period_start),
           renewsOn: isoDay(subscription.current_period_end),
           amount: num(subscription.amount),
           currency: subscription.currency_code,
         }
       : null,
+    // Real plan limits — `null` means the plan doesn't cap that dimension
+    // (e.g. Enterprise's unlimited listings), not "unknown".
+    package: subscription
+      ? {
+          name: subscription.plan_name,
+          subtitle: subscription.plan_description,
+          tier: subscription.plan_tier,
+          billingCycle: subscription.billing_interval,
+          // `int()` already returns null only for a real NULL (Enterprise's
+          // unlimited listings/seats) and passes a genuine 0 (Free's "not
+          // included") straight through — no `|| null` fallback here, or
+          // Free's real zero would be displayed as "Unlimited" too.
+          listingLimit: int(subscription.plan_listing_quota),
+          featuredListingsAllowance: int(subscription.plan_featured_quota),
+          agentLimit: int(subscription.plan_agent_seat_quota),
+          inquiriesLimit: int(subscription.plan_lead_quota),
+          prioritySupport: (subscription.plan_tier ?? 0) >= 3,
+        }
+      : null,
+    // Real usage against the account's own quota columns — these are what
+    // `POST /listings` actually enforces, unlike the subscription row's own
+    // listing/featured columns, which are never populated.
+    packageUsage: {
+      listings: int(subscription?.account_listing_used) ?? 0,
+      featured: int(subscription?.account_featured_used) ?? 0,
+      agents: agents.length,
+      inquiries: int(inquiryCount) ?? 0,
+    },
+    billingHistory: invoices.map((invoice) => ({
+      id: invoice.public_id,
+      number: invoice.invoice_number,
+      planName: invoice.plan_name,
+      status: invoice.status,
+      amount: num(invoice.total),
+      currency: invoice.currency_code,
+      date: isoDay(invoice.issued_at),
+      pdfUrl: invoice.pdf_url,
+    })),
   };
 }
 
-export async function listAdminIndividuals({ status = "all", search = "", page = 1, pageSize = 10 } = {}) {
+export async function listAdminIndividuals({ status = "all", search = "", packageId = "", page = 1, pageSize = 10 } = {}) {
   // "Individuals" are personal/lister accounts: a user with an account that is
   // not backed by an organization.
   const conditions = ["u.deleted_at IS NULL", "a.deleted_at IS NULL", "at.requires_organization = 0"];
@@ -1167,6 +1243,14 @@ export async function listAdminIndividuals({ status = "all", search = "", page =
   if (search) {
     conditions.push("(u.display_name LIKE ? OR u.email LIKE ?)");
     params.push(`%${search}%`, `%${search}%`);
+  }
+  // `options.packages()` (the filter dropdown) publishes the plan's numeric id, not its
+  // public_id like everywhere else — matched here the same way it's offered.
+  if (packageId) {
+    conditions.push(
+      `EXISTS (SELECT 1 FROM subscriptions s WHERE s.account_id = a.id AND s.plan_id = ? AND s.status IN ('active','trialing','past_due'))`
+    );
+    params.push(packageId);
   }
 
   const where = `WHERE ${conditions.join(" AND ")}`;
@@ -1181,7 +1265,13 @@ export async function listAdminIndividuals({ status = "all", search = "", page =
               co.id AS country_id, co.name AS country_name,
               ct.id AS city_id, ct.name AS city_name,
               ag.public_id AS agent_public_id, ag.bio, ag.title,
-              (SELECT COUNT(*) FROM listings l WHERE l.account_id = a.id AND l.deleted_at IS NULL) AS listing_count
+              (SELECT COUNT(*) FROM listings l WHERE l.account_id = a.id AND l.deleted_at IS NULL) AS listing_count,
+              (SELECT p.public_id FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+                WHERE s.account_id = a.id AND s.status IN ('active','trialing','past_due')
+                ORDER BY s.id DESC LIMIT 1) AS package_id,
+              (SELECT p.name FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+                WHERE s.account_id = a.id AND s.status IN ('active','trialing','past_due')
+                ORDER BY s.id DESC LIMIT 1) AS package_name
          FROM users u
          JOIN account_members am ON am.user_id = u.id AND am.role = 'owner' AND am.status = 'active'
          JOIN accounts a ON a.id = am.account_id
@@ -1254,6 +1344,7 @@ export async function listAdminIndividuals({ status = "all", search = "", page =
       address: null,
       listings: int(row.listing_count) ?? 0,
       listingCount: int(row.listing_count) ?? 0,
+      package: row.package_id ? { id: row.package_id, name: row.package_name } : null,
       enabledCategories: categoryIdsFor(approvedRoots),
       requestedCategories: categoryIdsFor(grants.filter((g) => g.status === "requested").map((g) => g.root_category_id)),
       primaryCategory: categoryIdsFor(approvedRoots)[0] ?? null,
@@ -1277,8 +1368,138 @@ export async function listAdminIndividuals({ status = "all", search = "", page =
 }
 
 export async function getAdminIndividual(identifier) {
-  const result = await listAdminIndividuals({ pageSize: 200 });
-  return result.items.find((item) => item.id === identifier || item.userId === identifier) || null;
+  // A direct lookup instead of paging through up to 200 individuals and
+  // filtering in memory for the one whose public_id matched.
+  const row = await queryOne(
+    `SELECT u.id, u.public_id, u.first_name, u.last_name, u.display_name, u.email, u.phone_e164,
+            u.avatar_url, u.created_at, u.last_seen_at,
+            a.id AS account_id, a.public_id AS account_public_id, a.status AS account_status,
+            a.verification_status, at.code AS account_type_code,
+            co.id AS country_id, co.name AS country_name,
+            ct.id AS city_id, ct.name AS city_name,
+            ag.public_id AS agent_public_id, ag.bio, ag.title,
+            (SELECT COUNT(*) FROM listings l WHERE l.account_id = a.id AND l.deleted_at IS NULL) AS listing_count
+       FROM users u
+       JOIN account_members am ON am.user_id = u.id AND am.role = 'owner' AND am.status = 'active'
+       JOIN accounts a ON a.id = am.account_id
+       JOIN account_types at ON at.id = a.account_type_id
+       LEFT JOIN locations co ON co.id = u.country_id
+       LEFT JOIN locations ct ON ct.id = u.city_id
+       LEFT JOIN agents ag ON ag.user_id = u.id AND ag.deleted_at IS NULL
+      WHERE at.requires_organization = 0 AND (u.public_id = ? OR u.id = ?)
+      LIMIT 1`,
+    [identifier, /^\d+$/.test(identifier) ? Number(identifier) : -1]
+  );
+  if (!row) return null;
+
+  const [access, subscription, inquiryCount, invoices] = await Promise.all([
+    query(
+      `SELECT COALESCE(c.root_category_id, c.id) AS root_category_id, aca.status
+         FROM account_category_access aca JOIN categories c ON c.id = aca.category_id
+        WHERE aca.account_id = ?`,
+      [row.account_id]
+    ),
+    // Individuals hold their own subscription directly on `accounts` — same
+    // shape as `getAdminCompany()`'s, just without the organizations join.
+    queryOne(
+      `SELECT s.status, s.current_period_start, s.current_period_end, s.amount, s.currency_code, s.billing_interval,
+              p.name AS plan_name, p.public_id AS plan_public_id, p.description AS plan_description,
+              p.listing_quota AS plan_listing_quota, p.featured_quota AS plan_featured_quota,
+              p.lead_quota AS plan_lead_quota, p.tier AS plan_tier,
+              a.listing_quota AS account_listing_quota, a.listing_used AS account_listing_used,
+              a.featured_quota AS account_featured_quota, a.featured_used AS account_featured_used
+         FROM subscriptions s
+         JOIN plans p ON p.id = s.plan_id
+         JOIN accounts a ON a.id = s.account_id
+        WHERE s.account_id = ? AND s.status IN ('trialing','active','past_due') ORDER BY s.id DESC LIMIT 1`,
+      [row.account_id]
+    ),
+    queryValue(
+      `SELECT COUNT(*) FROM inquiries WHERE account_id = ? AND deleted_at IS NULL AND is_spam = 0`,
+      [row.account_id]
+    ).catch(() => 0),
+    query(
+      `SELECT i.public_id, i.invoice_number, i.status, i.total, i.currency_code, i.issued_at, i.pdf_url, p.name AS plan_name
+         FROM invoices i
+         LEFT JOIN subscriptions s ON s.id = i.subscription_id
+         LEFT JOIN plans p ON p.id = s.plan_id
+        WHERE i.account_id = ? ORDER BY i.issued_at DESC LIMIT 12`,
+      [row.account_id]
+    ),
+  ]);
+  const approvedRoots = access.filter((g) => g.status === "approved").map((g) => g.root_category_id);
+
+  return {
+    id: row.public_id,
+    userId: String(row.id),
+    accountId: row.account_public_id,
+    reference: `IND-${String(row.id).padStart(5, "0")}`,
+    firstName: row.first_name,
+    lastName: row.last_name,
+    displayName: row.display_name,
+    email: row.email,
+    phone: row.phone_e164,
+    secondaryPhone: null,
+    avatar: row.avatar_url,
+    profession: row.title,
+    bio: row.bio,
+    type: "individual",
+    status: row.account_status,
+    verificationStatus: row.verification_status,
+    accountType: row.account_type_code,
+    countryId: row.country_id ? String(row.country_id) : null,
+    country: row.country_name,
+    cityId: row.city_id ? String(row.city_id) : null,
+    city: row.city_name,
+    address: null,
+    listings: int(row.listing_count) ?? 0,
+    listingCount: int(row.listing_count) ?? 0,
+    enabledCategories: categoryIdsFor(approvedRoots),
+    requestedCategories: categoryIdsFor(access.filter((g) => g.status === "requested").map((g) => g.root_category_id)),
+    primaryCategory: categoryIdsFor(approvedRoots)[0] ?? null,
+    agentId: row.agent_public_id,
+    dateAdded: isoDate(row.created_at),
+    lastActivityAt: isoDate(row.last_seen_at || row.created_at),
+    packageId: subscription?.plan_public_id ?? null,
+    packageBilling: subscription
+      ? {
+          planName: subscription.plan_name,
+          status: subscription.status,
+          startedOn: isoDay(subscription.current_period_start),
+          renewsOn: isoDay(subscription.current_period_end),
+          amount: num(subscription.amount),
+          currency: subscription.currency_code,
+        }
+      : null,
+    package: subscription
+      ? {
+          name: subscription.plan_name,
+          subtitle: subscription.plan_description,
+          tier: subscription.plan_tier,
+          billingCycle: subscription.billing_interval,
+          // No `|| null` fallback — see the identical field in getAdminCompany.
+          listingLimit: int(subscription.plan_listing_quota),
+          featuredListingsAllowance: int(subscription.plan_featured_quota),
+          inquiriesLimit: int(subscription.plan_lead_quota),
+          prioritySupport: (subscription.plan_tier ?? 0) >= 3,
+        }
+      : null,
+    packageUsage: {
+      listings: int(subscription?.account_listing_used) ?? 0,
+      featured: int(subscription?.account_featured_used) ?? 0,
+      inquiries: int(inquiryCount) ?? 0,
+    },
+    billingHistory: invoices.map((invoice) => ({
+      id: invoice.public_id,
+      number: invoice.invoice_number,
+      planName: invoice.plan_name,
+      status: invoice.status,
+      amount: num(invoice.total),
+      currency: invoice.currency_code,
+      date: isoDay(invoice.issued_at),
+      pdfUrl: invoice.pdf_url,
+    })),
+  };
 }
 
 export async function listAdminAgents({ status = "all", search = "", organizationId = null, page = 1, pageSize = 10 } = {}) {
@@ -1646,11 +1867,15 @@ export async function getAdminCategory(identifier) {
 
 export async function listAdminPackages() {
   const rows = await query(
+    // Each plan has one active `plan_prices` row per currency (AED/USD/EUR/GBP/…).
+    // Joining on `is_active = 1` alone returned every one of them, so each plan
+    // rendered as several duplicate cards with different prices. AED is the
+    // platform's base currency (`currencies.is_base`) — pick that one row.
     `SELECT p.public_id, p.code, p.name, p.description, p.tier, p.billing_interval, p.trial_days,
             p.listing_quota, p.featured_quota, p.agent_seat_quota, p.lead_quota, p.is_active, p.is_public,
             pp.amount, pp.currency_code
        FROM plans p
-       LEFT JOIN plan_prices pp ON pp.plan_id = p.id AND pp.is_active = 1
+       LEFT JOIN plan_prices pp ON pp.plan_id = p.id AND pp.currency_code = 'AED' AND pp.is_active = 1
       ORDER BY p.sort_order ASC`
   );
   return rows.map((row) => ({
@@ -1676,6 +1901,58 @@ export async function listAdminPackages() {
     isActive: bool(row.is_active),
     isPublic: bool(row.is_public),
   }));
+}
+
+const PLAN_CURRENCIES = ["AED", "USD", "EUR", "GBP"];
+
+function serializePlan(plan, prices) {
+  return {
+    id: plan.public_id,
+    code: plan.code,
+    name: plan.name,
+    slug: plan.slug,
+    description: plan.description,
+    audience: plan.audience,
+    tier: plan.tier,
+    billingInterval: plan.billing_interval,
+    trialDays: int(plan.trial_days) ?? 0,
+    // NULL is the real "unlimited" sentinel for these two (see the Enterprise
+    // plan and migration 0057); 0 is a genuine, deliberate zero everywhere
+    // else — neither is coalesced away here.
+    listingQuota: int(plan.listing_quota),
+    featuredQuota: int(plan.featured_quota) ?? 0,
+    agentSeatQuota: int(plan.agent_seat_quota),
+    leadQuota: int(plan.lead_quota) ?? 0,
+    isActive: bool(plan.is_active),
+    isPublic: bool(plan.is_public),
+    isDefault: bool(plan.is_default),
+    sortOrder: int(plan.sort_order) ?? 0,
+    prices: PLAN_CURRENCIES.map((currency) => {
+      const row = prices.find((p) => p.currency_code === currency);
+      return { currency, amount: row ? num(row.amount) : null, setupFee: row ? num(row.setup_fee) : 0 };
+    }),
+  };
+}
+
+/** The management table — every plan, every currency's price, active or not. */
+export async function listAdminPlans() {
+  const [plans, prices] = await Promise.all([
+    query(`SELECT * FROM plans ORDER BY sort_order ASC, tier ASC`),
+    query(`SELECT plan_id, currency_code, amount, setup_fee FROM plan_prices WHERE is_active = 1`),
+  ]);
+  const pricesByPlan = new Map();
+  for (const row of prices) {
+    if (!pricesByPlan.has(row.plan_id)) pricesByPlan.set(row.plan_id, []);
+    pricesByPlan.get(row.plan_id).push(row);
+  }
+  return plans.map((plan) => serializePlan(plan, pricesByPlan.get(plan.id) || []));
+}
+
+export async function getAdminPlan(identifier) {
+  const plan = await queryOne(`SELECT * FROM plans WHERE public_id = ? OR code = ?`, [identifier, identifier]);
+  if (!plan) return null;
+  const prices = await query(`SELECT plan_id, currency_code, amount, setup_fee FROM plan_prices WHERE plan_id = ? AND is_active = 1`, [plan.id]);
+  return serializePlan(plan, prices);
 }
 
 export async function listBusinessActivity({ organizationId = null, limit = 50 } = {}) {

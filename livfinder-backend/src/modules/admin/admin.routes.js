@@ -36,6 +36,10 @@ const listQuery = z
     location: z.string().trim().max(200).optional(),
     country: z.string().trim().max(120).optional(),
     developer: z.string().trim().max(120).optional(),
+    // The Companies/Individuals "Package" filter — a plan's numeric id, matching what
+    // `options.packages()` publishes. Missing here, `validate()` stripped it from every
+    // request before the repository functions ever saw it.
+    package: z.string().trim().max(20).optional(),
     // Developments. These were sent by the screen and stripped here, so six of
     // its eight selects reached the repository as nothing at all.
     developmentStatus: z.string().trim().max(40).optional(),
@@ -287,7 +291,7 @@ router.get(
   "/companies",
   requirePermission("companies.view"),
   validate({ query: listQuery }),
-  asyncHandler(async (req, res) => res.json(await catalog.listAdminCompanies(params(req))))
+  asyncHandler(async (req, res) => res.json(await catalog.listAdminCompanies({ ...params(req), packageId: params(req).package })))
 );
 
 router.get(
@@ -370,7 +374,7 @@ router.get(
   "/individuals",
   requirePermission("individuals.view"),
   validate({ query: listQuery }),
-  asyncHandler(async (req, res) => res.json(await catalog.listAdminIndividuals(params(req))))
+  asyncHandler(async (req, res) => res.json(await catalog.listAdminIndividuals({ ...params(req), packageId: params(req).package })))
 );
 
 router.get(
@@ -519,6 +523,48 @@ router.get(
   "/packages",
   requirePermission("finance.view"),
   asyncHandler(async (req, res) => res.json({ data: await catalog.listAdminPackages() }))
+);
+
+// The plan management screen — every currency's price, active or not. `/packages`
+// above stays as-is: it's the AED-only shape the "Change Package" pickers use.
+router.get(
+  "/plans",
+  requirePermission("finance.view"),
+  asyncHandler(async (req, res) => res.json({ data: await catalog.listAdminPlans() }))
+);
+
+router.get(
+  "/plans/:id",
+  requirePermission("finance.view"),
+  asyncHandler(async (req, res) => {
+    const plan = await catalog.getAdminPlan(req.params.id);
+    if (!plan) throw AppError.notFound("That plan was not found.");
+    return res.json(detailResponse(plan));
+  })
+);
+
+router.post(
+  "/plans",
+  writeLimiter,
+  requirePermission("finance.plans"),
+  validate({ body: mutations.planSchema }),
+  asyncHandler(async (req, res) => {
+    const result = await mutations.upsertPlan({ identifier: null, payload: req.body, userId: req.auth.user.id });
+    await auditFromRequest(req, { action: "plan.created", subjectType: "plan", subjectLabel: req.body.name });
+    return res.status(201).json(detailResponse(result));
+  })
+);
+
+router.patch(
+  "/plans/:id",
+  writeLimiter,
+  requirePermission("finance.plans"),
+  validate({ body: mutations.planSchema.partial() }),
+  asyncHandler(async (req, res) => {
+    const result = await mutations.upsertPlan({ identifier: req.params.id, payload: req.body, userId: req.auth.user.id });
+    await auditFromRequest(req, { action: "plan.updated", subjectType: "plan", subjectLabel: req.params.id, changes: req.body });
+    return res.json(detailResponse(result));
+  })
 );
 
 /* -------------------------------------------------------------------------- */

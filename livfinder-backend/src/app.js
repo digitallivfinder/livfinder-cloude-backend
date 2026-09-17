@@ -19,6 +19,7 @@ import portalRouter from "./modules/portal/portal.routes.js";
 import adminRouter from "./modules/admin/admin.routes.js";
 import devBoardRouter from "./modules/devBoard/devBoard.routes.js";
 import engagementRouter from "./modules/engagement/engagement.routes.js";
+import webhooksRouter from "./modules/system/webhooks.routes.js";
 import { legacyMediaRewrite } from "./middleware/legacyMedia.js";
 
 export function createApp() {
@@ -68,6 +69,10 @@ export function createApp() {
       },
     })
   );
+
+  // Ahead of the global JSON parser: Stripe's signature check needs the raw request bytes
+  // (see webhooks.routes.js), which express.json() below would have already consumed.
+  app.use("/v1/webhooks", webhooksRouter);
 
   app.use(express.json({ limit: env.BODY_LIMIT }));
   app.use(express.urlencoded({ extended: false, limit: env.BODY_LIMIT }));
