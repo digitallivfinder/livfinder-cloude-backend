@@ -146,6 +146,9 @@ is_post_seed_migration() {
     # 0053 redefines the counter rollup and recomputes counters from the seeded rows.
     0053_entity_counters_slot_rule.sql)
       return 0 ;;
+    # 0058 adds a provider row after the seeded providers, so their ids do not move.
+    0058_listing_import_api.sql)
+      return 0 ;;
     *)
       return 1 ;;
   esac

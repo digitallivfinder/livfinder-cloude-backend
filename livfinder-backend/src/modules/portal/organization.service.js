@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import net from "node:net";
 import { z } from "zod";
 import { query, queryOne, queryValue, execute } from "../../db/query.js";
 import { withTransaction } from "../../db/transaction.js";
@@ -569,23 +570,66 @@ export async function reviewAccessRequest({ organizationId, publicId, status, no
 /* API clients                                                                 */
 /* -------------------------------------------------------------------------- */
 
-export async function createApiClient({ organizationId, name, scopes, userId }) {
+/**
+ * An API key's IP allow-list: exact addresses or CIDR ranges, IPv4 or IPv6, deduplicated. An
+ * empty list means the key works from any address.
+ */
+export function normalizeAllowedIps(list = []) {
+  const fields = {};
+  const result = [];
+  for (const [index, raw] of list.entries()) {
+    const entry = String(raw || "").trim();
+    if (!entry) continue;
+    const [base, bits, extra] = entry.split("/");
+    const family = net.isIP(base);
+    const maxBits = family === 4 ? 32 : 128;
+    const validBits = bits === undefined || (/^\d+$/.test(bits) && Number(bits) <= maxBits);
+    if (!family || extra !== undefined || !validBits) {
+      fields[`allowedIps.${index}`] = `"${entry}" is not an IP address or CIDR range.`;
+      continue;
+    }
+    if (!result.includes(entry)) result.push(entry);
+  }
+  if (Object.keys(fields).length) throw AppError.validation("Some information is invalid.", fields);
+  return result;
+}
+
+export async function createApiClient({ organizationId, name, scopes, allowedIps = [], userId }) {
   const accountId = await queryValue("SELECT account_id FROM organizations WHERE id = ?", [organizationId]);
   const publicId = ulid();
   const clientId = `lf_${crypto.randomBytes(16).toString("hex")}`;
   const secret = randomToken(32);
+  const ips = normalizeAllowedIps(allowedIps);
 
   await execute(
     `INSERT INTO api_clients
        (public_id, account_id, organization_id, name, client_id, secret_hash, secret_hint,
-        scopes, rate_limit_per_minute, status, created_by_user_id, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), 120, 'active', ?, NOW(3))`,
-    [publicId, accountId, organizationId, name, clientId, sha256(secret), secret.slice(-6), JSON.stringify(scopes), userId]
+        scopes, rate_limit_per_minute, allowed_ips, status, created_by_user_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), 120, CAST(? AS JSON), 'active', ?, NOW(3))`,
+    [publicId, accountId, organizationId, name, clientId, sha256(secret), secret.slice(-6), JSON.stringify(scopes), JSON.stringify(ips), userId]
   );
 
   // The secret is returned exactly once. Only its SHA-256 is stored, so it
   // cannot be recovered from the database later.
-  return { id: publicId, name, clientId, secret, scopes, createdAt: new Date().toISOString() };
+  return { id: publicId, name, clientId, secret, scopes, allowedIps: ips, createdAt: new Date().toISOString() };
+}
+
+export async function updateApiClient({ organizationId, publicId, name, allowedIps }) {
+  const row = await queryOne("SELECT id, status FROM api_clients WHERE public_id = ? AND organization_id = ?", [publicId, organizationId]);
+  if (!row) throw AppError.notFound("That credential was not found.");
+  if (row.status === "revoked") throw AppError.conflict("A revoked credential cannot be changed.");
+  const assignments = [];
+  const params = [];
+  if (name !== undefined) {
+    assignments.push("name = ?");
+    params.push(name);
+  }
+  if (allowedIps !== undefined) {
+    assignments.push("allowed_ips = CAST(? AS JSON)");
+    params.push(JSON.stringify(normalizeAllowedIps(allowedIps)));
+  }
+  if (assignments.length) await execute(`UPDATE api_clients SET ${assignments.join(", ")} WHERE id = ?`, [...params, row.id]);
+  return true;
 }
 
 export async function revokeApiClient({ organizationId, publicId }) {

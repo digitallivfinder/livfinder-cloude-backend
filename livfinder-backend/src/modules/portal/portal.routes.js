@@ -26,6 +26,8 @@ import { ulid } from "../../utils/ids.js";
 import { assignPlanToAccount } from "../accounts/accounts.service.js";
 import { createInvoiceCheckout } from "../system/payments.service.js";
 import env from "../../config/env.js";
+import { API_SCOPES } from "../../middleware/apiClient.js";
+import * as importsRepo from "../imports/imports.repository.js";
 
 const router = Router();
 
@@ -915,17 +917,22 @@ router.get(
   asyncHandler(async (req, res) => {
     const organizationId = requireOrganizationId(req);
     const rows = await query(
-      `SELECT ac.public_id, ac.name, ac.status, ac.scopes, ac.last_used_at, ac.created_at,
-              ac.rate_limit_per_minute
+      `SELECT ac.public_id, ac.name, ac.client_id, ac.secret_hint, ac.status, ac.scopes, ac.allowed_ips,
+              ac.last_used_at, ac.created_at, ac.rate_limit_per_minute
          FROM api_clients ac WHERE ac.organization_id = ? ORDER BY ac.created_at DESC`,
       [organizationId]
     );
+    const json = (value) => (typeof value === "string" ? JSON.parse(value || "[]") : value || []);
     return res.json({
       data: rows.map((row) => ({
         id: row.public_id,
         name: row.name,
+        // The public half of the key; the partner sends it with the secret.
+        clientId: row.client_id,
+        secretHint: row.secret_hint ? `••••${row.secret_hint}` : null,
         status: row.status,
-        scopes: typeof row.scopes === "string" ? JSON.parse(row.scopes || "[]") : row.scopes || [],
+        scopes: json(row.scopes),
+        allowedIps: json(row.allowed_ips),
         rateLimitPerMinute: row.rate_limit_per_minute,
         lastUsedAt: row.last_used_at,
         createdAt: row.created_at,
@@ -940,17 +947,112 @@ router.post(
   "/integrations/credentials",
   writeLimiter,
   requireAccountCapability("can_view_integrations"),
-  validate({ body: z.object({ name: z.string().trim().min(1).max(120), scopes: z.array(z.string().max(60)).max(30).optional() }) }),
+  validate({
+    body: z.object({
+      name: z.string().trim().min(1).max(120),
+      scopes: z.array(z.enum(API_SCOPES)).min(1, "Choose at least one scope.").max(API_SCOPES.length).optional(),
+      allowedIps: z.array(z.string().trim().max(64)).max(20).optional(),
+    }),
+  }),
   asyncHandler(async (req, res) => {
     const organizationId = requireOrganizationId(req);
     const created = await organizationService.createApiClient({
       organizationId,
       name: req.body.name,
-      scopes: req.body.scopes || ["listings:read"],
+      scopes: [...new Set(req.body.scopes || ["listings:read"])],
+      allowedIps: req.body.allowedIps || [],
       userId: req.auth.user.id,
     });
-    await auditFromRequest(req, { action: "api_client.created", subjectType: "api_client", subjectId: created.id });
+    await auditFromRequest(req, {
+      action: "api_client.created",
+      subjectType: "api_client",
+      subjectId: created.id,
+      metadata: { scopes: created.scopes, allowedIps: created.allowedIps },
+    });
     return res.status(201).json(detailResponse(created));
+  })
+);
+
+router.patch(
+  "/integrations/credentials/:id",
+  writeLimiter,
+  requireAccountCapability("can_view_integrations"),
+  validate({
+    body: z
+      .object({
+        name: z.string().trim().min(1).max(120).optional(),
+        allowedIps: z.array(z.string().trim().max(64)).max(20).optional(),
+      })
+      .refine((body) => body.name !== undefined || body.allowedIps !== undefined, { message: "Nothing to change." }),
+  }),
+  asyncHandler(async (req, res) => {
+    const organizationId = requireOrganizationId(req);
+    await organizationService.updateApiClient({ organizationId, publicId: req.params.id, ...req.body });
+    await auditFromRequest(req, { action: "api_client.updated", subjectType: "api_client", metadata: { id: req.params.id }, changes: req.body });
+    return res.json(detailResponse({ updated: true }));
+  })
+);
+
+/* Listing imports pushed through this company's API keys, with the result for every listing. */
+
+const importListQuery = z.object({
+  page: z.coerce.number().int().min(1).max(10_000).optional(),
+  pageSize: z.coerce.number().int().min(1).max(100).optional(),
+  status: z.enum(["queued", "running", "completed", "partial", "failed"]).optional(),
+  type: z.enum(["single", "bulk"]).optional(),
+});
+
+router.get(
+  "/integrations/imports",
+  requireAccountCapability("can_view_integrations"),
+  validate({ query: importListQuery }),
+  asyncHandler(async (req, res) => {
+    const organizationId = requireOrganizationId(req);
+    const { page = 1, pageSize = 20, status, type } = q(req);
+    const result = await importsRepo.listImports({ organizationId, status, type, page, pageSize });
+    return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
+  })
+);
+
+async function ownImport(req) {
+  const row = await importsRepo.getImportRow(req.params.importId, { organizationId: requireOrganizationId(req) });
+  if (!row) throw AppError.notFound("That import was not found.");
+  return row;
+}
+
+router.get(
+  "/integrations/imports/:importId",
+  requireAccountCapability("can_view_integrations"),
+  asyncHandler(async (req, res) => res.json(detailResponse(importsRepo.serializeImport(await ownImport(req)))))
+);
+
+router.get(
+  "/integrations/imports/:importId/items",
+  requireAccountCapability("can_view_integrations"),
+  validate({
+    query: z.object({
+      page: z.coerce.number().int().min(1).max(10_000).optional(),
+      pageSize: z.coerce.number().int().min(1).max(100).optional(),
+      status: z.enum(["failed", "warning", "succeeded", "queued"]).optional(),
+      search: z.string().trim().max(191).optional(),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const row = await ownImport(req);
+    const { page = 1, pageSize = 50, status, search } = q(req);
+    const result = await importsRepo.listImportItems(row.id, { status, search, page, pageSize });
+    return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
+  })
+);
+
+/** Where one of this company's listings came from: portal, or which API key and server. */
+router.get(
+  "/listings/:id/source",
+  asyncHandler(async (req, res) => {
+    const listing = await assertListingAccess(req, req.params.id, "view");
+    const source = await importsRepo.listingSource(listing.public_id, { organizationId: listing.organization_id ?? null });
+    if (!source) throw AppError.notFound("That listing was not found.");
+    return res.json(detailResponse(source));
   })
 );
 

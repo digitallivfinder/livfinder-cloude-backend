@@ -60,6 +60,15 @@ const server = app.listen(env.PORT, async () => {
       logger.error({ err: error }, "billing maintenance could not be started");
     }
   }
+  // Bulk listing imports run in the background; this resumes any a restart interrupted.
+  if (env.NODE_ENV !== "test") {
+    try {
+      const { startImportRunner } = await import("./modules/imports/importRunner.js");
+      startImportRunner();
+    } catch (error) {
+      logger.error({ err: error }, "listing import runner could not be started");
+    }
+  }
 });
 
 async function shutdown(signal) {

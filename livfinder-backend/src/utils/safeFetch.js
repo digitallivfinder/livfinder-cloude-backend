@@ -73,7 +73,9 @@ function allowedHosts() {
     .filter(Boolean);
 }
 
-export async function assertSafeUrl(rawUrl) {
+// `useAllowList: false` is for URLs a partner supplies (listing image hosts): the configured list
+// names the OAuth endpoints, not every company's CDN. The private-address check still applies.
+export async function assertSafeUrl(rawUrl, { useAllowList = true } = {}) {
   let url;
   try {
     url = new URL(String(rawUrl));
@@ -85,7 +87,7 @@ export async function assertSafeUrl(rawUrl) {
     throw AppError.badRequest("Only https destinations are allowed.");
   }
 
-  const hosts = allowedHosts();
+  const hosts = useAllowList ? allowedHosts() : [];
   const host = url.hostname.toLowerCase();
   if (hosts.length && !hosts.some((entry) => host === entry || host.endsWith(`.${entry}`))) {
     throw AppError.forbidden("That destination is not permitted.");
@@ -112,9 +114,10 @@ export async function assertSafeUrl(rawUrl) {
  * Use this for every request to a URL that is not a compile-time constant.
  */
 export async function safeFetch(rawUrl, options = {}) {
-  const url = await assertSafeUrl(rawUrl);
+  const { useAllowList, timeoutMs, ...fetchOptions } = options;
+  const url = await assertSafeUrl(rawUrl, { useAllowList });
   return fetch(url, {
-    ...options,
+    ...fetchOptions,
     redirect: "error",
     signal: options.signal ?? AbortSignal.timeout(options.timeoutMs ?? 10_000),
   });

@@ -20,6 +20,8 @@ import adminRouter from "./modules/admin/admin.routes.js";
 import devBoardRouter from "./modules/devBoard/devBoard.routes.js";
 import engagementRouter from "./modules/engagement/engagement.routes.js";
 import webhooksRouter from "./modules/system/webhooks.routes.js";
+import partnerRouter from "./modules/partner/partner.routes.js";
+import importsAdminRouter from "./modules/imports/imports.admin.routes.js";
 import { legacyMediaRewrite } from "./middleware/legacyMedia.js";
 
 export function createApp() {
@@ -74,6 +76,10 @@ export function createApp() {
   // (see webhooks.routes.js), which express.json() below would have already consumed.
   app.use("/v1/webhooks", webhooksRouter);
 
+  // API-key callers pushing listings. Ahead of the global parser for its larger body limit, and
+  // of the session/CSRF middleware a key-signed server call never uses. See partner.routes.js.
+  app.use("/v1/partner", partnerRouter);
+
   app.use(express.json({ limit: env.BODY_LIMIT }));
   app.use(express.urlencoded({ extended: false, limit: env.BODY_LIMIT }));
   app.use(cookieParser());
@@ -105,6 +111,8 @@ export function createApp() {
   // Self-contained, like projects — its own tree and its own API, not folded
   // into admin.routes.js.
   app.use("/v1/admin/dev-board", devBoardRouter);
+  // API imports and API keys across every company — its own router, like the dev board.
+  app.use("/v1/admin", importsAdminRouter);
   app.use("/v1", engagementRouter);
 
   app.use(notFoundHandler);

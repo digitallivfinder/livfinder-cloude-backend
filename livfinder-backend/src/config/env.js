@@ -43,6 +43,7 @@ const schema = z.object({
   DB_CONNECTION_LIMIT: int(15),
   DB_CONNECT_TIMEOUT_MS: int(10000),
 
+  
   FRONTEND_URL: z.string().default("http://localhost:3000"),
   LIVFINDER_ALLOWED_ORIGINS: csv,
   BODY_LIMIT: z.string().default("1mb"),

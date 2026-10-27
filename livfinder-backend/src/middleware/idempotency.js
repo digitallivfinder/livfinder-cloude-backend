@@ -34,11 +34,14 @@ function hashRequest(req) {
   return crypto.createHash("sha256").update(`${req.method}\n${req.originalUrl}\n${body}`).digest("hex");
 }
 
-export function idempotency({ scope = "api" } = {}) {
+// `scope` may be a function of the request, so keys can be partitioned per caller (an API key's
+// keys never collide with another company's).
+export function idempotency({ scope: scopeOption = "api" } = {}) {
   return async function idempotencyMiddleware(req, res, next) {
     const key = req.get("idempotency-key");
     if (!key || req.method === "GET" || req.method === "HEAD") return next();
     if (key.length > 200) return next(AppError.badRequest("Idempotency-Key is too long."));
+    const scope = String(typeof scopeOption === "function" ? scopeOption(req) : scopeOption).slice(0, 60);
 
     const requestHash = hashRequest(req);
     const endpoint = req.route?.path ? `${req.method} ${req.baseUrl}${req.route.path}` : `${req.method} ${req.path}`;
@@ -49,7 +52,11 @@ export function idempotency({ scope = "api" } = {}) {
         [key, scope]
       );
 
-      if (existing) {
+      // A failed attempt is not stored, so its key is free to retry with (see the header comment).
+      // Without this, a retry after any error answered "already being processed" for 24 hours.
+      if (existing?.status === "failed" && existing.request_hash === requestHash) {
+        await execute("DELETE FROM idempotency_keys WHERE id = ? AND status = 'failed'", [existing.id]);
+      } else if (existing) {
         if (existing.request_hash !== requestHash) {
           return next(
             AppError.validation("That Idempotency-Key was used for a different request.", {
@@ -78,7 +85,7 @@ export function idempotency({ scope = "api" } = {}) {
             key,
             scope,
             req.auth?.user?.id ?? null,
-            req.auth?.activeAccountId ?? null,
+            req.auth?.activeAccountId ?? req.apiClient?.accountId ?? null,
             endpoint.slice(0, 255),
             req.method,
             requestHash,
