@@ -36,6 +36,8 @@ const portal = client();
 const admin = client();
 const keyIds = [];
 const createdListingIds = new Set();
+// The add-on rows as they were before the run, so afterAll puts them back exactly.
+const addonBefore = new Map();
 
 const basic = (key) => `Basic ${Buffer.from(`${key.clientId}:${key.secret}`).toString("base64")}`;
 const as = (key) => ({
@@ -87,10 +89,22 @@ beforeAll(async () => {
        JOIN categories c ON c.id = aca.category_id AND COALESCE(c.root_category_id, c.id) = 1
       WHERE o.status = 'active' AND o.deleted_at IS NULL
         AND (a.listing_quota IS NULL OR a.listing_used + 10 < a.listing_quota)
+        AND (a.storage_quota IS NULL OR a.storage_used + 10 < a.storage_quota)
       GROUP BY o.id ORDER BY o.id LIMIT 2`
   );
   [company, otherCompany] = companies;
   if (!company || !otherCompany) throw new Error("need two active companies approved for Real Estate with free listing slots");
+
+  // The listing API is part of the Integrations add-on (0059).
+  for (const accountId of [company.account_id, otherCompany.account_id]) {
+    addonBefore.set(accountId, await queryOne("SELECT * FROM account_addons WHERE account_id = ? AND addon_code = 'integrations'", [accountId]));
+    await execute(
+      `INSERT INTO account_addons (public_id, account_id, addon_code, status, started_at)
+       VALUES (?, ?, 'integrations', 'active', NOW(3))
+       ON DUPLICATE KEY UPDATE status = 'active', ends_at = NULL, cancelled_at = NULL`,
+      [`01QAADDON${suffix}${accountId}`.slice(0, 26).padEnd(26, "0"), accountId]
+    );
+  }
 
   unapprovedCategory = await queryOne(
     `SELECT c.code FROM categories c
@@ -157,6 +171,17 @@ afterAll(async () => {
     await cleanupUsers([member.email]);
   }
   if (staff) await cleanupUsers([staff.email]);
+  // The unknown values this run sends on purpose join the admin's mapping queue (Phase 5).
+  await execute("DELETE FROM feed_value_mappings WHERE connection_id IS NULL AND external_value IN ('spaceship', 'atlantis-under-the-sea')");
+  for (const [accountId, before] of addonBefore) {
+    if (!before) {
+      await execute("DELETE FROM account_addons WHERE account_id = ? AND addon_code = 'integrations'", [accountId]);
+    } else {
+      await execute("UPDATE account_addons SET status = ?, ends_at = ?, cancelled_at = ? WHERE id = ?", [
+        before.status, before.ends_at, before.cancelled_at, before.id,
+      ]);
+    }
+  }
   await closePool();
 });
 
@@ -187,6 +212,28 @@ describe("authentication and authorization", () => {
     expect(response.body.error.code).toBe("SCOPE_MISSING");
   });
 
+  it("stops every key while the company's Integrations add-on is off", async () => {
+    await execute("UPDATE account_addons SET status = 'cancelled' WHERE account_id = ? AND addon_code = 'integrations'", [company.account_id]);
+    try {
+      const response = await as(writeKey).get("/v1/partner/me");
+      expect(response.status).toBe(403);
+      expect(response.body.error.code).toBe("ADDON_INACTIVE");
+    } finally {
+      await execute("UPDATE account_addons SET status = 'active' WHERE account_id = ? AND addon_code = 'integrations'", [company.account_id]);
+    }
+  });
+
+  it("reads the company's lead feed with a leads:read key, and refuses a key without it", async () => {
+    const leadsKey = await makeKey(company.organization_id, ["leads:read"]);
+    const response = await as(leadsKey).get("/v1/partner/leads?limit=5");
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toMatchObject({ version: 1, hasMore: expect.any(Boolean) });
+    expect(Array.isArray(response.body.data)).toBe(true);
+    const xml = await as(leadsKey).get("/v1/partner/leads?limit=2&format=xml");
+    expect(xml.text).toContain("<livfinder-leads");
+    expect((await as(writeKey).get("/v1/partner/leads")).status).toBe(403);
+  });
+
   it("tells a key which company it belongs to", async () => {
     const response = await as(writeKey).get("/v1/partner/me");
     expect(response.status).toBe(200);
@@ -205,12 +252,12 @@ describe("single push", () => {
   const id = ext("single");
   let listingPublicId = null;
 
-  it("creates the listing in the key's company, waiting for review, with its source recorded", async () => {
+  it("creates the listing in the key's company, unpublished until the company submits it, with its source recorded", async () => {
     const response = await as(writeKey).put(`/v1/partner/listings/${id}`, listing(id));
     expect(response.status).toBe(201);
     expect(response.headers["x-import-id"]).toBeTruthy();
     expect(response.body.data.operation).toBe("create");
-    expect(response.body.data.status).toBe("pending_review");
+    expect(response.body.data.status).toBe("draft");
     listingPublicId = response.body.data.listingId;
 
     const row = await queryOne(
@@ -222,6 +269,16 @@ describe("single push", () => {
     expect(row.source).toBe("api");
     expect(row.source_reference).toBe(id);
     expect(row.source_api_client_id).toBe(writeKey.rowId);
+    expect(row.moderation_status).toBe("not_submitted");
+  });
+
+  it("submits a pushed listing for review when the push asks for it", async () => {
+    const submitted = ext("submitted");
+    const response = await as(writeKey).put(`/v1/partner/listings/${submitted}`, listing(submitted, { status: "pending_review" }));
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    expect(response.body.data.status).toBe("pending_review");
+    const row = await queryOne("SELECT id, moderation_status FROM listings WHERE public_id = ?", [response.body.data.listingId]);
+    createdListingIds.add(row.id);
     expect(row.moderation_status).toBe("pending");
   });
 
@@ -232,14 +289,19 @@ describe("single push", () => {
     expect(response.body.data.listingId).toBe(listingPublicId);
   });
 
-  it("updates in place, and sends a live listing back to review", async () => {
+  it("updates in place; on a live listing the change waits for approval while it stays live", async () => {
     await execute("UPDATE listings SET status = 'active', moderation_status = 'approved' WHERE public_id = ?", [listingPublicId]);
     const response = await as(writeKey).put(`/v1/partner/listings/${id}`, listing(id, { price: 2600000 }));
     expect(response.status).toBe(200);
     expect(response.body.data.operation).toBe("update");
-    expect(response.body.data.status).toBe("pending_review");
-    const row = await queryOne("SELECT price FROM listings WHERE public_id = ?", [listingPublicId]);
+    expect(response.body.data.status).toBe("active");
+    const row = await queryOne(
+      `SELECT l.price, r.status AS revision FROM listings l LEFT JOIN listing_revisions r ON r.id = l.pending_revision_id
+        WHERE l.public_id = ?`,
+      [listingPublicId]
+    );
     expect(Number(row.price)).toBe(2600000);
+    expect(row.revision).toBe("pending");
   });
 
   it("reports an image it could not fetch as a warning, not a failure", async () => {

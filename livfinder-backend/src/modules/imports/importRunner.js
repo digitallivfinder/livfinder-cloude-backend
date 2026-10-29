@@ -4,6 +4,8 @@ import { execute, query, queryOne } from "../../db/query.js";
 import { AppError } from "../../utils/errors.js";
 import { notifyAccount } from "../system/notifications.service.js";
 import { importProviderId } from "./importConnection.js";
+import { feedClientFor } from "../feeds/feedSources.repository.js";
+import { assertAddonActive } from "../accounts/addons.service.js";
 import * as repo from "./imports.repository.js";
 import { importListing, parseListingRecord, withdrawImportedListing } from "./listingImport.service.js";
 
@@ -139,13 +141,15 @@ export async function processImport(importId) {
   if (!claim.affectedRows) return null;
 
   const run = await queryOne(
-    `SELECT id, public_id, connection_id, provider_id, api_client_id, organization_id, account_id,
+    `SELECT id, public_id, connection_id, provider_id, api_client_id, feed_source_id, organization_id, account_id,
             INET6_NTOA(source_ip) AS source_ip
        FROM feed_imports WHERE id = ?`,
     [importId]
   );
   const ctx = { providerId: Number(run.provider_id), connectionId: Number(run.connection_id) };
-  const client = run.api_client_id ? await clientForRun(run) : null;
+  // A feed run (0063) imports as its feed; everything else as the API key that pushed it.
+  const client = run.feed_source_id ? await feedClientFor(run.feed_source_id) : run.api_client_id ? await clientForRun(run) : null;
+  const source = run.feed_source_id ? "feed" : "api";
   const items = await query(
     "SELECT id, raw_payload FROM feed_import_items WHERE import_id = ? AND status = 'queued' ORDER BY source_row ASC, id ASC",
     [importId]
@@ -155,14 +159,15 @@ export async function processImport(importId) {
     try {
       // A key revoked, or a company suspended, after the batch was accepted stops the rest of it.
       if (!client || client.status !== "active" || client.organizationStatus !== "active") {
-        throw new AppError("The API key or company was disabled before this listing was processed.", {
+        throw new AppError(`The ${source === "feed" ? "feed" : "API key"} or account was disabled before this listing was processed.`, {
           status: 401,
           code: "API_KEY_INVALID",
         });
       }
+      await assertAddonActive(client.accountId, "integrations");
       const raw = typeof item.raw_payload === "string" ? JSON.parse(item.raw_payload) : item.raw_payload;
       const record = parseListingRecord(raw);
-      const outcome = await importListing({ client, ctx, record, source: "api", importId: run.public_id, ip: run.source_ip });
+      const outcome = await importListing({ client, ctx, record, source, importId: run.public_id, ip: run.source_ip });
       await repo.recordItemSuccess(item.id, importId, outcome);
     } catch (error) {
       if (!(error instanceof AppError) || error.status >= 500) {

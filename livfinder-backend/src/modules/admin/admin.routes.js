@@ -7,6 +7,9 @@ import { requireAuth, requireAdmin, requirePermission, requireCategoryScope, req
 import { assertRootCategoryScope, scopedRootCategoryIds, scopeListingParam, scopeDevelopmentParam } from "./admin.shared.js";
 import { detailResponse, listResponse } from "../../utils/http.js";
 import { AppError } from "../../utils/errors.js";
+import { queryOne } from "../../db/query.js";
+import { revisionForReview } from "../listings/listingRevisions.service.js";
+import { projectRevisionForReview } from "../projects/projectRevisions.service.js";
 import { auditFromRequest } from "../system/audit.service.js";
 import * as dashboard from "./admin.dashboard.js";
 import * as catalog from "./admin.catalog.js";
@@ -143,8 +146,55 @@ router.get(
         rejectionReason: result.raw.moderation_status === "rejected" ? result.raw.rejection_reason || null : null,
         engagement,
         mediaItems: media,
+        // An owner's changes to this live listing waiting for approval, with the comparison
+        // against the approved version the site still shows (0060).
+        pendingChanges: await revisionForReview(result.raw.id),
       })
     );
+  })
+);
+
+/**
+ * One decision on many listings (Phase 7): a company's first feed can bring in hundreds at once.
+ * Each listing is decided on its own, held to the caller's category scope, and reported back; one
+ * that cannot be decided never stops the rest.
+ */
+router.post(
+  "/listings/moderation/bulk",
+  writeLimiter,
+  requirePermission("listings.moderate"),
+  validate({
+    body: z.object({
+      ids: z.array(z.string().trim().min(1).max(64)).min(1, "Choose at least one listing.").max(200, "Decide at most 200 at once."),
+      decision: z.enum(["approve", "reject", "approve_changes", "reject_changes"]),
+      reason: z.string().trim().max(500).optional(),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const { ids, decision, reason } = req.body;
+    if (decision.startsWith("reject") && !reason) {
+      throw AppError.validation("Some information is invalid.", { reason: "Tell the owners why." });
+    }
+    const results = [];
+    for (const id of [...new Set(ids)]) {
+      try {
+        const row = await queryOne("SELECT root_category_id FROM listings WHERE (public_id = ? OR reference = ?) AND deleted_at IS NULL LIMIT 1", [id, id]);
+        if (!row) throw AppError.notFound("That listing was not found.");
+        assertRootCategoryScope(req, row.root_category_id);
+        const result = await mutations.moderateListing({ identifier: id, decision, reason, userId: req.auth.user.id });
+        results.push({ id, ok: true, status: result.status, changes: result.changes ?? null });
+      } catch (error) {
+        results.push({ id, ok: false, error: error?.expose === false ? "Something went wrong on our side." : error?.message || "Not decided." });
+      }
+    }
+    const done = results.filter((result) => result.ok).length;
+    await auditFromRequest(req, {
+      action: `listing.bulk_${decision}`,
+      subjectType: "listing",
+      subjectLabel: `${done} of ${results.length}`,
+      metadata: { ids, reason: reason ?? null, failed: results.filter((result) => !result.ok).map((result) => result.id) },
+    });
+    return res.json(detailResponse({ decided: done, failed: results.length - done, results }));
   })
 );
 
@@ -262,6 +312,21 @@ router.get(
   asyncHandler(async (req, res) => {
     const result = await catalog.getAdminDevelopment(req.params.id);
     if (!result) throw AppError.notFound("That development was not found.");
+    // A developer's changes waiting for approval, compared with the approved version (0061).
+    const project = await queryOne("SELECT id FROM projects WHERE public_id = ? OR slug = ?", [req.params.id, req.params.id]);
+    return res.json(detailResponse({ ...result, pendingChanges: project ? await projectRevisionForReview(project.id) : null }));
+  })
+);
+
+router.patch(
+  "/developments/:id/changes",
+  writeLimiter,
+  requirePermission("developments.edit"),
+  scopeDevelopmentParam(),
+  validate({ body: mutations.developmentChangesSchema }),
+  asyncHandler(async (req, res) => {
+    const result = await mutations.decideDevelopmentChanges({ identifier: req.params.id, ...req.body, userId: req.auth.user.id });
+    await auditFromRequest(req, { action: `development.changes_${req.body.decision}d`, subjectType: "project", subjectLabel: req.params.id, changes: req.body });
     return res.json(detailResponse(result));
   })
 );
@@ -417,14 +482,33 @@ router.patch(
   })
 );
 
+router.get(
+  "/companies/:id/addons",
+  requirePermission("companies.view", "finance.plans"),
+  asyncHandler(async (req, res) => res.json({ data: await mutations.listAccountAddonsFor(req.params.id) }))
+);
+
+/** Grant or stop an add-on for one account, whatever its plan offers. */
+router.put(
+  "/companies/:id/addons/:code",
+  writeLimiter,
+  requirePermission("companies.edit", "finance.plans"),
+  validate({ body: mutations.accountAddonSchema }),
+  asyncHandler(async (req, res) => {
+    const result = await mutations.setAccountAddon({ identifier: req.params.id, code: req.params.code, payload: req.body, userId: req.auth.user.id });
+    await auditFromRequest(req, { action: req.body.enabled ? "account.addon_enabled" : "account.addon_disabled", subjectType: "account", subjectLabel: req.params.id, changes: req.body, metadata: { addon: req.params.code } });
+    return res.json({ data: result });
+  })
+);
+
 router.patch(
   "/individuals/:id",
   writeLimiter,
   requirePermission("individuals.edit"),
-  validate({ body: mutations.organizationProfileSchema }),
+  validate({ body: mutations.individualProfileSchema }),
   asyncHandler(async (req, res) => {
-    const result = await mutations.updateOrganizationProfile({ identifier: req.params.id, payload: req.body });
-    await auditFromRequest(req, { action: "individual.updated", subjectType: "organization", subjectLabel: req.params.id, changes: req.body });
+    const result = await mutations.updateIndividualProfile({ identifier: req.params.id, payload: req.body });
+    await auditFromRequest(req, { action: "individual.updated", subjectType: "user", subjectLabel: req.params.id, changes: req.body });
     return res.json(detailResponse(result));
   })
 );

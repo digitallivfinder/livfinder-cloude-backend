@@ -149,6 +149,12 @@ is_post_seed_migration() {
     # 0058 adds a provider row after the seeded providers, so their ids do not move.
     0058_listing_import_api.sql)
       return 0 ;;
+    # 0059 recomputes listing usage from the seeded listings and backfills the seeded plans.
+    0059_listing_limits_and_addons.sql)
+      return 0 ;;
+    # 0065 grants the seeded individual owners the integrations capability.
+    0065_individual_integrations.sql)
+      return 0 ;;
     *)
       return 1 ;;
   esac

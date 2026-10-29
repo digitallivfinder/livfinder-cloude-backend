@@ -4,11 +4,11 @@ import { validate, q } from "../../middleware/validation.js";
 import { AppError } from "../../utils/errors.js";
 import { listResponse, detailResponse, paginationFrom, toBool } from "../../utils/http.js";
 import * as projectsRepo from "./projects.repository.js";
-import * as searchRepo from "../search/search.repository.js";
 import * as locationsRepo from "../locations/locations.repository.js";
 import { projectSearchQuery, projectFacetQuery, developerQuery } from "./projects.schemas.js";
-import { serializeProjectCard, serializeProjectDetail, serializeDeveloper } from "../../serializers/project.js";
+import { serializeProjectCard, serializeDeveloper } from "../../serializers/project.js";
 import { FACET_COLUMNS } from "./projects.filters.js";
+import { frozenProjectDetail, projectPublicDetail } from "./projectRevisions.service.js";
 
 /**
  * The public Projects marketplace API.
@@ -169,14 +169,10 @@ router.get(
  * ------------------------------------------------------------------------ */
 
 async function detailFor(row, { includeGatedDocuments = false } = {}) {
-  const children = await projectsRepo.getProjectChildren(row.project_id, { includeGatedDocuments });
-  const [listings, related] = await Promise.all([
-    // The project's own inventory, through the listing search so publication,
-    // moderation and expiry are applied by the one place that owns those rules.
-    searchRepo.searchListings({ category: "real-estate", projectId: row.project_id }, { limit: 12 }),
-    projectsRepo.getRelatedProjects(row, { limit: 6 }),
-  ]);
-  return serializeProjectDetail({ row, ...children, listings: listings.rows, related });
+  const detail = await projectPublicDetail(row, { includeGatedDocuments });
+  // Changes waiting for approval: the public page stays the approved version (0061).
+  const pending = await projectsRepo.pendingRevisionOf(row.project_id);
+  return pending ? frozenProjectDetail(row.project_id, detail, { includeGatedDocuments }) : detail;
 }
 
 /**

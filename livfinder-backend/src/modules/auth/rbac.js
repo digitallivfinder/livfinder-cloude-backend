@@ -112,7 +112,9 @@ export async function loadAccountMemberships(userId) {
             a.slug  AS account_slug,
             a.public_id AS account_public_id,
             a.listing_quota,
-            a.listing_used
+            a.listing_used,
+            a.storage_quota,
+            a.storage_used
        FROM v_account_permissions vp
        JOIN accounts a ON a.id = vp.account_id
       WHERE vp.user_id = ?

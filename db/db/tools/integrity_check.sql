@@ -293,10 +293,11 @@ SELECT 'publicly visible agent whose organisation is not' AS check_name, COUNT(*
    AND (o.deleted_at IS NOT NULL OR o.status <> 'active' OR o.is_publicly_visible = 0)
    AND a.id IN (SELECT id FROM v_public_agents);
 
-SELECT 'sitemap entry for a non-public listing' AS check_name, COUNT(*) AS failures
+-- Sold, rented and withdrawn pages still work and stay in the sitemap (0062).
+SELECT 'sitemap entry for a listing whose page is gone' AS check_name, COUNT(*) AS failures
   FROM sitemap_entries s
  WHERE s.entity_type = 'listing'
-   AND s.entity_id NOT IN (SELECT id FROM v_public_listings);
+   AND s.entity_id NOT IN (SELECT id FROM v_reachable_listings);
 
 SELECT 'exactly one base currency' AS check_name,
        ABS((SELECT COUNT(*) FROM currencies WHERE is_base = 1) - 1) AS failures;
@@ -631,10 +632,16 @@ SELECT 'development owned by an account without approved developments access' AS
 -- `syncAccountListingUsage`, 0052); a mismatch means a write bypassed the service.
 -- The old counter was only ever incremented and 47 accounts had drifted, one to
 -- 500/500 while owning 26 listings.
+-- Since 0059 there are two figures: live (live + waiting for approval) and stored
+-- (everything but archived).
 SELECT 'account listing usage disagrees with its listings' AS check_name, COUNT(*) AS failures
   FROM accounts a
  WHERE a.listing_used <> (
          SELECT COUNT(*) FROM listings l
           WHERE l.account_id = a.id AND l.deleted_at IS NULL
-            AND l.status IN ('draft', 'pending_review', 'active', 'rejected')
+            AND l.status IN ('pending_review', 'active')
+       )
+    OR a.storage_used <> (
+         SELECT COUNT(*) FROM listings l
+          WHERE l.account_id = a.id AND l.deleted_at IS NULL AND l.status <> 'archived'
        );

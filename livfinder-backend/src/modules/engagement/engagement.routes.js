@@ -18,6 +18,7 @@ import { sendMail } from "../system/mail.service.js";
 import net from "node:net";
 import { notifyNewBooking, notifyNewInquiry, notifyNewOffer } from "../system/notifications.service.js";
 import { idempotency } from "../../middleware/idempotency.js";
+import { emitLeadEvent, emitLeadEventByPublicId } from "../leads/webhooks.service.js";
 
 /**
  * Buyer-side actions available to any signed-in user: favourites, saved
@@ -37,7 +38,7 @@ async function resolvePublicListing(identifier) {
   const listing = await queryOne(
     `SELECT l.id, l.public_id, l.reference, l.title, l.account_id, l.organization_id, l.agent_id,
             l.category_id, l.root_category_id, l.location_id, l.country_id, l.currency_code, l.contact_email
-       FROM v_public_listings l
+       FROM v_reachable_listings l
       WHERE l.public_id = ? OR l.reference = ? OR l.canonical_path = ?
       LIMIT 1`,
     [String(identifier), String(identifier), String(identifier)]
@@ -601,6 +602,8 @@ router.post(
       });
     }
 
+    // The company's own systems hear about it (webhook, Phase 6); never holds up the visitor.
+    await emitLeadEvent("inquiry", inquiryId, "lead.created");
     await auditFromRequest(req, {
       action: "inquiry.created",
       subjectType: listing ? "listing" : "project",
@@ -729,6 +732,7 @@ router.post(
       listing,
       booking: { id: null, reference, scheduledStart: req.body.scheduledStart },
     });
+    await emitLeadEventByPublicId("booking", publicId, "lead.created");
     return res.status(201).json(detailResponse({ id: publicId, reference, status: "requested" }));
   })
 );
@@ -814,6 +818,7 @@ router.post(
       listing,
       offer: { id: null, reference, amount: req.body.amount, currency },
     });
+    await emitLeadEventByPublicId("offer", publicId, "lead.created");
     return res.status(201).json(detailResponse({ id: publicId, reference, status: "submitted" }));
   })
 );
@@ -839,7 +844,7 @@ router.post(
   validate({ body: z.object({ visitorId: z.string().max(64).optional() }).partial() }),
   asyncHandler(async (req, res) => {
     const listing = await queryOne(
-      `SELECT id, category_id, organization_id, agent_id FROM v_public_listings
+      `SELECT id, category_id, organization_id, agent_id FROM v_reachable_listings
         WHERE public_id = ? OR canonical_path = ? LIMIT 1`,
       [req.params.id, req.params.id]
     );

@@ -83,6 +83,31 @@ export async function notify(
   }
 }
 
+/**
+ * Fan a notification out to LivFinder staff holding `permissionCode` (e.g. a feed run held for an
+ * admin to release, 0063). Super administrators always hold every permission.
+ */
+export async function notifyStaff(permissionCode, payload, connection) {
+  try {
+    const rows = await query(
+      `SELECT DISTINCT ur.user_id
+         FROM user_roles ur
+         JOIN roles r ON r.id = ur.role_id
+         JOIN users u ON u.id = ur.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+        WHERE r.code = 'super_admin'
+           OR EXISTS (SELECT 1 FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id
+                       WHERE rp.role_id = ur.role_id AND p.code = ?)`,
+      [permissionCode],
+      connection
+    );
+    for (const row of rows) await notify({ ...payload, userId: row.user_id }, connection);
+    return rows.length;
+  } catch (error) {
+    logger.warn({ err: error, type: payload?.type }, "staff notification fan-out failed");
+    return 0;
+  }
+}
+
 /** Fan a notification out to every member of an account. */
 export async function notifyAccount(scope, payload, connection) {
   try {

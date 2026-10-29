@@ -10,6 +10,7 @@ import { execute } from "../../db/query.js";
 import { auditFromRequest } from "../system/audit.service.js";
 import { normalizeAllowedIps } from "../portal/organization.service.js";
 import * as repo from "./imports.repository.js";
+import { discardHeldRun, releaseHeldRun } from "../feeds/feedRunner.js";
 
 /**
  * Admin view of the listing API: every company's imports with their per-listing results, every
@@ -46,6 +47,33 @@ router.get(
       pageSize,
     });
     return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
+  })
+);
+
+/** A feed run held because too many listings left the file at once (0063): withdraw them, or keep them. */
+router.post(
+  "/listing-imports/:importId/release",
+  writeLimiter,
+  requireAuth,
+  requireAdmin,
+  requirePermission("listings.moderate"),
+  asyncHandler(async (req, res) => {
+    const result = await releaseHeldRun(req.params.importId);
+    await auditFromRequest(req, { action: "feed_import.released", subjectType: "feed_import", subjectLabel: req.params.importId, metadata: result });
+    return res.json(detailResponse(result));
+  })
+);
+
+router.post(
+  "/listing-imports/:importId/discard",
+  writeLimiter,
+  requireAuth,
+  requireAdmin,
+  requirePermission("listings.moderate"),
+  asyncHandler(async (req, res) => {
+    const result = await discardHeldRun(req.params.importId);
+    await auditFromRequest(req, { action: "feed_import.kept", subjectType: "feed_import", subjectLabel: req.params.importId, metadata: result });
+    return res.json(detailResponse(result));
   })
 );
 

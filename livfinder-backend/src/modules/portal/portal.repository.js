@@ -108,6 +108,9 @@ export function serializePortalListing(row) {
     rawStatus: row.status,
     statusLabel: STATUS_LABELS[row.status] || row.status,
     moderationStatus: row.moderation_status,
+    // "pending" while the owner's changes to this live listing wait for approval, "rejected" when
+    // they were sent back; the site shows the approved version meanwhile (0060).
+    pendingChanges: row.pending_changes ?? null,
     amount,
     currency,
     price: { amount, currency, formatted: formatMoney({ amount, currency }) },
@@ -173,6 +176,7 @@ const PORTAL_LISTING_COLUMNS = `
   l.root_category_id, l.category_id, l.price, l.currency_code, l.cover_image_url, l.cover_image_alt,
   l.image_count, l.view_count, l.inquiry_count, l.favourite_count,
   l.created_at, l.updated_at, l.published_at, l.expires_at,
+  (SELECT r.status FROM listing_revisions r WHERE r.id = l.pending_revision_id) AS pending_changes,
   cat.name AS category_name,
   ct.name AS city_name, co.name AS country_name, cm.name AS community_name, sc.name AS sub_community_name,
   ag.display_name AS agent_name, ag.public_id AS agent_public_id,
@@ -339,7 +343,7 @@ export async function accountDashboard({ accountId, organizationId }) {
               l.title AS listing_title, l.cover_image_url
          FROM inquiries i
          LEFT JOIN listings l ON l.id = i.listing_id
-        WHERE (i.account_id = ? OR i.organization_id <=> ?) AND i.deleted_at IS NULL AND i.is_spam = 0
+        WHERE (i.account_id = ? OR i.organization_id = ?) AND i.deleted_at IS NULL AND i.is_spam = 0
         ORDER BY i.created_at DESC LIMIT 4`,
       [accountId, organizationId ?? null]
     ),

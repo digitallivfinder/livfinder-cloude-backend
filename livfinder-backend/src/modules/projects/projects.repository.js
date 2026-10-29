@@ -433,6 +433,12 @@ export async function resolveProjectCanonicalPath({ path, slug, publicId } = {})
 /* Detail                                                                      */
 /* -------------------------------------------------------------------------- */
 
+/** The development's open revision id, if a developer's changes wait for approval (0061). */
+export async function pendingRevisionOf(projectId) {
+  const row = await queryOne("SELECT pending_revision_id FROM projects WHERE id = ?", [projectId]);
+  return row?.pending_revision_id ?? null;
+}
+
 export async function getProjectChildren(projectId, { includeGatedDocuments = false } = {}) {
   const [record, unitTypes, paymentPlans, milestones, amenities, media, documents, floorPlans, tours, buildings] =
     await Promise.all([

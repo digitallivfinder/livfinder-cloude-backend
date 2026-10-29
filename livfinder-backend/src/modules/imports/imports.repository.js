@@ -9,7 +9,7 @@ import { publicListingUrl } from "./listingImport.service.js";
  * the admin screen; every read here is limited to the `livfinder_import` provider.
  */
 
-const IMPORT_TYPE_LABEL = { single: "single", api_push: "bulk" };
+const IMPORT_TYPE_LABEL = { single: "single", api_push: "bulk", full: "feed" };
 
 function parseJson(value, fallback) {
   if (value === null || value === undefined) return fallback;
@@ -25,13 +25,14 @@ function parseJson(value, fallback) {
 /* Writing                                                                     */
 /* -------------------------------------------------------------------------- */
 
-export async function createImportRun({ client, ctx, type, total, status, ip, userAgent }) {
+export async function createImportRun({ client, ctx, type, total, status, ip, userAgent, feed = null }) {
   const publicId = ulid();
   const result = await execute(
     `INSERT INTO feed_imports
-       (public_id, connection_id, provider_id, organization_id, account_id, api_client_id, source_ip,
-        source_user_agent, import_type, entity_type, deletion_mode, status, total_rows, started_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, INET6_ATON(?), ?, ?, 'listing', 'none', ?, ?, ?, NOW(3))`,
+       (public_id, connection_id, provider_id, organization_id, account_id, api_client_id, feed_source_id,
+        source_url, source_checksum, source_size_bytes, deletion_mode, max_deletion_percent, source_ip,
+        source_user_agent, import_type, entity_type, status, total_rows, started_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, INET6_ATON(?), ?, ?, ?, ?, ?, ?, NOW(3))`,
     [
       publicId,
       ctx.connectionId,
@@ -39,9 +40,17 @@ export async function createImportRun({ client, ctx, type, total, status, ip, us
       client.organizationId,
       client.accountId,
       client.id,
+      // A feed run (0063): which feed, which file, and that listings gone from it are withdrawn.
+      feed?.id ?? null,
+      feed?.url ? String(feed.url).slice(0, 500) : null,
+      feed?.checksum ?? null,
+      feed?.sizeBytes ?? null,
+      feed ? "unpublish" : "none",
+      feed?.maxRemovalPercent ?? 20,
       ip || null,
       userAgent ? String(userAgent).slice(0, 300) : null,
       type,
+      feed?.entityType ?? "listing",
       status,
       total,
       status === "running" ? new Date() : null,
@@ -51,18 +60,19 @@ export async function createImportRun({ client, ctx, type, total, status, ip, us
 }
 
 /** `items`: `{ row, externalId, raw, error? }`. An item with `error` is stored as already failed. */
-export async function addImportItems(importId, items) {
+export async function addImportItems(importId, items, { entityType = "listing" } = {}) {
   const ids = [];
   for (const item of items) {
     const failed = Boolean(item.error);
     const result = await execute(
       `INSERT INTO feed_import_items
          (import_id, source_row, external_id, entity_type, operation, status, raw_payload, errors, error_message, processed_at)
-       VALUES (?, ?, ?, 'listing', ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         importId,
         item.row ?? null,
         item.externalId ? String(item.externalId).slice(0, 191) : null,
+        entityType,
         failed ? "fail" : "create",
         failed ? "failed" : "queued",
         JSON.stringify(item.raw ?? null),
@@ -163,12 +173,14 @@ const IMPORT_COLUMNS = `
   INET6_NTOA(fi.source_ip) AS source_ip, fi.source_user_agent,
   o.public_id AS organization_public_id, o.name AS organization_name,
   ac.public_id AS api_client_public_id, ac.name AS api_client_name, ac.client_id AS api_client_client_id,
-  ac.status AS api_client_status`;
+  ac.status AS api_client_status,
+  fi.hold_reason, fsrc.public_id AS feed_public_id, fsrc.category AS feed_category, fi.source_url AS feed_url`;
 
 const IMPORT_FROM = `
   FROM feed_imports fi
   LEFT JOIN organizations o ON o.id = fi.organization_id
-  LEFT JOIN api_clients ac ON ac.id = fi.api_client_id`;
+  LEFT JOIN api_clients ac ON ac.id = fi.api_client_id
+  LEFT JOIN feed_sources fsrc ON fsrc.id = fi.feed_source_id`;
 
 export function serializeImport(row) {
   return {
@@ -185,7 +197,10 @@ export function serializeImport(row) {
     },
     images: { downloaded: Number(row.media_downloaded) || 0, failed: Number(row.media_failed) || 0 },
     message: row.error_message,
+    // A feed run (0063) held because too many listings left the file at once says why.
+    holdReason: row.hold_reason ?? null,
     source: {
+      feed: row.feed_public_id ? { id: row.feed_public_id, category: row.feed_category, url: row.feed_url } : null,
       ip: row.source_ip,
       userAgent: row.source_user_agent,
       apiKey: row.api_client_public_id
@@ -200,13 +215,18 @@ export function serializeImport(row) {
   };
 }
 
-export async function listImports({ organizationId = null, organizationPublicId = null, apiClientPublicId = null, status = null, type = null, search = null, page = 1, pageSize = 20 } = {}) {
+export async function listImports({ organizationId = null, accountId = null, organizationPublicId = null, apiClientPublicId = null, status = null, type = null, search = null, page = 1, pageSize = 20 } = {}) {
   const providerId = await importProviderId();
   const conditions = ["fi.provider_id = ?"];
   const params = [providerId];
   if (organizationId) {
     conditions.push("fi.organization_id = ?");
     params.push(organizationId);
+  }
+  // An individual's runs (no organization) are theirs by account.
+  if (accountId) {
+    conditions.push("fi.account_id = ?");
+    params.push(accountId);
   }
   if (organizationPublicId) {
     conditions.push("o.public_id = ?");
@@ -238,13 +258,14 @@ export async function listImports({ organizationId = null, organizationPublicId 
 }
 
 /** `organizationId` limits the lookup to one company; omit it only for admins. */
-export async function getImportRow(publicId, { organizationId = null } = {}) {
+export async function getImportRow(publicId, { organizationId = null, accountId = null } = {}) {
   const providerId = await importProviderId();
+  const scope = organizationId ? "AND fi.organization_id = ?" : accountId ? "AND fi.account_id = ?" : "";
   return queryOne(
     `SELECT ${IMPORT_COLUMNS} ${IMPORT_FROM}
-      WHERE fi.public_id = ? AND fi.provider_id = ? ${organizationId ? "AND fi.organization_id = ?" : ""}
+      WHERE fi.public_id = ? AND fi.provider_id = ? ${scope}
       LIMIT 1`,
-    organizationId ? [publicId, providerId, organizationId] : [publicId, providerId]
+    [publicId, providerId, ...(organizationId ? [organizationId] : accountId ? [accountId] : [])]
   );
 }
 

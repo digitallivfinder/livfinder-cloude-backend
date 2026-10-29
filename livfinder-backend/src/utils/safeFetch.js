@@ -111,14 +111,16 @@ export async function assertSafeUrl(rawUrl, { useAllowList = true } = {}) {
 /**
  * `fetch`, with the checks above and no redirect following.
  *
- * Use this for every request to a URL that is not a compile-time constant.
+ * Use this for every request to a URL that is not a compile-time constant. `redirect: "manual"`
+ * hands a 3xx back to the caller, which must check the next address the same way before
+ * following it (the feed fetcher does); anything else refuses redirects.
  */
 export async function safeFetch(rawUrl, options = {}) {
-  const { useAllowList, timeoutMs, ...fetchOptions } = options;
+  const { useAllowList, timeoutMs, redirect, ...fetchOptions } = options;
   const url = await assertSafeUrl(rawUrl, { useAllowList });
   return fetch(url, {
     ...fetchOptions,
-    redirect: "error",
+    redirect: redirect === "manual" ? "manual" : "error",
     signal: options.signal ?? AbortSignal.timeout(options.timeoutMs ?? 10_000),
   });
 }

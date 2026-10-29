@@ -569,7 +569,7 @@ export async function assignPlanToAccount({ accountId, packageId, publicOnly = f
     // Partner (`is_public = 0`) — never offered as a "Choose Plan" card, so an
     // account should not be able to grant it to itself by calling the API
     // directly with a copied plan id. The admin path has no such restriction.
-    `SELECT p.id, p.public_id, p.name, p.listing_quota, p.featured_quota, p.billing_interval,
+    `SELECT p.id, p.public_id, p.name, p.listing_quota, p.storage_quota, p.featured_quota, p.billing_interval,
             pp.amount, pp.currency_code
        FROM plans p
        LEFT JOIN plan_prices pp ON pp.plan_id = p.id AND pp.currency_code = 'AED' AND pp.is_active = 1
@@ -614,8 +614,8 @@ export async function assignPlanToAccount({ accountId, packageId, publicOnly = f
     // literal 0 for Free ("no listing capability") — passed straight through, not
     // coalesced to 0, or "unlimited" would become a hard cap of zero.
     await execute(
-      "UPDATE accounts SET listing_quota = ?, featured_quota = ?, updated_at = NOW(3) WHERE id = ?",
-      [plan.listing_quota, plan.featured_quota ?? 0, accountId],
+      "UPDATE accounts SET listing_quota = ?, storage_quota = ?, featured_quota = ?, updated_at = NOW(3) WHERE id = ?",
+      [plan.listing_quota, plan.storage_quota, plan.featured_quota ?? 0, accountId],
       connection
     );
   });

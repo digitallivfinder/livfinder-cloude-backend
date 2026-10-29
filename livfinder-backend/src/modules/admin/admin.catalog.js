@@ -6,6 +6,7 @@ import { adminListingStatus, initialsOf } from "./admin.dashboard.js";
 import * as options from "./admin.options.js";
 import { CATEGORY_DEFINITIONS } from "../../utils/categories.js";
 import { AppError } from "../../utils/errors.js";
+import { planAddonsByPlan, serializePlanAddons } from "../accounts/addons.service.js";
 import {
   LAUNCH_STATUSES,
   OWNERSHIP_TYPES,
@@ -67,7 +68,10 @@ export async function listAdminListings({
     }
   }
   const statuses = ADMIN_STATUS_TO_DB[status];
-  if (statuses) {
+  if (status === "changes") {
+    // Live listings whose owner's changes wait for approval (0060).
+    conditions.push("l.pending_revision_id IS NOT NULL AND EXISTS (SELECT 1 FROM listing_revisions r WHERE r.id = l.pending_revision_id AND r.status = 'pending')");
+  } else if (statuses) {
     conditions.push(`l.status IN (${statuses.map(() => "?").join(", ")})`);
     params.push(...statuses);
   }
@@ -94,6 +98,7 @@ export async function listAdminListings({
     query(
       `SELECT l.id, l.public_id, l.reference, l.title, l.status, l.moderation_status, l.price,
               l.currency_code, l.created_at, l.published_at, l.updated_at,
+              (SELECT r.status FROM listing_revisions r WHERE r.id = l.pending_revision_id) AS pending_changes,
               -- Fall back to the first gallery image, then to any image file on the
               -- listing (a photo uploaded as a floor plan or document), so the admin
               -- table still shows a picture when no cover has been set.
@@ -303,7 +308,9 @@ async function listingSummaryFor(rootCategoryId) {
             SUM(status = 'rejected') AS rejected,
             SUM(status IN ('sold','rented')) AS sold,
             SUM(status IN ('archived','withdrawn')) AS archived,
-            SUM(status = 'draft') AS draft
+            SUM(status = 'draft') AS draft,
+            SUM(pending_revision_id IS NOT NULL
+                AND EXISTS (SELECT 1 FROM listing_revisions r WHERE r.id = pending_revision_id AND r.status = 'pending')) AS changes
        FROM listings
       WHERE deleted_at IS NULL${rootCategoryId ? " AND root_category_id = ?" : ""}`,
     rootCategoryId ? [rootCategoryId] : []
@@ -317,6 +324,7 @@ async function listingSummaryFor(rootCategoryId) {
     sold: int(row?.sold) ?? 0,
     archived: int(row?.archived) ?? 0,
     draft: int(row?.draft) ?? 0,
+    changes: int(row?.changes) ?? 0,
   };
 }
 
@@ -330,6 +338,8 @@ export function serializeAdminListingRow(row) {
     status: adminListingStatus(row.status),
     rawStatus: row.status,
     moderationStatus: row.moderation_status,
+    // "pending" / "rejected" while an owner's changes to this live listing are open (0060).
+    pendingChanges: row.pending_changes ?? null,
     price: row.price ? `${row.currency_code} ${Math.round(num(row.price)).toLocaleString("en")}` : "On request",
     priceValue: num(row.price),
     currency: row.currency_code,
@@ -1872,7 +1882,7 @@ export async function listAdminPackages() {
     // rendered as several duplicate cards with different prices. AED is the
     // platform's base currency (`currencies.is_base`) — pick that one row.
     `SELECT p.public_id, p.code, p.name, p.description, p.tier, p.billing_interval, p.trial_days,
-            p.listing_quota, p.featured_quota, p.agent_seat_quota, p.lead_quota, p.is_active, p.is_public,
+            p.listing_quota, p.storage_quota, p.featured_quota, p.agent_seat_quota, p.lead_quota, p.is_active, p.is_public,
             pp.amount, pp.currency_code
        FROM plans p
        LEFT JOIN plan_prices pp ON pp.plan_id = p.id AND pp.currency_code = 'AED' AND pp.is_active = 1
@@ -1889,6 +1899,7 @@ export async function listAdminPackages() {
     priceAnnual: num(row.amount),
     currency: row.currency_code || "AED",
     listingLimit: int(row.listing_quota),
+    storageLimit: int(row.storage_quota),
     featuredListingsAllowance: int(row.featured_quota),
     agentLimit: int(row.agent_seat_quota),
     inquiriesLimit: int(row.lead_quota),
@@ -1905,7 +1916,7 @@ export async function listAdminPackages() {
 
 const PLAN_CURRENCIES = ["AED", "USD", "EUR", "GBP"];
 
-function serializePlan(plan, prices) {
+function serializePlan(plan, prices, addons) {
   return {
     id: plan.public_id,
     code: plan.code,
@@ -1920,6 +1931,7 @@ function serializePlan(plan, prices) {
     // plan and migration 0057); 0 is a genuine, deliberate zero everywhere
     // else — neither is coalesced away here.
     listingQuota: int(plan.listing_quota),
+    storageQuota: int(plan.storage_quota),
     featuredQuota: int(plan.featured_quota) ?? 0,
     agentSeatQuota: int(plan.agent_seat_quota),
     leadQuota: int(plan.lead_quota) ?? 0,
@@ -1927,6 +1939,7 @@ function serializePlan(plan, prices) {
     isPublic: bool(plan.is_public),
     isDefault: bool(plan.is_default),
     sortOrder: int(plan.sort_order) ?? 0,
+    addons: serializePlanAddons(addons),
     prices: PLAN_CURRENCIES.map((currency) => {
       const row = prices.find((p) => p.currency_code === currency);
       return { currency, amount: row ? num(row.amount) : null, setupFee: row ? num(row.setup_fee) : 0 };
@@ -1945,14 +1958,16 @@ export async function listAdminPlans() {
     if (!pricesByPlan.has(row.plan_id)) pricesByPlan.set(row.plan_id, []);
     pricesByPlan.get(row.plan_id).push(row);
   }
-  return plans.map((plan) => serializePlan(plan, pricesByPlan.get(plan.id) || []));
+  const addons = await planAddonsByPlan(plans.map((plan) => plan.id));
+  return plans.map((plan) => serializePlan(plan, pricesByPlan.get(plan.id) || [], addons.get(Number(plan.id))));
 }
 
 export async function getAdminPlan(identifier) {
   const plan = await queryOne(`SELECT * FROM plans WHERE public_id = ? OR code = ?`, [identifier, identifier]);
   if (!plan) return null;
   const prices = await query(`SELECT plan_id, currency_code, amount, setup_fee FROM plan_prices WHERE plan_id = ? AND is_active = 1`, [plan.id]);
-  return serializePlan(plan, prices);
+  const addons = await planAddonsByPlan([plan.id]);
+  return serializePlan(plan, prices, addons.get(Number(plan.id)));
 }
 
 export async function listBusinessActivity({ organizationId = null, limit = 50 } = {}) {
@@ -2007,6 +2022,7 @@ export async function listOwnerListings({ ownerType, ownerId, page = 1, pageSize
     query(
       `SELECT l.id, l.public_id, l.reference, l.title, l.status, l.moderation_status, l.price,
               l.currency_code, l.created_at, l.published_at, l.updated_at,
+              (SELECT r.status FROM listing_revisions r WHERE r.id = l.pending_revision_id) AS pending_changes,
               COALESCE(
                 l.cover_image_url,
                 (SELECT lm.url FROM listing_media lm

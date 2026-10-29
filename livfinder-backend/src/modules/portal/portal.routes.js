@@ -5,6 +5,7 @@ import { validate, q } from "../../middleware/validation.js";
 import { writeLimiter } from "../../middleware/rateLimit.js";
 import { requireAuth, requireAccount, requireAccountCapability } from "../../middleware/auth.js";
 import { AppError } from "../../utils/errors.js";
+import { ownAgentClause } from "../../utils/tenantScope.js";
 import { listResponse, detailResponse } from "../../utils/http.js";
 import { auditFromRequest } from "../system/audit.service.js";
 import { requireAccountId, requireOrganizationId, assertListingAccess } from "./authorization.js";
@@ -24,6 +25,10 @@ import { developmentAttachments } from "../projects/developmentAttachments.servi
 import { withTransaction } from "../../db/transaction.js";
 import { ulid } from "../../utils/ids.js";
 import { assignPlanToAccount } from "../accounts/accounts.service.js";
+import * as addons from "../accounts/addons.service.js";
+import { openRevisionSummary } from "../listings/listingRevisions.service.js";
+import { emitLeadEvent } from "../leads/webhooks.service.js";
+import { beginDeveloperChange, openProjectRevisionSummary } from "../projects/projectRevisions.service.js";
 import { createInvoiceCheckout } from "../system/payments.service.js";
 import env from "../../config/env.js";
 import { API_SCOPES } from "../../middleware/apiClient.js";
@@ -121,6 +126,7 @@ router.get(
         media,
         gallery: media,
         summary: summary ? portalRepo.serializePortalListing(summary) : null,
+        pendingChanges: await openRevisionSummary(listing.id),
       })
     );
   })
@@ -134,14 +140,8 @@ router.post(
   asyncHandler(async (req, res) => {
     const { accountId, organizationId, userId, agentId } = scope(req);
 
-    // Quota is enforced server-side; the form's own count is advisory.
-    const account = await queryOne(
-      "SELECT listing_quota, listing_used FROM accounts WHERE id = ?",
-      [accountId]
-    );
-    if (account?.listing_quota !== null && Number(account.listing_used) >= Number(account.listing_quota)) {
-      throw AppError.conflict("This account has used its listing allowance. Upgrade the plan to add more.");
-    }
+    // The plan's storage and live limits are enforced by `createListing`; the form's own count
+    // is advisory.
 
     // Organizations may only list in a category they have been approved for.
     if (organizationId) {
@@ -178,18 +178,17 @@ router.patch(
   asyncHandler(async (req, res) => {
     const listing = await assertListingAccess(req, req.params.id, "edit");
     const { accountId, organizationId, userId } = scope(req);
+    const isOwner = !req.auth.platform.roles.length;
+    const edited = Object.keys(req.body).some((key) => key !== "status");
+    // A live listing the owner changes keeps its approved version on the site while the change
+    // waits for a moderator (captured before the edit is written); any other listing takes the
+    // edit form's "Save draft" / "Submit for review" choice. A platform user editing through the
+    // portal is not the owner and changes no status here.
+    if (isOwner && edited) await listingsService.holdOwnerChange({ listingId: listing.id, userId, reason: "Details edited" });
     await listingsService.updateListing({ listing, payload: req.body, userId, accountId, organizationId });
-    // A live listing the owner changes goes back for review (off the public site until approved
-    // again); any other listing takes the edit form's "Save draft" / "Submit for review" choice.
-    // A platform user editing through the portal is not the owner and changes no status here.
-    const statusChange = req.auth.platform.roles.length
+    const statusChange = !isOwner
       ? { changed: false }
-      : await listingsService.applyOwnerEditStatus({
-          listing,
-          requestedStatus: req.body.status,
-          edited: Object.keys(req.body).some((key) => key !== "status"),
-          userId,
-        });
+      : await listingsService.applyOwnerEditStatus({ listing, requestedStatus: req.body.status, edited, userId });
     await auditFromRequest(req, {
       action: "listing.updated",
       subjectType: "listing",
@@ -278,10 +277,11 @@ router.patch(
     }),
   }),
   asyncHandler(async (req, res) => {
-    const { accountId, organizationId } = scope(req);
+    const { accountId, organizationId, userId } = scope(req);
+    const ownAgent = ownAgentClause({ organizationId, userId });
     const inquiry = await queryOne(
       `SELECT id, public_id, status FROM inquiries
-        WHERE public_id = ? AND (account_id = ? OR organization_id <=> ?) AND deleted_at IS NULL`,
+        WHERE public_id = ? AND (account_id = ? OR organization_id = ?) AND deleted_at IS NULL`,
       [req.params.id, accountId, organizationId]
     );
     if (!inquiry) throw AppError.notFound("That inquiry was not found.");
@@ -302,8 +302,8 @@ router.patch(
       if (req.body.assignedAgentId !== undefined) {
         const agent = req.body.assignedAgentId
           ? await queryOne(
-              "SELECT id FROM agents WHERE public_id = ? AND organization_id <=> ? AND deleted_at IS NULL",
-              [req.body.assignedAgentId, organizationId],
+              `SELECT id FROM agents WHERE public_id = ? AND ${ownAgent.sql} AND deleted_at IS NULL`,
+              [req.body.assignedAgentId, ...ownAgent.params],
               connection
             )
           : null;
@@ -337,6 +337,8 @@ router.patch(
       }
     });
 
+    // The company's own systems see status changes made here (webhook, Phase 6).
+    await emitLeadEvent("inquiry", inquiry.id, "lead.updated");
     await auditFromRequest(req, {
       action: "inquiry.updated",
       subjectType: "inquiry",
@@ -372,10 +374,11 @@ router.patch(
     }),
   }),
   asyncHandler(async (req, res) => {
-    const { accountId, organizationId } = scope(req);
+    const { accountId, organizationId, userId } = scope(req);
+    const ownAgent = ownAgentClause({ organizationId, userId });
     const lead = await queryOne(
       `SELECT id, public_id, stage_id, status FROM leads
-        WHERE public_id = ? AND (account_id = ? OR organization_id <=> ?) AND deleted_at IS NULL`,
+        WHERE public_id = ? AND (account_id = ? OR organization_id = ?) AND deleted_at IS NULL`,
       [req.params.id, accountId, organizationId]
     );
     if (!lead) throw AppError.notFound("That lead was not found.");
@@ -407,7 +410,7 @@ router.patch(
       }
       if (req.body.ownerAgentId !== undefined) {
         const agent = req.body.ownerAgentId
-          ? await queryOne("SELECT id FROM agents WHERE public_id = ? AND organization_id <=> ?", [req.body.ownerAgentId, organizationId], connection)
+          ? await queryOne(`SELECT id FROM agents WHERE public_id = ? AND ${ownAgent.sql} AND deleted_at IS NULL`, [req.body.ownerAgentId, ...ownAgent.params], connection)
           : null;
         if (req.body.ownerAgentId && !agent) {
           throw AppError.validation("Some information is invalid.", { ownerAgentId: "That agent is not on this account." });
@@ -472,10 +475,12 @@ router.post(
 
     const publicId = ulid();
     await withTransaction(async (connection) => {
+      // `body_format` is enum('plain','html','markdown'). This wrote 'text', which MySQL rejects,
+      // so every reply that got past the request validation failed with a 500.
       await execute(
         `INSERT INTO messages (public_id, conversation_id, sender_user_id, sender_type, body,
                                body_format, status, channel, created_at)
-         VALUES (?, ?, ?, 'user', ?, 'text', 'sent', 'in_app', NOW(3))`,
+         VALUES (?, ?, ?, 'user', ?, 'plain', 'sent', 'in_app', NOW(3))`,
         [publicId, conversation.id, userId, req.body.body],
         connection
       );
@@ -554,7 +559,7 @@ router.patch(
     const { accountId, organizationId } = scope(req);
     const booking = await queryOne(
       `SELECT id, public_id, status FROM bookings
-        WHERE public_id = ? AND (account_id = ? OR organization_id <=> ?) AND deleted_at IS NULL`,
+        WHERE public_id = ? AND (account_id = ? OR organization_id = ?) AND deleted_at IS NULL`,
       [req.params.id, accountId, organizationId]
     );
     if (!booking) throw AppError.notFound("That booking was not found.");
@@ -597,6 +602,7 @@ router.patch(
       }
     });
 
+    await emitLeadEvent("booking", booking.id, "lead.updated");
     await auditFromRequest(req, { action: "booking.updated", subjectType: "booking", subjectId: booking.id, changes: req.body });
     return res.json(detailResponse({ id: booking.public_id, updated: true }));
   })
@@ -633,7 +639,7 @@ router.patch(
     const { accountId, organizationId } = scope(req);
     const offer = await queryOne(
       `SELECT id, public_id, status, listing_id, currency_code, amount FROM offers
-        WHERE public_id = ? AND (account_id = ? OR organization_id <=> ?) AND deleted_at IS NULL`,
+        WHERE public_id = ? AND (account_id = ? OR organization_id = ?) AND deleted_at IS NULL`,
       [req.params.id, accountId, organizationId]
     );
     if (!offer) throw AppError.notFound("That offer was not found.");
@@ -664,6 +670,7 @@ router.patch(
       );
     });
 
+    await emitLeadEvent("offer", offer.id, "lead.updated");
     await auditFromRequest(req, { action: "offer.responded", subjectType: "offer", subjectId: offer.id, changes: req.body });
     return res.json(detailResponse({ id: offer.public_id, status: req.body.status }));
   })
@@ -689,11 +696,20 @@ router.post(
   writeLimiter,
   validate({ body: z.object({ body: z.string().trim().min(1, "Write a response.").max(4000) }) }),
   asyncHandler(async (req, res) => {
-    const { organizationId } = scope(req);
-    const review = await queryOne(
-      "SELECT id, public_id FROM reviews WHERE public_id = ? AND organization_id <=> ? AND deleted_at IS NULL",
-      [req.params.id, organizationId]
-    );
+    const { organizationId, agentId } = scope(req);
+    // The same scope the reviews list uses: an organization answers its own reviews; an
+    // individual answers only reviews of their own agent profile.
+    const review = organizationId
+      ? await queryOne(
+          "SELECT id, public_id FROM reviews WHERE public_id = ? AND organization_id = ? AND deleted_at IS NULL",
+          [req.params.id, organizationId]
+        )
+      : agentId
+        ? await queryOne(
+            "SELECT id, public_id FROM reviews WHERE public_id = ? AND subject_type = 'agent' AND subject_id = ? AND deleted_at IS NULL",
+            [req.params.id, agentId]
+          )
+        : null;
     if (!review) throw AppError.notFound("That review was not found.");
     await execute(
       `INSERT INTO review_responses (review_id, responder_user_id, body, status, created_at)
@@ -915,7 +931,9 @@ router.get(
   "/integrations",
   requireAccountCapability("can_view_integrations"),
   asyncHandler(async (req, res) => {
-    const organizationId = requireOrganizationId(req);
+    // API keys belong to companies; an individual's page shows feeds and lead delivery only (0065).
+    const organizationId = req.auth?.activeMembership?.organization_id;
+    if (!organizationId) return res.json({ data: [] });
     const rows = await query(
       `SELECT ac.public_id, ac.name, ac.client_id, ac.secret_hint, ac.status, ac.scopes, ac.allowed_ips,
               ac.last_used_at, ac.created_at, ac.rate_limit_per_minute
@@ -956,6 +974,7 @@ router.post(
   }),
   asyncHandler(async (req, res) => {
     const organizationId = requireOrganizationId(req);
+    await addons.assertAddonActive(requireAccountId(req), "integrations");
     const created = await organizationService.createApiClient({
       organizationId,
       name: req.body.name,
@@ -1007,15 +1026,24 @@ router.get(
   requireAccountCapability("can_view_integrations"),
   validate({ query: importListQuery }),
   asyncHandler(async (req, res) => {
-    const organizationId = requireOrganizationId(req);
+    // A company's runs by organization; an individual's (feeds only) by account.
+    const organizationId = req.auth?.activeMembership?.organization_id ?? null;
     const { page = 1, pageSize = 20, status, type } = q(req);
-    const result = await importsRepo.listImports({ organizationId, status, type, page, pageSize });
+    const result = await importsRepo.listImports({
+      organizationId,
+      accountId: organizationId ? null : requireAccountId(req),
+      status,
+      type,
+      page,
+      pageSize,
+    });
     return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
   })
 );
 
 async function ownImport(req) {
-  const row = await importsRepo.getImportRow(req.params.importId, { organizationId: requireOrganizationId(req) });
+  const organizationId = req.auth?.activeMembership?.organization_id ?? null;
+  const row = await importsRepo.getImportRow(req.params.importId, organizationId ? { organizationId } : { accountId: requireAccountId(req) });
   if (!row) throw AppError.notFound("That import was not found.");
   return row;
 }
@@ -1091,7 +1119,12 @@ router.get(
   requireAccountCapability("can_manage_billing"),
   asyncHandler(async (req, res) => {
     const params = q(req) || {};
-    return res.json(detailResponse(await engagement.accountBilling({ accountId: requireAccountId(req), ...params })));
+    const accountId = requireAccountId(req);
+    const [billing, accountAddons] = await Promise.all([
+      engagement.accountBilling({ accountId, ...params }),
+      addons.listAccountAddons(accountId),
+    ]);
+    return res.json(detailResponse({ ...billing, addons: accountAddons }));
   })
 );
 
@@ -1109,6 +1142,39 @@ router.patch(
     const result = await assignPlanToAccount({ accountId, packageId: req.body.packageId, publicOnly: true });
     await auditFromRequest(req, { action: "account.package_changed", subjectType: "account", subjectLabel: String(accountId), changes: { packageId: result.packageId } });
     return res.json(detailResponse(result));
+  })
+);
+
+/** The plan's add-ons: what it offers, at what price, and what this account has switched on. */
+router.get(
+  "/billing/addons",
+  requireAccountCapability("can_manage_billing"),
+  asyncHandler(async (req, res) => res.json({ data: await addons.listAccountAddons(requireAccountId(req)) }))
+);
+
+router.post(
+  "/billing/addons/:code",
+  writeLimiter,
+  requireAccountCapability("can_manage_billing"),
+  validate({ params: z.object({ code: z.enum(addons.ADDON_CODES) }) }),
+  asyncHandler(async (req, res) => {
+    const accountId = requireAccountId(req);
+    const result = await addons.enableAddon({ accountId, code: req.params.code, userId: req.auth.user.id });
+    await auditFromRequest(req, { action: "account.addon_enabled", subjectType: "account", subjectLabel: String(accountId), metadata: { addon: req.params.code } });
+    return res.json({ data: result });
+  })
+);
+
+router.delete(
+  "/billing/addons/:code",
+  writeLimiter,
+  requireAccountCapability("can_manage_billing"),
+  validate({ params: z.object({ code: z.enum(addons.ADDON_CODES) }) }),
+  asyncHandler(async (req, res) => {
+    const accountId = requireAccountId(req);
+    const result = await addons.disableAddon({ accountId, code: req.params.code });
+    await auditFromRequest(req, { action: "account.addon_disabled", subjectType: "account", subjectLabel: String(accountId), metadata: { addon: req.params.code } });
+    return res.json({ data: result });
   })
 );
 
@@ -1546,7 +1612,11 @@ router.get(
 
 router.get(
   "/developments/:id",
-  asyncHandler(async (req, res) => res.json(detailResponse(await portalDevelopmentDetail(await ownDevelopment(req, req.params.id)))))
+  asyncHandler(async (req, res) => {
+    const row = await ownDevelopment(req, req.params.id);
+    // A developer's changes to a published development waiting for approval (0061).
+    return res.json(detailResponse({ ...(await portalDevelopmentDetail(row)), pendingChanges: await openProjectRevisionSummary(row.id) }));
+  })
 );
 
 router.post(
@@ -1600,14 +1670,17 @@ router.patch(
     const { submit, ...payload } = req.body;
     await assertOwnDevelopmentMedia(req, payload, current.id);
     const edited = Object.keys(payload).length > 0;
+    // Approval covers the version a moderator reviewed: a published development the developer
+    // changes in any way (a unit, a milestone, a photo) waits for a moderator, while the site
+    // keeps the approved version (0061). Captured before the change is written.
+    const wasLive = current.moderation_status === "published";
+    if (wasLive && edited) {
+      await beginDeveloperChange({ projectId: current.id, userId: req.auth.user.id, change: "Details edited" });
+    }
     if (edited) {
       await upsertDevelopment({ identifier: current.public_id, payload, userId: req.auth.user.id });
     }
-    // Approval covers the version a moderator reviewed: a published development the developer
-    // changes in any way — a unit, a milestone, a photo — goes back into the queue and off the
-    // public site, exactly like an explicit resubmission. It used to be saved live in place.
-    const wasLive = current.moderation_status === "published";
-    if (submit || (wasLive && edited)) {
+    if (submit && !wasLive) {
       // Resubmission: back into the queue, off the public site, the old reason cleared.
       await execute(
         "UPDATE projects SET moderation_status = 'pending', rejection_reason = NULL, is_publicly_visible = 0, updated_at = NOW(3) WHERE id = ?",

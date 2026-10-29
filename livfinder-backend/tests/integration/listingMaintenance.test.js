@@ -146,7 +146,7 @@ describe("expiry", () => {
     const drift = await queryOne(
       `SELECT
          (SELECT COUNT(*) FROM listing_search s WHERE s.listing_id NOT IN (SELECT id FROM v_public_listings)) AS projection,
-         (SELECT COUNT(*) FROM sitemap_entries s WHERE s.entity_type = 'listing' AND s.entity_id NOT IN (SELECT id FROM v_public_listings)) AS sitemap,
+         (SELECT COUNT(*) FROM sitemap_entries s WHERE s.entity_type = 'listing' AND s.entity_id NOT IN (SELECT id FROM v_reachable_listings)) AS sitemap,
          (SELECT COUNT(*) FROM listings WHERE status = 'active' AND deleted_at IS NULL AND expires_at <= NOW(3)) AS overdue`
     );
     expect(drift).toEqual({ projection: 0, sitemap: 0, overdue: 0 });

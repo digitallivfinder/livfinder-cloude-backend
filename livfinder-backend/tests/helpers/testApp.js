@@ -62,6 +62,9 @@ export async function findPortalOwner() {
         AND EXISTS (SELECT 1 FROM account_category_access aca
                      JOIN categories c ON c.id = aca.category_id
                     WHERE aca.account_id = a.id AND aca.status = 'approved' AND c.id = 1)
+        -- Room under both plan limits (0059), so the suites can create listings.
+        AND (a.listing_quota IS NULL OR a.listing_used + 5 < a.listing_quota)
+        AND (a.storage_quota IS NULL OR a.storage_used + 5 < a.storage_quota)
       ORDER BY u.id LIMIT 1`
   );
 }

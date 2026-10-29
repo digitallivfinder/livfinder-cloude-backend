@@ -68,6 +68,20 @@ const server = app.listen(env.PORT, async () => {
     } catch (error) {
       logger.error({ err: error }, "listing import runner could not be started");
     }
+    // Webhooks (0064): deliver lead events to companies' endpoints, with retries.
+    try {
+      const { startWebhookWorker } = await import("./modules/leads/webhooks.service.js");
+      startWebhookWorker();
+    } catch (error) {
+      logger.error({ err: error }, "webhook worker could not be started");
+    }
+    // Company feeds (0063): scheduled fetches, the 10-minute change watch, and "Run now".
+    try {
+      const { startFeedScheduler } = await import("./modules/feeds/feedRunner.js");
+      startFeedScheduler();
+    } catch (error) {
+      logger.error({ err: error }, "feed scheduler could not be started");
+    }
   }
 });
 

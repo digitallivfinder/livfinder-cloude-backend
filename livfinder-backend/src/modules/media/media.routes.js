@@ -213,16 +213,16 @@ router.get(
 );
 
 /**
- * Any media change an owner makes to a live listing — a photo added, removed, reordered or
- * re-captioned, a file or a link — sends it back for review, exactly like an edit to its text:
- * the public page would otherwise show media no moderator has seen. A platform user is not the
- * owner and their change sends nothing back.
+ * Any media change an owner makes to a live listing (a photo added, removed, reordered or
+ * re-captioned, a file or a link) waits for a moderator, exactly like an edit to its text; the
+ * public page keeps the approved media meanwhile (0060). Called before the change is written, so
+ * the approved version is captured first. A platform user is not the owner and holds nothing.
  */
-async function sendBackIfLive(req, listing, reason) {
+async function holdIfLive(req, listing, reason) {
   if (req.auth.platform?.roles?.length) return;
   if (listing.status !== "active") return;
-  const { sendBackForReview } = await import("../listings/listings.service.js");
-  await sendBackForReview({ listingId: listing.id, userId: req.auth.user.id, reason: `${reason} by the owner after approval` });
+  const { holdOwnerChange } = await import("../listings/listings.service.js");
+  await holdOwnerChange({ listingId: listing.id, userId: req.auth.user.id, reason });
 }
 
 router.post(
@@ -242,6 +242,7 @@ router.post(
       throw AppError.badRequest("Attach at least one image.");
     }
 
+    await holdIfLive(req, listing, "Photos added");
     for (const file of files) {
       const asset = await mediaService.storeImage({
         buffer: file.buffer,
@@ -275,7 +276,6 @@ router.post(
     await listingMedia.syncListingMediaCounters(listing.id);
     const { refreshListingSearch } = await import("../listings/listings.repository.js");
     await refreshListingSearch(listing.id);
-    await sendBackIfLive(req, listing, "Photos added");
 
     await auditFromRequest(req, {
       action: "listing.media_added",
@@ -322,6 +322,7 @@ router.post(
     }
     const caption = String(req.body.caption || "").trim().slice(0, 500) || null;
 
+    await holdIfLive(req, listing, "Files added");
     for (const file of files) {
       const owner = { buffer: file.buffer, originalFileName: file.originalname, accountId: req.auth.activeAccountId, userId: req.auth.user.id };
       let stored;
@@ -348,7 +349,6 @@ router.post(
     await listingMedia.syncListingMediaCounters(listing.id);
     const { refreshListingSearch } = await import("../listings/listings.repository.js");
     await refreshListingSearch(listing.id);
-    await sendBackIfLive(req, listing, "Files added");
     await auditFromRequest(req, {
       action: "listing.media_added",
       subjectType: "listing",
@@ -387,13 +387,13 @@ router.post(
           : "That media type is not available for this category.",
       });
     }
+    await holdIfLive(req, listing, "Link added");
     const data = await listingMedia.addListingLink({
       listingId: listing.id,
       mediaType: req.body.mediaType,
       url: req.body.url,
       caption: req.body.caption || null,
     });
-    await sendBackIfLive(req, listing, "Link added");
     await auditFromRequest(req, {
       action: "listing.media_added",
       subjectType: "listing",
@@ -413,11 +413,11 @@ router.patch(
   }),
   asyncHandler(async (req, res) => {
     const listing = await assertListingAccess(req, req.params.listingId, "edit");
+    await holdIfLive(req, listing, "Photos reordered");
     const data = await listingMedia.reorderListingMedia({
       listingId: listing.id,
       orderedIds: req.body.order,
     });
-    await sendBackIfLive(req, listing, "Photos reordered");
     await auditFromRequest(req, { action: "listing.media_reordered", subjectType: "listing", subjectId: listing.id });
     return res.json({ data });
   })
@@ -438,12 +438,12 @@ router.patch(
   }),
   asyncHandler(async (req, res) => {
     const listing = await assertListingAccess(req, req.params.listingId, "edit");
+    await holdIfLive(req, listing, "Media updated");
     const data = await listingMedia.updateListingMediaItem({
       listingId: listing.id,
       mediaId: req.params.mediaId,
       ...req.body,
     });
-    await sendBackIfLive(req, listing, "Media updated");
     await auditFromRequest(req, {
       action: "listing.media_updated",
       subjectType: "listing",
@@ -460,11 +460,11 @@ router.delete(
   validate({ params: listingIdParam.extend({ mediaId: z.string().min(1).max(32) }) }),
   asyncHandler(async (req, res) => {
     const listing = await assertListingAccess(req, req.params.listingId, "edit");
+    await holdIfLive(req, listing, "Media removed");
     const data = await listingMedia.removeListingMedia({
       listingId: listing.id,
       mediaId: req.params.mediaId,
     });
-    await sendBackIfLive(req, listing, "Media removed");
     await auditFromRequest(req, {
       action: "listing.media_removed",
       subjectType: "listing",
@@ -484,9 +484,11 @@ router.delete(
  * ------------------------------------------------------------------------ */
 const developmentParams = z.object({ projectId: z.string().trim().min(1).max(200) });
 
-async function afterDevelopmentChange(req, project) {
+/** Called before a developer's change: on a published development it waits for approval (0061). */
+async function holdDevelopmentChange(req, project, change) {
   if (req.auth.platform?.roles?.length) return;
-  await devAttachments.sendDevelopmentBackForReview(project);
+  const { beginDeveloperChange } = await import("../projects/projectRevisions.service.js");
+  await beginDeveloperChange({ projectId: project.id, userId: req.auth.user.id, change });
 }
 
 router.get(
@@ -520,6 +522,7 @@ router.post(
     }
     const caption = String(req.body.caption || "").trim().slice(0, 255) || null;
 
+    await holdDevelopmentChange(req, project, "Files added");
     for (const file of files) {
       const owner = { buffer: file.buffer, originalFileName: file.originalname, accountId: req.auth.activeAccountId, userId: req.auth.user.id };
       let stored;
@@ -543,7 +546,6 @@ router.post(
       });
     }
 
-    await afterDevelopmentChange(req, project);
     await auditFromRequest(req, {
       action: "development.media_added",
       subjectType: "project",
@@ -568,8 +570,8 @@ router.post(
   }),
   asyncHandler(async (req, res) => {
     const project = await devAttachments.ownedDevelopment(req.auth.activeAccountId, req.params.projectId);
+    await holdDevelopmentChange(req, project, "Link added");
     await devAttachments.addDevelopmentLink({ projectId: project.id, ...req.body });
-    await afterDevelopmentChange(req, project);
     await auditFromRequest(req, {
       action: "development.media_added",
       subjectType: "project",
@@ -587,8 +589,8 @@ router.delete(
   validate({ params: developmentParams.extend({ attachmentId: z.string().trim().min(1).max(120) }) }),
   asyncHandler(async (req, res) => {
     const project = await devAttachments.ownedDevelopment(req.auth.activeAccountId, req.params.projectId);
+    await holdDevelopmentChange(req, project, "Attachment removed");
     await devAttachments.removeDevelopmentAttachment({ projectId: project.id, attachmentId: req.params.attachmentId });
-    await afterDevelopmentChange(req, project);
     await auditFromRequest(req, {
       action: "development.media_removed",
       subjectType: "project",

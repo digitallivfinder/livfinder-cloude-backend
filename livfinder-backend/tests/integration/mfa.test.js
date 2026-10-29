@@ -119,6 +119,31 @@ describe("enrolment", () => {
   });
 });
 
+describe("login", () => {
+  // Enrolment above turned MFA on for this account. The password alone used to issue a session
+  // regardless (Finding 13); it must now ask for the code and refuse a wrong one.
+  it("asks for a code instead of issuing a session on the password alone", async () => {
+    const browser = client();
+    const response = await browser.login(staffEmail, PASSWORD);
+    expect(response.status).toBe(401);
+    expect(response.body.error.code).toBe("MFA_REQUIRED");
+    expect(response.headers["set-cookie"]?.join(";") || "").not.toMatch(/livfinder_session=[^;]+/);
+  });
+
+  it("refuses a wrong code and accepts the current one", async () => {
+    const wrong = await client().agent.post("/v1/auth/login").send({ email: staffEmail, password: PASSWORD, mfaCode: "000000" });
+    expect(wrong.status).toBe(401);
+    expect(wrong.body.error.code).toBe("MFA_INVALID");
+
+    const browser = client();
+    const right = await browser.agent.post("/v1/auth/login").send({ email: staffEmail, password: PASSWORD, mfaCode: currentCode() });
+    expect(right.status).toBe(200);
+    expect((await browser.get("/v1/auth/session")).body.data.authenticated).toBe(true);
+    // A wrong code counts toward lockout like a wrong password; clear it so later cases start clean.
+    await execute("UPDATE users SET failed_login_count = 0, locked_until = NULL WHERE id = ?", [userId]);
+  });
+});
+
 describe("step-up", () => {
   it("refuses a high-risk action until the session re-proves itself", async () => {
     await execute("UPDATE user_sessions SET stepped_up_at = NULL WHERE user_id = ?", [userId]);

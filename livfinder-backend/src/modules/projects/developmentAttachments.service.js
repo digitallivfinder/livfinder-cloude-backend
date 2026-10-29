@@ -1,4 +1,4 @@
-import { callProcedure, execute, query, queryOne, queryValue } from "../../db/query.js";
+import { execute, query, queryOne, queryValue } from "../../db/query.js";
 import { AppError } from "../../utils/errors.js";
 import { ulid } from "../../utils/ids.js";
 
@@ -152,15 +152,4 @@ export async function removeDevelopmentAttachment({ projectId, attachmentId }) {
     affected = (await execute("UPDATE virtual_tours SET status = 'archived' WHERE project_id = ? AND public_id = ?", [projectId, ref])).affectedRows;
   }
   if (!affected) throw AppError.notFound("That attachment was not found.");
-}
-
-/** A published development its developer changed goes back to review, off the public site. */
-export async function sendDevelopmentBackForReview(project) {
-  if (project.moderation_status !== "published") return false;
-  await execute(
-    "UPDATE projects SET moderation_status = 'pending', rejection_reason = NULL, is_publicly_visible = 0, updated_at = NOW(3) WHERE id = ?",
-    [project.id]
-  );
-  await callProcedure("sp_refresh_project_search", [project.id]);
-  return true;
 }

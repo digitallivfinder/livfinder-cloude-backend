@@ -643,7 +643,9 @@ router.get(
 router.get(
   "/sitemap",
   asyncHandler(async (req, res) => {
-    const entries = await sitemapRepo.sitemapEntries(String(req.query.kind || "all"));
+    const entries = await sitemapRepo.sitemapEntries(String(req.query.kind || "all"), {
+      category: req.query.category ? String(req.query.category) : undefined,
+    });
     return res.json({ data: entries });
   })
 );

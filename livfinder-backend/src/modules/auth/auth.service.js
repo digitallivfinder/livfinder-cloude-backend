@@ -6,6 +6,7 @@ import { AppError } from "../../utils/errors.js";
 import { ulid, randomToken, sha256 } from "../../utils/ids.js";
 import { hashPassword, verifyPassword, passwordPolicyError } from "./passwords.js";
 import { createSession, revokeSession, revokeAllSessions } from "./sessions.js";
+import { requiresMfaAtLogin, verifyMfaCode } from "./mfa.service.js";
 import { recordAudit } from "../system/audit.service.js";
 import { sendMail } from "../system/mail.service.js";
 
@@ -22,7 +23,7 @@ async function findUserByEmail(email) {
   return queryOne(
     `SELECT id, public_id, email, email_normalized, email_verified_at, password_hash, session_epoch,
             status, display_name, first_name, last_name, avatar_url, default_account_id,
-            failed_login_count, locked_until, deleted_at
+            failed_login_count, locked_until, mfa_enabled, deleted_at
        FROM users WHERE email_normalized = ? LIMIT 1`,
     [normalizeEmail(email)]
   );
@@ -35,7 +36,7 @@ async function findUserByEmail(email) {
  * "not active", so the endpoint does not confirm which addresses are
  * registered. The rate limiter is keyed on IP+email upstream.
  */
-export async function login({ email, password, ip, userAgent }) {
+export async function login({ email, password, mfaCode, ip, userAgent }) {
   const genericFailure = AppError.unauthorized("Email or password is incorrect.");
   const user = await findUserByEmail(email);
 
@@ -78,6 +79,38 @@ export async function login({ email, password, ip, userAgent }) {
       });
     }
     throw genericFailure;
+  }
+
+  /**
+   * The second factor, for accounts that enrolled one.
+   *
+   * MFA enrolment, verification and recovery codes were all implemented, but nothing here asked
+   * for a code, so an account "protected" by an authenticator signed in with its password alone.
+   * No session is issued until the code verifies. A missing code is a prompt, not a failure; a
+   * wrong one counts toward the same lockout as a wrong password.
+   */
+  if (user.mfa_enabled && (await requiresMfaAtLogin(user.id))) {
+    if (!mfaCode) {
+      throw new AppError("Enter the code from your authenticator app.", { status: 401, code: "MFA_REQUIRED" });
+    }
+    if (!(await verifyMfaCode({ userId: user.id, code: mfaCode }))) {
+      await execute(
+        `UPDATE users
+            SET failed_login_count = failed_login_count + 1,
+                locked_until = IF(failed_login_count + 1 >= 10, DATE_ADD(NOW(3), INTERVAL 15 MINUTE), locked_until)
+          WHERE id = ?`,
+        [user.id]
+      );
+      await recordAudit({
+        action: "auth.login_failed",
+        subjectType: "user",
+        subjectId: user.id,
+        userId: user.id,
+        metadata: { reason: "bad_mfa_code" },
+        ip,
+      });
+      throw new AppError("That code is not valid. Try the latest code from your app.", { status: 401, code: "MFA_INVALID" });
+    }
   }
 
   return withTransaction(async (connection) => {
@@ -346,7 +379,15 @@ export async function upsertOAuthIdentity({ provider, subject, email, displayNam
       );
     }
 
-    const user = await queryOne("SELECT session_epoch, default_account_id FROM users WHERE id = ?", [userId], connection);
+    const user = await queryOne("SELECT session_epoch, default_account_id, mfa_enabled FROM users WHERE id = ?", [userId], connection);
+    // A provider sign-in proves the provider account, not the second factor this user enrolled,
+    // so an MFA-protected account signs in with its password and code instead.
+    if (user.mfa_enabled && (await requiresMfaAtLogin(userId))) {
+      throw new AppError("This account uses two-step verification. Sign in with your email, password and code.", {
+        status: 403,
+        code: "MFA_REQUIRED",
+      });
+    }
     const session = await createSession(
       { userId, sessionEpoch: user.session_epoch, activeAccountId: user.default_account_id, ip, userAgent },
       connection

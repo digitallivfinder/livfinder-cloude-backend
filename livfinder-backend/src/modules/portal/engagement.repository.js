@@ -890,7 +890,7 @@ export async function listSavedSearches({ userId }) {
       alertFrequency: row.alert_frequency,
       savedAt: new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }).format(new Date(row.created_at)),
       savedAtIso: isoDate(row.created_at),
-      resultUrl: row.canonical_url || "/search",
+      resultUrl: row.canonical_url || "/",
     };
   });
 }
@@ -1064,7 +1064,9 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
               s.current_period_start, s.current_period_end, s.auto_renew,
               p.name AS plan_name, p.code AS plan_code, p.tier, p.agent_seat_quota, p.lead_quota,
               p.listing_quota AS plan_listing_quota, p.featured_quota AS plan_featured_quota,
+              p.storage_quota AS plan_storage_quota,
               a.listing_quota AS account_listing_quota, a.listing_used AS account_listing_used,
+              a.storage_quota AS account_storage_quota, a.storage_used AS account_storage_used,
               a.featured_quota AS account_featured_quota, a.featured_used AS account_featured_used
          FROM subscriptions s
          JOIN plans p ON p.id = s.plan_id
@@ -1074,7 +1076,7 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
       [accountId]
     ),
     query(
-      `SELECT public_id, code, name, description, tier, billing_interval, listing_quota,
+      `SELECT public_id, code, name, description, tier, billing_interval, listing_quota, storage_quota,
               featured_quota, agent_seat_quota, lead_quota
          FROM plans WHERE is_active = 1 AND is_public = 1 ORDER BY sort_order ASC`,
       []
@@ -1126,7 +1128,8 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
             : null,
           autoRenew: bool(subscription.auto_renew),
           benefits: [
-            quotaBenefit(subscription.plan_listing_quota, "listings"),
+            quotaBenefit(subscription.plan_listing_quota, "live listings"),
+            quotaBenefit(subscription.plan_storage_quota, "listings stored"),
             subscription.plan_featured_quota ? `${subscription.plan_featured_quota} featured slots` : null,
             quotaBenefit(subscription.agent_seat_quota, "agent seats"),
             subscription.lead_quota ? `${subscription.lead_quota} leads / month` : null,
@@ -1140,6 +1143,14 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
             limit: int(subscription.account_listing_quota),
             percent: subscription.account_listing_quota
               ? Math.round(((int(subscription.account_listing_used) ?? 0) / int(subscription.account_listing_quota)) * 100)
+              : 0,
+          },
+          // Live = live + waiting for approval; stored = everything but archived (0059).
+          storage: {
+            used: int(subscription.account_storage_used) ?? 0,
+            limit: int(subscription.account_storage_quota),
+            percent: subscription.account_storage_quota
+              ? Math.round(((int(subscription.account_storage_used) ?? 0) / int(subscription.account_storage_quota)) * 100)
               : 0,
           },
           featured: {
@@ -1173,7 +1184,8 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
         ? formatMoney(planPrices.get(plan.public_id))
         : null,
       benefits: [
-        quotaBenefit(plan.listing_quota, "listings"),
+        quotaBenefit(plan.listing_quota, "live listings"),
+        quotaBenefit(plan.storage_quota, "listings stored"),
         plan.featured_quota ? `${plan.featured_quota} featured slots` : null,
         quotaBenefit(plan.agent_seat_quota, "agent seats"),
         plan.lead_quota ? `${plan.lead_quota} leads / month` : null,

@@ -1,15 +1,17 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { client, adminEmail, cleanupListings, cleanupProjects, ensureTestPassword, queryOne } from "../helpers/testApp.js";
+import { client, adminEmail, cleanupListings, cleanupProjects, ensureTestPassword, execute, queryOne } from "../helpers/testApp.js";
 import { closePool } from "../../src/db/pool.js";
 
 /**
- * A live listing or development that its owner changes goes back to moderation.
+ * An owner's change to a live listing waits for a moderator; the site keeps the approved version.
  *
- * Approval covers the version a moderator reviewed. Before this, an owner could change the text,
- * the price or the photos of an approved listing and the public page showed it straight away —
- * content nobody had checked. Now any owner change (the edit form, or any media action: a photo
- * added, removed, reordered or re-captioned, a file, a link) takes it off the public site and
- * back to `pending_review` until a moderator approves it again. Walked for all seven categories.
+ * Approval covers the version a moderator reviewed. Any owner change (the edit form, or any media
+ * action: a photo added, removed, reordered or re-captioned, a file, a link) opens a pending
+ * revision (migration 0060). The listing stays live and the public page, the search results and
+ * the URL keep showing the approved version until a moderator approves the change; a rejection
+ * sends reasons back and leaves the approved version up. Walked for every listing category.
+ *
+ * Developments follow the same rule (migration 0061), below.
  */
 const PASSWORD = "LivFinder!2026";
 const createdListings = [];
@@ -23,6 +25,9 @@ async function ownerForCategory(categoryId) {
        JOIN accounts a ON a.id = am.account_id AND a.status = 'active'
        JOIN account_category_access aca ON aca.account_id = a.id AND aca.status = 'approved' AND aca.category_id = ?
       WHERE u.status = 'active' AND u.deleted_at IS NULL
+        -- Room under both plan limits (0059), so creating the test listing is not refused.
+        AND (a.listing_quota IS NULL OR a.listing_used + 5 < a.listing_quota)
+        AND (a.storage_quota IS NULL OR a.storage_used + 5 < a.storage_quota)
       ORDER BY u.id LIMIT 1`,
     [categoryId]
   );
@@ -39,19 +44,17 @@ async function locationRef(level) {
 const statusOf = (publicId) =>
   queryOne("SELECT status, moderation_status FROM listings WHERE public_id = ?", [publicId]);
 
-const lastTransition = (publicId) =>
-  queryOne(
-    `SELECT h.from_status, h.to_status
-       FROM listing_status_history h JOIN listings l ON l.id = h.listing_id
-      WHERE l.public_id = ? ORDER BY h.id DESC LIMIT 1`,
-    [publicId]
-  );
-
 beforeAll(async () => {
   await ensureTestPassword(PASSWORD);
 });
 
 afterAll(async () => {
+  for (const publicId of createdListings) {
+    await execute(
+      "DELETE n FROM notifications n JOIN listings l ON l.id = n.subject_id WHERE n.subject_type = 'listing' AND n.type LIKE 'listing.revision_%' AND l.public_id = ?",
+      [publicId]
+    );
+  }
   await cleanupListings(createdListings);
   await cleanupProjects(createdProjects);
   await closePool();
@@ -70,12 +73,19 @@ describe.each(CASES)("an owner's change to a live $category listing", ({ categor
   const portal = client();
   const admin = client();
   let id = null;
+  let approvedPath = null;
 
-  const approve = async () => {
-    const response = await admin.send("patch", `/v1/admin/listings/${id}/moderation`, { decision: "approve" });
+  const moderate = async (body) => {
+    const response = await admin.send("patch", `/v1/admin/listings/${id}/moderation`, body);
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(await statusOf(id)).toEqual({ status: "active", moderation_status: "approved" });
+    return response.body.data;
   };
+  const publicPage = async () => {
+    const response = await client().get(`/v1/public/listings/${id}`);
+    expect(response.status).toBe(200);
+    return response.body.data;
+  };
+  const row = () => queryOne("SELECT status, moderation_status, canonical_path, pending_revision_id FROM listings WHERE public_id = ?", [id]);
 
   beforeAll(async () => {
     const owner = await ownerForCategory(categoryId);
@@ -89,6 +99,7 @@ describe.each(CASES)("an owner's change to a live $category listing", ({ categor
       categorySlug,
       purpose: category === "yachts" ? "charter" : "sale",
       title: `QA reapproval ${category} ${Date.now()}`,
+      subtitle: "Approved subtitle",
       description: `<p>Exercises re-approval after an owner edit for ${category}.</p>`,
       price: 250000,
       currency: category === "watches" ? "USD" : "AED",
@@ -99,42 +110,89 @@ describe.each(CASES)("an owner's change to a live $category listing", ({ categor
     expect(created.status, JSON.stringify(created.body)).toBe(201);
     id = created.body.data.id;
     createdListings.push(id);
-    await approve();
-    expect((await client().get(`/v1/public/listings/${id}`)).status).toBe(200);
+    await moderate({ decision: "approve" });
+    approvedPath = (await row()).canonical_path;
+    expect((await publicPage()).subtitle).toBe("Approved subtitle");
   });
 
-  it("a text edit sends it back for review and takes it off the public site", async () => {
-    const response = await portal.send("patch", `/v1/portal/listings/${id}`, { subtitle: "Edited after approval" });
+  it("an edit stays queued: the listing stays live and the site keeps the approved version and URL", async () => {
+    const response = await portal.send("patch", `/v1/portal/listings/${id}`, {
+      subtitle: "Edited after approval",
+      title: `QA reapproval ${category} renamed ${Date.now()}`,
+    });
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(await statusOf(id)).toEqual({ status: "pending_review", moderation_status: "pending" });
-    expect(await lastTransition(id)).toMatchObject({ from_status: "active", to_status: "pending_review" });
-    expect((await client().get(`/v1/public/listings/${id}`)).status).toBe(404);
+    const now = await row();
+    expect(now).toMatchObject({ status: "active", moderation_status: "approved", canonical_path: approvedPath });
+    expect(now.pending_revision_id).toBeTruthy();
+    const page = await publicPage();
+    expect(page.subtitle).toBe("Approved subtitle");
+
+    const own = (await portal.get(`/v1/portal/listings/${id}`)).body.data;
+    expect(own.subtitle).toBe("Edited after approval");
+    expect(own.pendingChanges).toMatchObject({ status: "pending" });
   });
 
-  it("re-approval puts the edited version back on the site", async () => {
-    await approve();
-    const live = await client().get(`/v1/public/listings/${id}`);
-    expect(live.status).toBe(200);
-    expect(JSON.stringify(live.body.data)).toContain("Edited after approval");
-  });
-
-  it("a media change alone — adding a video link — sends it back too", async () => {
+  it("a media change alone (a video link) joins the same pending change, and is not public yet", async () => {
     const response = await portal.send("post", `/v1/media/listings/${id}/links`, {
       mediaType: "video",
       url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
     });
     expect(response.status, JSON.stringify(response.body)).toBe(201);
-    expect(await statusOf(id)).toEqual({ status: "pending_review", moderation_status: "pending" });
-    expect((await client().get(`/v1/public/listings/${id}`)).status).toBe(404);
+    expect((await row()).status).toBe("active");
+    expect(JSON.stringify((await publicPage()).documents)).not.toContain("youtube.com");
   });
 
-  it("an owner status change that is not an edit (marking it sold) is not sent back", async () => {
-    await approve();
+  it("the moderator sees what changed against the approved version", async () => {
+    const detail = (await admin.get(`/v1/admin/listings/${id}`)).body.data;
+    expect(detail.pendingChanges.status).toBe("pending");
+    expect(detail.pendingChanges.changeLog).toHaveLength(2);
+    const fields = detail.pendingChanges.changes.fields.map((item) => item.field);
+    expect(fields).toEqual(expect.arrayContaining(["title", "subtitle"]));
+    expect(detail.pendingChanges.changes.fields.find((item) => item.field === "subtitle")).toMatchObject({
+      before: "Approved subtitle",
+      after: "Edited after approval",
+    });
+    expect(detail.pendingChanges.changes.documents.added).toHaveLength(1);
+  });
+
+  it("rejecting sends the reasons back and keeps the approved version live", async () => {
+    await moderate({ decision: "reject", reason: "Remove the renamed title.", fields: { title: "Keep the original title." } });
+    expect(await row()).toMatchObject({ status: "active", moderation_status: "approved" });
+    expect((await publicPage()).subtitle).toBe("Approved subtitle");
+    const own = (await portal.get(`/v1/portal/listings/${id}`)).body.data;
+    expect(own.pendingChanges).toMatchObject({
+      status: "rejected",
+      rejectionReason: "Remove the renamed title.",
+      rejectionFields: { title: "Keep the original title." },
+    });
+    const notice = await queryOne(
+      "SELECT n.type FROM notifications n JOIN listings l ON l.id = n.subject_id WHERE l.public_id = ? AND n.type = 'listing.revision_rejected' LIMIT 1",
+      [id]
+    );
+    expect(notice).toBeTruthy();
+  });
+
+  it("the owner's next edit resubmits, and approval publishes all of it at once", async () => {
+    const response = await portal.send("patch", `/v1/portal/listings/${id}`, { subtitle: "Edited again" });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect((await portal.get(`/v1/portal/listings/${id}`)).body.data.pendingChanges.status).toBe("pending");
+
+    await moderate({ decision: "approve" });
+    const now = await row();
+    expect(now).toMatchObject({ status: "active", pending_revision_id: null });
+    expect(now.canonical_path).not.toBe(approvedPath);
+    const page = await publicPage();
+    expect(page.subtitle).toBe("Edited again");
+    expect(JSON.stringify(page.documents)).toContain("youtube.com");
+    expect((await portal.get(`/v1/portal/listings/${id}`)).body.data.pendingChanges).toBeNull();
+  });
+
+  it("an owner status change that is not an edit (marking it sold) opens no pending change", async () => {
     const response = await portal.send("patch", `/v1/portal/listings/${id}/status`, {
       status: category === "yachts" ? "rented" : "sold",
     });
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect((await statusOf(id)).status).toBe(category === "yachts" ? "rented" : "sold");
+    expect(await row()).toMatchObject({ status: category === "yachts" ? "rented" : "sold", pending_revision_id: null });
   });
 });
 
@@ -228,19 +286,41 @@ describe("a developer's change to a live development", () => {
     expect((await client().get(`/v1/public/projects/${id}`)).status).toBe(200);
   });
 
-  it("any edit takes it off the site and back to pending", async () => {
+  it("an edit stays queued: the development stays published and the site keeps the approved version", async () => {
     const response = await developer.send("patch", `/v1/portal/developments/${id}`, { availableUnits: 35 });
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(await moderation()).toEqual({ moderation_status: "pending", visible: 0 });
-    expect((await client().get(`/v1/public/projects/${id}`)).status).toBe(404);
+    expect(await moderation()).toEqual({ moderation_status: "published", visible: 1 });
+    const page = await client().get(`/v1/public/projects/${id}`);
+    expect(page.status).toBe(200);
+    expect(page.body.data.availableUnits ?? page.body.data.inventory?.availableUnits).not.toBe(35);
+    const own = (await developer.get(`/v1/portal/developments/${id}`)).body.data;
+    expect(own.availableUnits).toBe(35);
+    expect(own.pendingChanges).toMatchObject({ status: "pending" });
   });
 
-  it("re-publishing puts the edited version back", async () => {
-    const publish = await admin.send("patch", `/v1/admin/developments/${id}`, { name, moderationStatus: "published" });
-    expect(publish.status).toBe(200);
+  it("the moderator sees the change, can send it back, and the developer sees why", async () => {
+    const response = await admin.get(`/v1/admin/developments/${id}`);
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const detail = response.body.data;
+    expect(detail.pendingChanges.status).toBe("pending");
+    expect(detail.pendingChanges.changes.fields.length).toBeGreaterThan(0);
+    const reject = await admin.send("patch", `/v1/admin/developments/${id}/changes`, { decision: "reject", reason: "Confirm the unit count." });
+    expect(reject.status, JSON.stringify(reject.body)).toBe(200);
     expect(await moderation()).toEqual({ moderation_status: "published", visible: 1 });
+    const own = (await developer.get(`/v1/portal/developments/${id}`)).body.data;
+    expect(own.pendingChanges).toMatchObject({ status: "rejected", rejectionReason: "Confirm the unit count." });
+  });
+
+  it("the next edit resubmits, and approving publishes it", async () => {
+    expect((await developer.send("patch", `/v1/portal/developments/${id}`, { availableUnits: 34 })).status).toBe(200);
+    expect((await developer.get(`/v1/portal/developments/${id}`)).body.data.pendingChanges.status).toBe("pending");
+    const approve = await admin.send("patch", `/v1/admin/developments/${id}/changes`, { decision: "approve" });
+    expect(approve.status, JSON.stringify(approve.body)).toBe(200);
+    const pending = await queryOne("SELECT pending_revision_id FROM projects WHERE public_id = ?", [id]);
+    expect(pending.pending_revision_id).toBeNull();
     const own = await developer.get(`/v1/portal/developments/${id}`);
-    expect(own.body.data.availableUnits).toBe(35);
+    expect(own.body.data.availableUnits).toBe(34);
+    expect(own.body.data.pendingChanges).toBeNull();
   });
 
   /**
@@ -257,11 +337,13 @@ describe("a developer's change to a live development", () => {
     return request.attach("files", PDF, { filename: "attachment.pdf", contentType: "application/pdf" });
   };
 
-  it("a floor plan uploaded to a live development is listed, and sends it back for review", async () => {
+  it("a floor plan uploaded to a live development is listed, and waits for approval while it stays live", async () => {
     const response = await uploadFile(developer, { mediaType: "floor_plan", caption: "Level 12 — 2BR" });
     expect(response.status, JSON.stringify(response.body)).toBe(201);
     expect(response.body.data.some((item) => item.type === "floor_plan" && item.label === "Level 12 — 2BR")).toBe(true);
-    expect(await moderation()).toEqual({ moderation_status: "pending", visible: 0 });
+    expect(await moderation()).toEqual({ moderation_status: "published", visible: 1 });
+    expect((await developer.get(`/v1/portal/developments/${id}`)).body.data.pendingChanges.status).toBe("pending");
+    expect(JSON.stringify((await client().get(`/v1/public/projects/${id}`)).body.data)).not.toContain("Level 12 — 2BR");
   });
 
   it("adds a brochure, a typed document and a video link, all listed on the development", async () => {

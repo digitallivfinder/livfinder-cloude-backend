@@ -242,6 +242,33 @@ describe("editorial and seo", () => {
     );
     expect(rows).toHaveLength(paths.length);
   });
+
+  it("derives each category's browse pages from listing paths that exist", async () => {
+    const response = await api.get("/v1/public/sitemap", { kind: "hubs", category: "cars" });
+    expect(response.body.data.length).toBeGreaterThan(0);
+    for (const hub of response.body.data.slice(0, 20)) {
+      expect(hub.url.startsWith("/cars/")).toBe(true);
+      expect(hub.listingCount).toBeGreaterThan(0);
+      const [{ count }] = await query(
+        "SELECT COUNT(*) AS count FROM listing_search WHERE root_category_id = 2 AND canonical_path LIKE ?",
+        [`${hub.url}/%`]
+      );
+      expect(Number(count)).toBe(hub.listingCount);
+    }
+  });
+
+  it("lists only magazine archives that hold a post", async () => {
+    const response = await api.get("/v1/public/sitemap", { kind: "blog-taxonomy" });
+    expect(response.body.data.length).toBeGreaterThan(0);
+    expect(response.body.data.every((entry) => /^\/blogs\/(category|topic|tag|destination|author)\//.test(entry.url))).toBe(true);
+  });
+
+  it("lists the canonical directory, not its alias, among the static pages", async () => {
+    const response = await api.get("/v1/public/sitemap", { kind: "static" });
+    const urls = response.body.data.map((entry) => entry.url);
+    expect(urls).toContain("/agencies");
+    expect(urls).not.toContain("/companies");
+  });
 });
 
 describe("error contract", () => {

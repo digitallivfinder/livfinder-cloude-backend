@@ -24,6 +24,8 @@ const emailField = z.string().trim().toLowerCase().email("Enter a valid email ad
 const loginSchema = z.object({
   email: emailField,
   password: z.string().min(1, "Enter your password.").max(200),
+  // Required only for accounts with MFA enrolled; the login answers MFA_REQUIRED when missing.
+  mfaCode: z.string().trim().min(6).max(20).optional(),
   remember: z.boolean().optional(),
 });
 
@@ -45,6 +47,7 @@ router.post(
     const { user, session } = await authService.login({
       email: req.body.email,
       password: req.body.password,
+      mfaCode: req.body.mfaCode,
       ip: req.ip,
       userAgent: req.get("user-agent"),
     });
@@ -396,15 +399,22 @@ router.get(
     if (!profileResponse.ok) throw AppError.badRequest("Sign-in with that provider failed.");
     const profile = await profileResponse.json();
 
-    const { session } = await authService.upsertOAuthIdentity({
-      provider: req.params.provider,
-      subject: String(profile.sub || profile.id),
-      email: profile.email,
-      displayName: profile.name || profile.given_name,
-      avatarUrl: profile.picture,
-      ip: req.ip,
-      userAgent: req.get("user-agent"),
-    });
+    let session;
+    try {
+      ({ session } = await authService.upsertOAuthIdentity({
+        provider: req.params.provider,
+        subject: String(profile.sub || profile.id),
+        email: profile.email,
+        displayName: profile.name || profile.given_name,
+        avatarUrl: profile.picture,
+        ip: req.ip,
+        userAgent: req.get("user-agent"),
+      }));
+    } catch (error) {
+      // An MFA-protected account is sent to the password-and-code sign-in, not left on an error.
+      if (error?.code === "MFA_REQUIRED") return res.redirect(`${env.FRONTEND_URL}/login?mfa=required`);
+      throw error;
+    }
     setSessionCookie(res, session);
     return res.redirect(`${env.FRONTEND_URL}/portal/dashboard`);
   })

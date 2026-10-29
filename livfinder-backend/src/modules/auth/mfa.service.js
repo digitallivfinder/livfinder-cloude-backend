@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { execute, query, queryOne } from "../../db/query.js";
 import { withTransaction } from "../../db/transaction.js";
-import { encryptSecret, decryptSecret } from "../../utils/secrets.js";
+import { encryptSecret, decryptSecret, isEncrypted } from "../../utils/secrets.js";
 import { AppError } from "../../utils/errors.js";
 import { hashPassword, verifyPassword } from "./passwords.js";
 
@@ -216,6 +216,25 @@ export async function disableMfa({ userId, code }) {
 export async function isMfaEnabled(userId) {
   const row = await queryOne("SELECT mfa_enabled FROM users WHERE id = ?", [userId]);
   return Boolean(row?.mfa_enabled);
+}
+
+/**
+ * Whether sign-in must ask this user for a code: a confirmed authenticator enrolled through
+ * `confirmTotpEnrolment`, whose secret is stored in this app's encrypted format.
+ *
+ * The demo seed (073_identity_extensions.sql) flags accounts `mfa_enabled = 1` and writes a
+ * SHA-256 digest where the secret belongs. No code can ever match that, so treating the flag
+ * alone as enrolment would lock those accounts — the seeded administrators among them — out for
+ * good. A secret in the encrypted format always counts, even one that no longer decrypts, so a
+ * real enrolment fails closed rather than quietly dropping its second factor.
+ */
+export async function requiresMfaAtLogin(userId) {
+  const rows = await query(
+    `SELECT secret_encrypted FROM user_mfa_factors
+      WHERE user_id = ? AND factor_type = 'totp' AND confirmed_at IS NOT NULL`,
+    [userId]
+  );
+  return rows.some((row) => isEncrypted(row.secret_encrypted?.toString?.("utf8") ?? row.secret_encrypted));
 }
 
 /**

@@ -12,6 +12,9 @@ import { callProcedure } from "../../db/query.js";
 import { splitPhone } from "../../utils/phone.js";
 import { notifyListingModeration, notifyVerificationDecision } from "../system/notifications.service.js";
 import { assignPlanToAccount } from "../accounts/accounts.service.js";
+import { approveRevision, closeOpenRevision, rejectRevision } from "../listings/listingRevisions.service.js";
+import { approveProjectRevision, closeOpenProjectRevision, rejectProjectRevision } from "../projects/projectRevisions.service.js";
+import { ADDON_CODES, disableAddon, enableAddon, listAccountAddons, upsertPlanAddons } from "../accounts/addons.service.js";
 
 /**
  * Admin write operations.
@@ -26,19 +29,34 @@ import { assignPlanToAccount } from "../accounts/accounts.service.js";
 /* -------------------------------------------------------------------------- */
 
 export const moderateListingSchema = z.object({
-  decision: z.enum(["approve", "reject", "flag", "unpublish", "archive", "feature", "unfeature"]),
+  // approve_changes / reject_changes decide a live listing's pending revision (0060); on a live
+  // listing with one open, plain approve / reject mean the same.
+  decision: z.enum(["approve", "reject", "flag", "unpublish", "archive", "feature", "unfeature", "approve_changes", "reject_changes"]),
   reason: z.string().trim().max(500).optional(),
   note: z.string().trim().max(1000).optional(),
+  // Field-level issues sent back with rejected changes: { title: "Remove the phone number." }
+  fields: z.record(z.string().max(80), z.string().trim().max(500)).optional(),
 });
 
-export async function moderateListing({ identifier, decision, reason, note, userId }) {
+export async function moderateListing({ identifier, decision, reason, note, fields, userId }) {
   const listing = await queryOne(
     `SELECT id, public_id, reference, title, status, moderation_status, is_featured,
-            account_id, organization_id, agent_id
+            account_id, organization_id, agent_id, pending_revision_id
        FROM listings WHERE (public_id = ? OR reference = ?) AND deleted_at IS NULL LIMIT 1`,
     [identifier, identifier]
   );
   if (!listing) throw AppError.notFound("That listing was not found.");
+
+  const onRevision =
+    decision === "approve_changes" ||
+    decision === "reject_changes" ||
+    (listing.status === "active" && listing.pending_revision_id && (decision === "approve" || decision === "reject"));
+  if (onRevision) {
+    const result = decision.startsWith("approve")
+      ? await approveRevision({ listingId: listing.id, userId })
+      : await rejectRevision({ listingId: listing.id, userId, reason: reason || note, fields });
+    return { id: listing.public_id, status: listing.status, changes: result.status };
+  }
 
   if (decision === "feature" || decision === "unfeature") {
     await execute("UPDATE listings SET is_featured = ? WHERE id = ?", [decision === "feature" ? 1 : 0, listing.id]);
@@ -52,11 +70,14 @@ export async function moderateListing({ identifier, decision, reason, note, user
         `UPDATE listings
             SET status = 'active', moderation_status = 'approved', rejection_reason = NULL,
                 published_at = COALESCE(published_at, NOW(3)),
-                expires_at = COALESCE(expires_at, DATE_ADD(NOW(3), INTERVAL 90 DAY))
+                expires_at = COALESCE(expires_at, DATE_ADD(NOW(3), INTERVAL 90 DAY)),
+                unpublished_by_platform_at = NULL
           WHERE id = ?`,
         [listing.id],
         connection
       );
+      // Approving the whole listing reviewed every change in it (0060).
+      await closeOpenRevision(listing.id, connection);
       await recordStatusChange(
         { listingId: listing.id, fromStatus: listing.status, toStatus: "active", userId, reason: note || "approved" },
         connection
@@ -108,6 +129,11 @@ export async function moderateListing({ identifier, decision, reason, note, user
 
   const toStatus = decision === "archive" ? "archived" : "withdrawn";
   await changeListingStatus({ listing, toStatus, reason: reason || note, userId, byPlatform: true });
+  // LivFinder taking a listing down is not the owner closing it: its page stops being served
+  // (v_reachable_listings, 0062) until it is approved again.
+  if (decision === "unpublish") {
+    await execute("UPDATE listings SET unpublished_by_platform_at = NOW(3) WHERE id = ?", [listing.id]);
+  }
   await notifyListingModeration({ listing, decision, reason: reason || note });
   return { id: listing.public_id, status: toStatus };
 }
@@ -429,7 +455,25 @@ export async function decideCategoryAccess({ accountId, organizationPublicId, us
       [accountId, definition.rootId, status, listingQuota ?? null, userId, note || null]
     );
   }
-  return { accountId: String(accountId), categoryId: definition.frontendId, status };
+  const withdrawn = decision === "revoke" ? await withdrawCategoryListings({ accountId, rootCategoryId: definition.rootId, userId }) : 0;
+  return { accountId: String(accountId), categoryId: definition.frontendId, status, listingsWithdrawn: withdrawn };
+}
+
+/**
+ * Revoking a category withdraws the account's live and waiting listings in it. Withdrawn is
+ * the owner's rule (2026-10-29): off search and lists, the page still working at its URL and in
+ * the sitemap (0062). Drafts stay drafts; they cannot be submitted without the category.
+ */
+async function withdrawCategoryListings({ accountId, rootCategoryId, userId }) {
+  const listings = await query(
+    `SELECT id, public_id, status, account_id, root_category_id FROM listings
+      WHERE account_id = ? AND root_category_id = ? AND deleted_at IS NULL AND status IN ('active', 'pending_review')`,
+    [accountId, rootCategoryId]
+  );
+  for (const listing of listings) {
+    await changeListingStatus({ listing, toStatus: "withdrawn", reason: "Category access removed", userId, byPlatform: true });
+  }
+  return listings.length;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1383,6 +1427,98 @@ export async function updateOrganizationProfile({ identifier, payload }) {
   return { id: organization.public_id, updated: true };
 }
 
+/**
+ * An individual's profile, written where an individual actually lives.
+ *
+ * `PATCH /individuals/:id` reused `updateOrganizationProfile`, which looks the identifier up in
+ * `organizations`. Individuals are never rows there — they are a `users` row owning an account,
+ * with an optional `agents` profile — so every edit came back "That company was not found." This
+ * resolves the same row `getAdminIndividual()` reads, writes names, contact details and location
+ * to `users`, and profession and bio to the person's agent profile.
+ */
+export const individualProfileSchema = z.object({
+  firstName: z.string().trim().min(1).max(120).optional(),
+  lastName: z.string().trim().min(1).max(120).optional(),
+  email: z.string().trim().toLowerCase().email().max(255).optional(),
+  phone: z.string().trim().max(40).optional().nullable(),
+  profession: z.string().trim().max(255).optional().nullable(),
+  bio: z.string().trim().max(5000).optional().nullable(),
+  countryId: z.coerce.number().int().positive().optional().nullable(),
+  cityId: z.coerce.number().int().positive().optional().nullable(),
+});
+
+export async function updateIndividualProfile({ identifier, payload }) {
+  return withTransaction(async (connection) => {
+    const user = await queryOne(
+      `SELECT u.id, u.public_id, u.first_name, u.last_name
+         FROM users u
+         JOIN account_members am ON am.user_id = u.id AND am.role = 'owner' AND am.status = 'active'
+         JOIN accounts a ON a.id = am.account_id
+         JOIN account_types at ON at.id = a.account_type_id
+        WHERE at.requires_organization = 0 AND u.deleted_at IS NULL AND (u.public_id = ? OR u.id = ?)
+        LIMIT 1`,
+      [identifier, /^\d+$/.test(String(identifier)) ? Number(identifier) : -1],
+      connection
+    );
+    if (!user) throw AppError.notFound("That individual was not found.");
+
+    if (payload.email !== undefined) {
+      const taken = await queryValue("SELECT id FROM users WHERE email_normalized = ? AND id <> ?", [payload.email, user.id], connection);
+      if (taken) throw AppError.conflict("Another account already uses that email address.");
+    }
+
+    const firstName = payload.firstName ?? user.first_name;
+    const lastName = payload.lastName ?? user.last_name;
+    const userAssignments = [];
+    const userParams = [];
+    const set = (column, value) => { userAssignments.push(`${column} = ?`); userParams.push(value); };
+    if (payload.firstName !== undefined) set("first_name", payload.firstName);
+    if (payload.lastName !== undefined) set("last_name", payload.lastName);
+    if (payload.firstName !== undefined || payload.lastName !== undefined) set("display_name", `${firstName} ${lastName}`.trim());
+    if (payload.email !== undefined) { set("email", payload.email); set("email_normalized", payload.email); }
+    if (payload.phone !== undefined) {
+      const phone = splitPhone(payload.phone);
+      set("phone_country_code", phone.countryCode);
+      set("phone_number", phone.number);
+    }
+    if (payload.countryId !== undefined) set("country_id", payload.countryId);
+    if (payload.cityId !== undefined) set("city_id", payload.cityId);
+    if (userAssignments.length) {
+      await execute(`UPDATE users SET ${userAssignments.join(", ")}, updated_at = NOW(3) WHERE id = ?`, [...userParams, user.id], connection);
+    }
+
+    // Profession and bio belong to the agent profile; names follow so the public card agrees.
+    const agentAssignments = [];
+    const agentParams = [];
+    const setAgent = (column, value) => { agentAssignments.push(`${column} = ?`); agentParams.push(value); };
+    if (payload.profession !== undefined) setAgent("title", payload.profession);
+    if (payload.bio !== undefined) setAgent("bio", payload.bio);
+    if (payload.firstName !== undefined || payload.lastName !== undefined) {
+      setAgent("first_name", firstName);
+      setAgent("last_name", lastName);
+      setAgent("display_name", `${firstName} ${lastName}`.trim());
+    }
+    if (agentAssignments.length) {
+      const result = await execute(
+        `UPDATE agents SET ${agentAssignments.join(", ")}, updated_at = NOW(3) WHERE user_id = ? AND deleted_at IS NULL`,
+        [...agentParams, user.id],
+        connection
+      );
+      // Profession and bio only exist on an agent profile. Without one they would be dropped
+      // silently, so say so; creating a profile here would also list the person publicly.
+      const wantsProfileText = Boolean(payload.profession) || Boolean(payload.bio);
+      if (!result.affectedRows && wantsProfileText) {
+        throw AppError.validation("Some information is invalid.", {
+          ...(payload.profession ? { profession: "This person has no advisor profile, so a profession cannot be saved." } : {}),
+          ...(payload.bio ? { bio: "This person has no advisor profile, so a bio cannot be saved." } : {}),
+        });
+      }
+    }
+
+    return { id: user.public_id, updated: Boolean(userAssignments.length || agentAssignments.length) };
+  });
+}
+
 export const agentSchema = z.object({
   firstName: z.string().trim().min(1).max(120),
   lastName: z.string().trim().min(1).max(120),
@@ -1500,9 +1636,20 @@ export const planSchema = z.object({
   billingInterval: z.enum(["monthly", "quarterly", "yearly", "one_time", "custom"]).optional(),
   trialDays: z.coerce.number().int().min(0).max(365).optional(),
   listingQuota: quotaField,
+  storageQuota: quotaField,
   featuredQuota: quotaField,
   agentSeatQuota: quotaField,
   leadQuota: quotaField,
+  addons: z
+    .array(
+      z.object({
+        code: z.enum(ADDON_CODES),
+        isAvailable: z.coerce.boolean().optional(),
+        amount: z.coerce.number().min(0).max(100000000).optional(),
+      })
+    )
+    .max(20)
+    .optional(),
   isActive: z.coerce.boolean().optional(),
   isPublic: z.coerce.boolean().optional(),
   sortOrder: z.coerce.number().int().min(0).max(10000).optional(),
@@ -1563,6 +1710,7 @@ export async function upsertPlan({ identifier, payload, userId }) {
       if (payload.billingInterval !== undefined) set("billing_interval", payload.billingInterval);
       if (payload.trialDays !== undefined) set("trial_days", payload.trialDays);
       if (payload.listingQuota !== undefined) set("listing_quota", payload.listingQuota);
+      if (payload.storageQuota !== undefined) set("storage_quota", payload.storageQuota);
       if (payload.featuredQuota !== undefined) set("featured_quota", payload.featuredQuota);
       if (payload.agentSeatQuota !== undefined) set("agent_seat_quota", payload.agentSeatQuota);
       if (payload.leadQuota !== undefined) set("lead_quota", payload.leadQuota);
@@ -1573,6 +1721,7 @@ export async function upsertPlan({ identifier, payload, userId }) {
         await execute(`UPDATE plans SET ${assignments.join(", ")}, updated_at = NOW(3) WHERE id = ?`, [...params, plan.id], connection);
       }
       await upsertPlanPrices(plan.id, payload.prices, connection);
+      await upsertPlanAddons(plan.id, payload.addons, connection);
       return { id: plan.public_id, updated: true };
     }
 
@@ -1584,8 +1733,8 @@ export async function upsertPlan({ identifier, payload, userId }) {
     const result = await execute(
       `INSERT INTO plans
          (public_id, code, name, slug, description, tier, billing_interval, trial_days,
-          listing_quota, featured_quota, agent_seat_quota, lead_quota, is_active, is_public, sort_order, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+          listing_quota, storage_quota, featured_quota, agent_seat_quota, lead_quota, is_active, is_public, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
       [
         publicId,
         payload.code,
@@ -1600,6 +1749,12 @@ export async function upsertPlan({ identifier, payload, userId }) {
         payload.billingInterval ?? "monthly",
         payload.trialDays ?? 0,
         payload.listingQuota ?? 0,
+        // Blank is unlimited, like the live limit; left out, it follows the owner's 2× example.
+        payload.storageQuota !== undefined
+          ? payload.storageQuota
+          : payload.listingQuota === null
+            ? null
+            : (payload.listingQuota ?? 0) * 2,
         payload.featuredQuota ?? 0,
         payload.agentSeatQuota ?? 0,
         payload.leadQuota ?? 0,
@@ -1610,6 +1765,7 @@ export async function upsertPlan({ identifier, payload, userId }) {
       connection
     );
     await upsertPlanPrices(result.insertId, payload.prices, connection);
+    await upsertPlanAddons(result.insertId, payload.addons, connection);
     return { id: publicId, planId: String(result.insertId), created: true };
   });
 }
@@ -1640,6 +1796,65 @@ export async function changeAccountPackage({ identifier, payload }) {
 
   const result = await assignPlanToAccount({ accountId: account.id, packageId: payload.packageId });
   return { id: account.public_id, ...result };
+}
+
+async function accountForAdmin(identifier) {
+  // A company (account or organization id) or an individual (the owner's user id).
+  const account = await queryOne(
+    `SELECT a.id, a.public_id FROM accounts a
+      LEFT JOIN organizations o ON o.account_id = a.id
+      WHERE a.public_id = ? OR o.public_id = ? OR o.slug = ?
+         OR a.id = (SELECT am.account_id FROM users u
+                      JOIN account_members am ON am.user_id = u.id AND am.role = 'owner' AND am.status = 'active'
+                     WHERE u.public_id = ? LIMIT 1)
+      LIMIT 1`,
+    [identifier, identifier, identifier, identifier]
+  );
+  if (!account) throw AppError.notFound("That account was not found.");
+  return account;
+}
+
+export const developmentChangesSchema = z.object({
+  decision: z.enum(["approve", "reject"]),
+  reason: z.string().trim().max(500).optional(),
+  fields: z.record(z.string().max(80), z.string().trim().max(500)).optional(),
+});
+
+/** Approve or send back a developer's changes to a published development (0061). */
+export async function decideDevelopmentChanges({ identifier, decision, reason, fields, userId }) {
+  const project = await queryOne("SELECT id, public_id FROM projects WHERE (public_id = ? OR slug = ?) AND deleted_at IS NULL", [identifier, identifier]);
+  if (!project) throw AppError.notFound("That development was not found.");
+  const result =
+    decision === "approve"
+      ? await approveProjectRevision({ projectId: project.id, userId })
+      : await rejectProjectRevision({ projectId: project.id, userId, reason, fields });
+  return { id: project.public_id, changes: result.status };
+}
+
+export const accountAddonSchema = z.object({
+  enabled: z.boolean(),
+  // Overrides the plan's price for this account; left out, the plan's price applies.
+  amount: z.coerce.number().min(0).max(100000000).optional(),
+  endsAt: z.string().datetime({ offset: true }).optional().nullable(),
+});
+
+export async function listAccountAddonsFor(identifier) {
+  const account = await accountForAdmin(identifier);
+  return listAccountAddons(account.id);
+}
+
+export async function setAccountAddon({ identifier, code, payload, userId }) {
+  const account = await accountForAdmin(identifier);
+  return payload.enabled
+    ? enableAddon({
+        accountId: account.id,
+        code,
+        userId,
+        byPlatform: true,
+        amount: payload.amount ?? null,
+        endsAt: payload.endsAt ? new Date(payload.endsAt) : null,
+      })
+    : disableAddon({ accountId: account.id, code });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1683,7 +1898,7 @@ const enumIn = (allowed, label) =>
       message: `${label} must be one of: ${allowed.join(", ")}.`,
     });
 
-const DEVELOPMENT_LIFECYCLE = [
+export const DEVELOPMENT_LIFECYCLE = [
   "announced",
   "presale",
   "under_construction",
@@ -1692,9 +1907,9 @@ const DEVELOPMENT_LIFECYCLE = [
   "on_hold",
   "cancelled",
 ];
-const DEVELOPMENT_LAUNCH = ["coming_soon", "upcoming", "launched", "sold_out"];
+export const DEVELOPMENT_LAUNCH = ["coming_soon", "upcoming", "launched", "sold_out"];
 const DEVELOPMENT_MODERATION = ["draft", "pending", "published", "rejected", "archived"];
-const DEVELOPMENT_PROJECT_TYPES = [
+export const DEVELOPMENT_PROJECT_TYPES = [
   "residential",
   "commercial",
   "mixed_use",
@@ -1702,8 +1917,8 @@ const DEVELOPMENT_PROJECT_TYPES = [
   "branded_residence",
   "master_community",
 ];
-const DEVELOPMENT_OWNERSHIP = ["freehold", "leasehold", "commonhold", "usufruct", "musataha", "other", "unknown"];
-const DEVELOPMENT_UNIT_TYPES = [
+export const DEVELOPMENT_OWNERSHIP = ["freehold", "leasehold", "commonhold", "usufruct", "musataha", "other", "unknown"];
+export const DEVELOPMENT_UNIT_TYPES = [
   "apartment",
   "penthouse",
   "duplex",
@@ -1719,9 +1934,9 @@ const DEVELOPMENT_UNIT_TYPES = [
   "whole_building",
   "other",
 ];
-const DEVELOPMENT_AVAILABILITY = ["available", "limited", "sold_out", "coming_soon"];
-const PAYMENT_PLAN_TYPES = ["construction_linked", "time_linked", "post_handover", "cash", "custom"];
-const MILESTONE_TRIGGERS = [
+export const DEVELOPMENT_AVAILABILITY = ["available", "limited", "sold_out", "coming_soon"];
+export const PAYMENT_PLAN_TYPES = ["construction_linked", "time_linked", "post_handover", "cash", "custom"];
+export const MILESTONE_TRIGGERS = [
   "booking",
   "contract",
   "construction_percent",
@@ -1797,7 +2012,7 @@ const paymentPlanSchema = z.object({
   milestones: z.array(milestoneSchema).max(40).optional(),
 });
 
-const mediaRefSchema = z.object({
+export const mediaRefSchema = z.object({
   mediaAssetId: z.string().trim().min(1).max(64),
   caption: z.string().trim().max(500).optional().nullable(),
   isPrimary: z.boolean().optional(),
@@ -2367,7 +2582,14 @@ export async function upsertDevelopment({ identifier, payload, userId }) {
      * project or leave two URLs claiming it. `sp_rebuild_project_canonical_path`
      * is the only writer of that column, so this is the one call site.
      */
-    await callProcedure("sp_rebuild_project_canonical_path", [project.id], connection);
+    // An admin's decision on the whole development (unpublish, reject, back to draft) closes any
+    // open revision of the developer's changes (0061).
+    if (payload.moderationStatus !== undefined && payload.moderationStatus !== "published") {
+      await closeOpenProjectRevision(project.id, connection);
+    }
+    // While a developer's changes wait for approval the URL stays put; approving rebuilds it.
+    const pending = await queryValue("SELECT pending_revision_id FROM projects WHERE id = ?", [project.id], connection);
+    if (!pending) await callProcedure("sp_rebuild_project_canonical_path", [project.id], connection);
     return { id: project.id, publicId: project.public_id, created: !identifier };
   });
 
@@ -2404,6 +2626,7 @@ export async function archiveDevelopment({ identifier }) {
     "UPDATE projects SET deleted_at = NOW(3), is_publicly_visible = 0, moderation_status = 'archived' WHERE id = ?",
     [project.id]
   );
+  await closeOpenProjectRevision(project.id);
   // Out of the projection immediately: an archived project has no public page,
   // and leaving the row would keep it in results and in the sitemap.
   await callProcedure("sp_refresh_project_search", [project.id]);

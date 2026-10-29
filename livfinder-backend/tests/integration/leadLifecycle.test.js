@@ -34,6 +34,9 @@ async function ownerForCategory(categoryId) {
        JOIN accounts a ON a.id = am.account_id AND a.status = 'active'
        JOIN account_category_access aca ON aca.account_id = a.id AND aca.status = 'approved' AND aca.category_id = ?
       WHERE u.status = 'active' AND u.deleted_at IS NULL
+        -- Room under both plan limits (0059), so creating the test listing is not refused.
+        AND (a.listing_quota IS NULL OR a.listing_used + 5 < a.listing_quota)
+        AND (a.storage_quota IS NULL OR a.storage_used + 5 < a.storage_quota)
       ORDER BY u.id LIMIT 1`,
     [categoryId]
   );

@@ -205,6 +205,8 @@ export async function serializeSession(userId, { sessionId = null, activeAccount
       }),
       listingQuota: membership.listing_quota === null ? null : Number(membership.listing_quota),
       listingUsed: Number(membership.listing_used || 0),
+      storageQuota: membership.storage_quota == null ? null : Number(membership.storage_quota),
+      storageUsed: Number(membership.storage_used || 0),
       createdAt: isoDate(accountRow?.created_at),
       updatedAt: isoDate(accountRow?.updated_at),
     };

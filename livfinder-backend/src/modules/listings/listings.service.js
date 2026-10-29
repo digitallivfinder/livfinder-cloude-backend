@@ -1,6 +1,7 @@
 import { query, queryOne, queryValue, execute } from "../../db/query.js";
 import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
+import { ownAgentClause } from "../../utils/tenantScope.js";
 import { ulid } from "../../utils/ids.js";
 import { slugify } from "../../utils/slug.js";
 import { resolveCategory, categoryByRootId } from "../../utils/categories.js";
@@ -10,6 +11,7 @@ import { sanitizeDescription } from "../../utils/richText.js";
 import { DETAIL_SCHEMAS } from "./listings.schemas.js";
 import { refreshListingSearch, recordStatusChange, nextReference } from "./listings.repository.js";
 import { attachAssetToListing, syncListingMediaCounters } from "../media/listingMedia.service.js";
+import { beginOwnerChange, closeOpenRevision } from "./listingRevisions.service.js";
 import { resolveAssetRef } from "../media/media.service.js";
 
 /**
@@ -393,26 +395,34 @@ async function baseCurrencyAmount(price, currencyCode, executor) {
 }
 
 /**
- * Plan allowance usage.
+ * Plan limits (migration 0059).
  *
- * A listing occupies a slot while it is draft, pending review, live or rejected (awaiting a
- * fix); archived, withdrawn, sold, rented, expired or deleted listings free it. Usage is
- * recomputed from the rows on every change instead of being counted up: the old counter was
- * only ever incremented, so nothing ever freed a slot and 47 accounts drifted — one owner read
- * 500/500 "allowance used" while owning 26 listings. Migration 0052 brought existing accounts
- * into line; the per-category figure (`account_category_access`) follows the same rule.
+ * Two limits, both set by an admin per plan and mirrored onto the account:
+ *
+ *   live      `listing_quota` / `listing_used`: listings live or waiting for approval. Waiting
+ *             counts, so an account cannot queue more than its plan can show.
+ *   storage   `storage_quota` / `storage_used`: every listing the account still holds, so
+ *             everything except archived (and deleted) ones.
+ *
+ * NULL is "unlimited" for both. An optional live cap per category sits on
+ * `account_category_access.listing_quota`. Listings beyond the live limit stay unpublished in
+ * the portal; the owner picks which ones go live.
+ *
+ * Usage is recomputed from the rows on every change, never counted up: the old counter was
+ * only ever incremented and drifted to 500/500 on an account with 26 listings (0052).
  */
-export const LISTING_SLOT_STATUSES = ["draft", "pending_review", "active", "rejected"];
+export const LIVE_LIMIT_STATUSES = ["pending_review", "active"];
 
 export async function syncAccountListingUsage(accountId, connection) {
   if (!accountId) return;
-  const slots = LISTING_SLOT_STATUSES.map(() => "?").join(", ");
   await execute(
     `UPDATE accounts
         SET listing_used = (SELECT COUNT(*) FROM listings
-                             WHERE account_id = ? AND deleted_at IS NULL AND status IN (${slots}))
+                             WHERE account_id = ? AND deleted_at IS NULL AND status IN ('pending_review', 'active')),
+            storage_used = (SELECT COUNT(*) FROM listings
+                             WHERE account_id = ? AND deleted_at IS NULL AND status <> 'archived')
       WHERE id = ?`,
-    [accountId, ...LISTING_SLOT_STATUSES, accountId],
+    [accountId, accountId, accountId],
     connection
   );
   await execute(
@@ -421,11 +431,74 @@ export async function syncAccountListingUsage(accountId, connection) {
         SET aca.listing_used = (SELECT COUNT(*) FROM listings l
                                  WHERE l.account_id = aca.account_id
                                    AND l.root_category_id = COALESCE(c.root_category_id, c.id)
-                                   AND l.deleted_at IS NULL AND l.status IN (${slots}))
+                                   AND l.deleted_at IS NULL AND l.status IN ('pending_review', 'active'))
       WHERE aca.account_id = ? AND COALESCE(c.root_category_id, c.id) <> 7`,
-    [...LISTING_SLOT_STATUSES, accountId],
+    [accountId],
     connection
   );
+}
+
+const UPGRADE_HINT = "Upgrade your plan to add more.";
+
+/** Throws when the account already holds as many listings as its plan stores. */
+export async function assertStorageAvailable(accountId, connection) {
+  if (!accountId) return;
+  const row = await queryOne(
+    `SELECT a.storage_quota,
+            (SELECT COUNT(*) FROM listings l
+              WHERE l.account_id = a.id AND l.deleted_at IS NULL AND l.status <> 'archived') AS used
+       FROM accounts a WHERE a.id = ?`,
+    [accountId],
+    connection
+  );
+  if (row && row.storage_quota !== null && Number(row.used) >= Number(row.storage_quota)) {
+    throw new AppError(`Your plan allows ${row.storage_quota} listings in total. ${UPGRADE_HINT}`, {
+      status: 409,
+      code: "STORAGE_LIMIT_REACHED",
+    });
+  }
+}
+
+/**
+ * Throws when one more listing live or waiting for approval would pass the account's live
+ * limit, or the live cap of its category. Called when an owner submits a listing that does not
+ * yet count (draft, rejected, expired, withdrawn); a moderator's own moves skip it.
+ */
+export async function assertLiveSlotAvailable({ accountId, rootCategoryId }, connection) {
+  if (!accountId) return;
+  const row = await queryOne(
+    `SELECT a.listing_quota,
+            (SELECT COUNT(*) FROM listings l
+              WHERE l.account_id = a.id AND l.deleted_at IS NULL AND l.status IN ('pending_review', 'active')) AS used
+       FROM accounts a WHERE a.id = ?`,
+    [accountId],
+    connection
+  );
+  if (row && row.listing_quota !== null && Number(row.used) >= Number(row.listing_quota)) {
+    throw new AppError(`Your plan allows ${row.listing_quota} live listings. ${UPGRADE_HINT}`, {
+      status: 409,
+      code: "LIVE_LIMIT_REACHED",
+    });
+  }
+  if (!rootCategoryId) return;
+  const category = await queryOne(
+    `SELECT aca.listing_quota, c.name,
+            (SELECT COUNT(*) FROM listings l
+              WHERE l.account_id = aca.account_id AND l.root_category_id = ? AND l.deleted_at IS NULL
+                AND l.status IN ('pending_review', 'active')) AS used
+       FROM account_category_access aca
+       JOIN categories c ON c.id = aca.category_id
+      WHERE aca.account_id = ? AND COALESCE(c.root_category_id, c.id) = ? AND aca.listing_quota IS NOT NULL
+      LIMIT 1`,
+    [rootCategoryId, accountId, rootCategoryId],
+    connection
+  );
+  if (category && Number(category.used) >= Number(category.listing_quota)) {
+    throw new AppError(`Your account allows ${category.listing_quota} live listings in ${category.name}. ${UPGRADE_HINT}`, {
+      status: 409,
+      code: "CATEGORY_LIVE_LIMIT_REACHED",
+    });
+  }
 }
 
 export async function syncAccountListingUsageForListing(listingId, connection, { previousAgentId = null } = {}) {
@@ -474,6 +547,8 @@ export async function createListing({ payload, accountId, userId, organizationId
 
   return withTransaction(async (connection) => {
     const { categoryId, rootCategoryId } = await resolveCategoryRow(definition, payload.categorySlug, connection);
+    await assertStorageAvailable(accountId, connection);
+    if (payload.status === "pending_review") await assertLiveSlotAvailable({ accountId, rootCategoryId }, connection);
     const purposeId = await resolvePurposeId(payload.purpose, connection);
     const brandInfo = await resolveBrandAndModel({ definition, brand: payload.brand, model: payload.model }, connection);
     const location = await resolveLocationChain(payload.locationId, connection);
@@ -488,8 +563,8 @@ export async function createListing({ payload, accountId, userId, organizationId
     let resolvedAgentId = null;
     if (payload.agentId) {
       const agentRow = await queryOne(
-        "SELECT id FROM agents WHERE (public_id = ? OR id = ?) AND organization_id <=> ? AND deleted_at IS NULL LIMIT 1",
-        [String(payload.agentId), /^\d+$/.test(String(payload.agentId)) ? Number(payload.agentId) : 0, organizationId ?? null],
+        `SELECT id FROM agents WHERE (public_id = ? OR id = ?) AND ${ownAgentClause({ organizationId, userId }).sql} AND deleted_at IS NULL LIMIT 1`,
+        [String(payload.agentId), /^\d+$/.test(String(payload.agentId)) ? Number(payload.agentId) : 0, ...ownAgentClause({ organizationId, userId }).params],
         connection
       );
       if (!agentRow) throw AppError.validation("Some information is invalid.", { agentId: "That agent is not on this account." });
@@ -720,8 +795,8 @@ export async function updateListing({ listing, payload, userId, accountId, organ
       if (payload.agentId === null) set("agent_id", null);
       else {
         const agentRow = await queryOne(
-          "SELECT id FROM agents WHERE (public_id = ? OR id = ?) AND organization_id <=> ? AND deleted_at IS NULL LIMIT 1",
-          [String(payload.agentId), /^\d+$/.test(String(payload.agentId)) ? Number(payload.agentId) : 0, organizationId ?? null],
+          `SELECT id FROM agents WHERE (public_id = ? OR id = ?) AND ${ownAgentClause({ organizationId, userId }).sql} AND deleted_at IS NULL LIMIT 1`,
+          [String(payload.agentId), /^\d+$/.test(String(payload.agentId)) ? Number(payload.agentId) : 0, ...ownAgentClause({ organizationId, userId }).params],
           connection
         );
         if (!agentRow) throw AppError.validation("Some information is invalid.", { agentId: "That agent is not on this account." });
@@ -761,47 +836,11 @@ export async function updateListing({ listing, payload, userId, accountId, organ
       await syncListingMediaCounters(listing.id, connection);
     }
 
-    // Title, location or brand changing means the canonical URL changes too;
-    // the column is the single source of that URL, so it is rewritten here.
+    // Title, location or brand changing means the canonical URL changes too. While a live
+    // listing's changes wait for approval the URL stays put; approving rewrites it (0060).
     if (payload.title !== undefined || location || brandInfo) {
-      const current = await queryOne(
-        `SELECT l.id, l.title, l.root_category_id,
-                co.slug AS country_slug, st.slug AS state_slug, ct.slug AS city_slug,
-                cm.slug AS community_slug, sc.slug AS sub_community_slug,
-                br.slug AS brand_slug, bm.slug AS brand_model_slug,
-                COALESCE(veh.model_year, mar.build_year, av.year_built, tp.year_of_production) AS year_value
-           FROM listings l
-           LEFT JOIN locations co ON co.id = l.country_id
-           LEFT JOIN locations st ON st.id = l.state_id
-           LEFT JOIN locations ct ON ct.id = l.city_id
-           LEFT JOIN locations cm ON cm.id = l.community_id
-           LEFT JOIN locations sc ON sc.id = l.sub_community_id
-           LEFT JOIN brands br ON br.id = l.brand_id
-           LEFT JOIN brand_models bm ON bm.id = l.brand_model_id
-           LEFT JOIN listing_vehicle veh ON veh.listing_id = l.id
-           LEFT JOIN listing_marine mar ON mar.listing_id = l.id
-           LEFT JOIN listing_aviation av ON av.listing_id = l.id
-           LEFT JOIN listing_timepiece tp ON tp.listing_id = l.id
-          WHERE l.id = ?`,
-        [listing.id],
-        connection
-      );
-      const slug = await uniqueListingSlug(current.title, listing.id, connection);
-      const canonicalPath = buildCanonicalPath({
-        rootCategoryId: current.root_category_id,
-        slug,
-        location: {
-          country: current.country_slug,
-          state: current.state_slug,
-          city: current.city_slug,
-          community: current.community_slug,
-          subCommunity: current.sub_community_slug,
-        },
-        brandSlug: current.brand_slug,
-        modelSlug: current.brand_model_slug,
-        year: current.year_value,
-      });
-      await execute("UPDATE listings SET slug = ?, canonical_path = ? WHERE id = ?", [slug, canonicalPath, listing.id], connection);
+      const pending = await queryValue("SELECT pending_revision_id FROM listings WHERE id = ?", [listing.id], connection);
+      if (!pending) await rewriteCanonicalPath(listing.id, connection);
     }
   });
 
@@ -811,6 +850,48 @@ export async function updateListing({ listing, payload, userId, accountId, organ
   }
   await refreshListingSearch(listing.id);
   return true;
+}
+
+/** Rewrites a listing's slug and canonical path from its title, location, brand and year. */
+export async function rewriteCanonicalPath(listingId, connection) {
+  const current = await queryOne(
+    `SELECT l.id, l.title, l.root_category_id,
+            co.slug AS country_slug, st.slug AS state_slug, ct.slug AS city_slug,
+            cm.slug AS community_slug, sc.slug AS sub_community_slug,
+            br.slug AS brand_slug, bm.slug AS brand_model_slug,
+            COALESCE(veh.model_year, mar.build_year, av.year_built, tp.year_of_production) AS year_value
+       FROM listings l
+       LEFT JOIN locations co ON co.id = l.country_id
+       LEFT JOIN locations st ON st.id = l.state_id
+       LEFT JOIN locations ct ON ct.id = l.city_id
+       LEFT JOIN locations cm ON cm.id = l.community_id
+       LEFT JOIN locations sc ON sc.id = l.sub_community_id
+       LEFT JOIN brands br ON br.id = l.brand_id
+       LEFT JOIN brand_models bm ON bm.id = l.brand_model_id
+       LEFT JOIN listing_vehicle veh ON veh.listing_id = l.id
+       LEFT JOIN listing_marine mar ON mar.listing_id = l.id
+       LEFT JOIN listing_aviation av ON av.listing_id = l.id
+       LEFT JOIN listing_timepiece tp ON tp.listing_id = l.id
+      WHERE l.id = ?`,
+    [listingId],
+    connection
+  );
+  const slug = await uniqueListingSlug(current.title, listingId, connection);
+  const canonicalPath = buildCanonicalPath({
+    rootCategoryId: current.root_category_id,
+    slug,
+    location: {
+      country: current.country_slug,
+      state: current.state_slug,
+      city: current.city_slug,
+      community: current.community_slug,
+      subCommunity: current.sub_community_slug,
+    },
+    brandSlug: current.brand_slug,
+    modelSlug: current.brand_model_slug,
+    year: current.year_value,
+  });
+  await execute("UPDATE listings SET slug = ?, canonical_path = ? WHERE id = ?", [slug, canonicalPath, listingId], connection);
 }
 
 /**
@@ -841,6 +922,10 @@ export async function changeListingStatus({ listing, toStatus, reason, userId, b
     if (!allowed.includes(toStatus)) {
       throw AppError.conflict(`A listing that is ${fromStatus.replace("_", " ")} cannot be moved to ${toStatus.replace("_", " ")}.`);
     }
+    // Submitting a listing that does not yet count toward the live limit takes a live slot.
+    if (LIVE_LIMIT_STATUSES.includes(toStatus) && !LIVE_LIMIT_STATUSES.includes(fromStatus)) {
+      await assertLiveSlotAvailable({ accountId: listing.account_id, rootCategoryId: listing.root_category_id });
+    }
   }
 
   await withTransaction(async (connection) => {
@@ -849,6 +934,7 @@ export async function changeListingStatus({ listing, toStatus, reason, userId, b
     if (toStatus === "pending_review") extra.push("moderation_status = 'pending'");
     if (toStatus === "active") {
       extra.push("moderation_status = 'approved'");
+      extra.push("unpublished_by_platform_at = NULL");
       extra.push("published_at = COALESCE(published_at, NOW(3))");
       extra.push("expires_at = COALESCE(expires_at, DATE_ADD(NOW(3), INTERVAL 90 DAY))");
     }
@@ -861,6 +947,11 @@ export async function changeListingStatus({ listing, toStatus, reason, userId, b
       connection
     );
     await recordStatusChange({ listingId: listing.id, fromStatus, toStatus, userId, reason }, connection);
+    // A moderator publishing the whole listing reviewed every change in it; an archived listing
+    // has nothing left to review.
+    if ((toStatus === "active" && fromStatus !== "active") || toStatus === "archived") {
+      await closeOpenRevision(listing.id, connection);
+    }
     // A real-estate listing going in or out of `active` moves its unit's active counter.
     await syncUnitListingCountersForListing(listing.id, connection);
     // Archive, withdraw, sold/rented and expiry free an allowance slot; a resubmission takes one.
@@ -872,45 +963,30 @@ export async function changeListingStatus({ listing, toStatus, reason, userId, b
 }
 
 /**
- * An owner's change to a live listing sends it back to moderation.
+ * An owner's change to a live listing waits for a moderator (0060).
  *
- * Approval covers the version a moderator looked at. Once the owner changes anything — text,
- * price, specs, a photo, a document, the photo order — the live page would be showing content
- * nobody reviewed, so the listing leaves the public site and returns to `pending_review` until
- * it is approved again. A moderator's own edit is not an owner change and never comes here.
+ * Approval covers the version a moderator looked at. Once the owner changes anything (text,
+ * price, specs, a photo, a document, the photo order) the change goes to the queue, while the
+ * public site keeps showing the approved version until it is approved. Call this BEFORE the
+ * change is applied: it captures the approved page first. A moderator's own edit is not an owner
+ * change and never comes here.
  */
-export async function sendBackForReview({ listingId, userId, reason = "Changed by the owner after approval" }) {
-  const current = await queryOne("SELECT id, status FROM listings WHERE id = ? AND deleted_at IS NULL", [listingId]);
-  if (!current || current.status !== "active") return { changed: false };
-  await withTransaction(async (connection) => {
-    await execute(
-      `UPDATE listings
-          SET status = 'pending_review', moderation_status = 'pending', rejection_reason = NULL
-        WHERE id = ? AND status = 'active'`,
-      [listingId],
-      connection
-    );
-    await recordStatusChange({ listingId, fromStatus: "active", toStatus: "pending_review", userId, reason }, connection);
-    // Leaving `active` moves a real-estate unit's active counter, and the agent's and organisation's.
-    await syncUnitListingCountersForListing(listingId, connection);
-    await syncAccountListingUsageForListing(listingId, connection);
-  });
-  await refreshListingSearch(listingId);
-  return { changed: true, fromStatus: "active", toStatus: "pending_review" };
+export async function holdOwnerChange({ listingId, userId, reason = "Changed by the owner after approval" }) {
+  const revisionId = await beginOwnerChange({ listingId, userId, change: reason });
+  return { changed: false, pendingRevision: Boolean(revisionId) };
 }
 
 /**
  * What an owner's edit does to the listing's status.
  *
- * A live listing goes back for review. Any other listing takes the status the edit form asked
+ * A live listing keeps its status: the change itself waits as a pending revision (see
+ * `holdOwnerChange`, called before the edit). Any other listing takes the status the edit form asked
  * for ("Save draft" / "Submit for review") where the portal may make that move. The form always
  * sent it and the update ignored it, so "Submit for review" on an edited rejected listing never
  * actually resubmitted it.
  */
 export async function applyOwnerEditStatus({ listing, requestedStatus, edited, userId }) {
-  if (listing.status === "active") {
-    return edited ? sendBackForReview({ listingId: listing.id, userId }) : { changed: false };
-  }
+  if (listing.status === "active") return { changed: false };
   if (!requestedStatus || requestedStatus === listing.status) return { changed: false };
   if (!(PORTAL_TRANSITIONS[listing.status] || []).includes(requestedStatus)) return { changed: false };
   return changeListingStatus({ listing, toStatus: requestedStatus, reason: "Changed with an edit by the owner", userId });

@@ -9,6 +9,8 @@ import { AppError } from "../../utils/errors.js";
 import { detailResponse, listResponse } from "../../utils/http.js";
 import { ensureImportConnection } from "../imports/importConnection.js";
 import * as repo from "../imports/imports.repository.js";
+import { getAccountFeed, requestRun } from "../feeds/feedSources.repository.js";
+import { mountPartnerLeads } from "../leads/leads.routes.js";
 import { MAX_BULK_LISTINGS, createBulkImport, runSingleImport, runWithdrawal } from "../imports/importRunner.js";
 import {
   findImportedListing,
@@ -229,6 +231,27 @@ router.delete(
     }
   })
 );
+
+/**
+ * "My feed changed": the company's system calls this after updating its file, and LivFinder
+ * fetches it within a minute instead of waiting for the next scheduled run (0063).
+ */
+router.post(
+  "/feeds/:category/refresh",
+  ...signedIn("listings:write"),
+  asyncHandler(async (req, res) => {
+    const feed = await getAccountFeed(req.apiClient.accountId, String(req.params.category));
+    if (!feed) throw AppError.notFound(`There is no ${req.params.category} feed on this account. Set one up in the portal first.`);
+    if (feed.status !== "active") throw AppError.conflict(`The ${feed.category} feed is ${feed.status}. Turn it back on in the portal first.`);
+    const { at } = await requestRun(feed.id);
+    return res.status(202).json(
+      detailResponse({ category: feed.category, queued: true, fetchAfter: at, message: "The feed will be fetched at the next opportunity (at most once every 2 minutes)." })
+    );
+  })
+);
+
+// The lead feed (Phase 6).
+mountPartnerLeads(router, signedIn);
 
 router.use((req, res, next) => next(AppError.notFound("No partner API route matches this request.")));
 

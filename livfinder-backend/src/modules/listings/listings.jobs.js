@@ -40,18 +40,23 @@ export async function refreshStaleProjections({ limit = 500 } = {}) {
     `SELECT s.listing_id
        FROM listing_search s JOIN listings l ON l.id = s.listing_id
       WHERE s.source_updated_at < l.updated_at
+        -- A listing with changes waiting for approval keeps its approved row (0060).
+        AND l.pending_revision_id IS NULL
       LIMIT ${Number(limit)}`
   );
   for (const row of stale) await refreshListingSearch(row.listing_id);
   return stale.length;
 }
 
-/** `sitemap_entries` is seeded, never rebuilt; entries for listings no longer public go. */
+/**
+ * `sitemap_entries` is seeded, never rebuilt; entries for listings whose page no longer works go.
+ * Sold, rented and withdrawn pages still work (v_reachable_listings, 0062), so they stay.
+ */
 export async function pruneSitemapEntries() {
   const result = await execute(
     `DELETE FROM sitemap_entries
       WHERE entity_type = 'listing'
-        AND entity_id NOT IN (SELECT id FROM v_public_listings)`
+        AND entity_id NOT IN (SELECT id FROM v_reachable_listings)`
   );
   return result?.affectedRows ?? 0;
 }

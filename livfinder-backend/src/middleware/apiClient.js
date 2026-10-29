@@ -7,6 +7,7 @@ import { execute, queryOne } from "../db/query.js";
 import { AppError } from "../utils/errors.js";
 import { sha256 } from "../utils/ids.js";
 import { importProviderId } from "../modules/imports/importConnection.js";
+import { assertAddonActive } from "../modules/accounts/addons.service.js";
 
 /**
  * API-key authentication for the partner API (`/v1/partner/*`).
@@ -21,7 +22,8 @@ import { importProviderId } from "../modules/imports/importConnection.js";
  * The first four answer the same 401, so a caller cannot tell which of them failed.
  */
 
-export const API_SCOPES = Object.freeze(["listings:read", "listings:write"]);
+// `leads:read` (Phase 6) reads the account's lead feed.
+export const API_SCOPES = Object.freeze(["listings:read", "listings:write", "leads:read"]);
 
 // `listings:write` covers reading back what was written.
 const IMPLIED = { "listings:write": ["listings:read"] };
@@ -157,6 +159,8 @@ export function requireApiClient(scope) {
       if (scope && !scopesGrant(row.scopes, scope)) {
         throw new AppError(`This API key does not have the "${scope}" scope.`, { status: 403, code: "SCOPE_MISSING" });
       }
+      // The listing API is part of the Integrations add-on; while it is off, keys stop working.
+      await assertAddonActive(row.account_id, "integrations");
 
       execute(
         `UPDATE api_clients SET last_used_at = NOW(3)

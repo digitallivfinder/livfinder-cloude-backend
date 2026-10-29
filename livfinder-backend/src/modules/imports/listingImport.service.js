@@ -12,8 +12,8 @@ import { DETAIL_SCHEMAS, createListingSchema, updateListingSchema } from "../lis
 import * as listingsService from "../listings/listings.service.js";
 import { resolveCountryByCode, resolveLocation } from "../locations/locations.repository.js";
 import { MAX_IMAGE_BYTES, storeImage } from "../media/media.service.js";
+import { findMapping, recordUnmapped } from "../feeds/valueMappings.js";
 import { removeListingMedia, reorderListingMedia } from "../media/listingMedia.service.js";
-import { assertCategoryAccess } from "../portal/organization.service.js";
 import { recordAudit } from "../system/audit.service.js";
 
 /**
@@ -31,7 +31,6 @@ export const IMPORT_CATEGORIES = ["real-estate", "cars", "yachts", "jets", "heli
 export const MAX_IMAGES_PER_LISTING = 30;
 const IMAGE_TIMEOUT_MS = 20_000;
 const IMAGE_CONCURRENCY = 4;
-const SLOT_STATUSES = new Set(listingsService.LISTING_SLOT_STATUSES);
 const CLOSED_STATUSES = new Set(["sold", "rented", "archived"]);
 
 const text = (max) => z.string().trim().max(max);
@@ -151,6 +150,10 @@ async function resolvePropertyType(definition, value) {
     [definition.rootId, value, slug, value]
   );
   if (row) return row.code;
+  // A type an admin mapped from a company's own word (Phase 5); otherwise it joins their queue.
+  const mapped = await findMapping({ type: "category", value, scope: definition.rootId });
+  if (mapped?.value) return mapped.value;
+  await recordUnmapped({ type: "category", value, scope: definition.rootId, label: `${value} (${definition.label})` });
   const allowed = await query(
     "SELECT code FROM categories WHERE root_category_id = ? AND id <> ? AND deleted_at IS NULL ORDER BY sort_order, code LIMIT 40",
     [definition.rootId, definition.rootId]
@@ -184,7 +187,7 @@ async function findCountry(value) {
 }
 
 /** `location.id` (ours), or names walked down from the country. Returns our numeric location id. */
-async function resolveImportLocation(location) {
+export async function resolveImportLocation(location) {
   if (!location) {
     throw importValidationError({ location: "Give the listing's location, at least its country and city." });
   }
@@ -226,21 +229,31 @@ async function resolveImportLocation(location) {
         LIMIT 1`,
       [...step.levels, slugify(value), value, ...params]
     );
-    if (!row) {
+    // A place an admin mapped from the company's own name for it (Phase 5), within the same parent.
+    const mapped = row ? null : await findMapping({ type: "location", value, scope: current.id });
+    const match = row || (mapped?.id ? await queryOne("SELECT id, level, name FROM locations WHERE id = ? AND deleted_at IS NULL", [mapped.id]) : null);
+    if (!match) {
+      await recordUnmapped({ type: "location", value, scope: current.id, label: `${value} (${step.label} in ${current.name})` });
       throw new AppError("This listing uses a value LivFinder does not recognise.", {
         status: 422,
         code: "UNMAPPED_VALUE",
-        fields: { [`location.${step.key}`]: `No ${step.label} named "${value}" was found in ${current.name}.` },
+        fields: {
+          [`location.${step.key}`]: `No ${step.label} named "${value}" was found in ${current.name}. LivFinder has been asked to map it; the listing goes through on a later run.`,
+        },
       });
     }
-    chain[step.key === "subCommunity" ? "community" : step.key] = row.id;
-    current = row;
+    chain[step.key === "subCommunity" ? "community" : step.key] = match.id;
+    current = match;
   }
   return current.id;
 }
 
 async function resolveAgent(organizationId, email, warnings) {
   if (!email) return null;
+  if (!organizationId) {
+    warnings.push("Agents belong to companies; agentEmail was ignored for this account.");
+    return null;
+  }
   const row = await queryOne(
     `SELECT id FROM agents
       WHERE organization_id = ? AND LOWER(email) = LOWER(?) AND deleted_at IS NULL
@@ -273,7 +286,7 @@ async function downloadImage(url) {
  * Fetches each URL once per company: a URL already imported for this connection reuses its
  * stored asset, so a re-push does not download unchanged photographs again.
  */
-async function importImages({ urls, ctx, accountId, userId }) {
+export async function importImages({ urls, ctx, accountId, userId }) {
   const results = new Array(urls.length);
   let next = 0;
   const worker = async () => {
@@ -344,19 +357,9 @@ async function withAccountLock(accountId, work) {
   }
 }
 
-async function assertSlotAvailable(accountId) {
-  const account = await queryOne("SELECT listing_quota, listing_used FROM accounts WHERE id = ?", [accountId]);
-  if (account && account.listing_quota !== null && Number(account.listing_used) >= Number(account.listing_quota)) {
-    throw new AppError("This company has used its listing allowance. Upgrade the plan or withdraw listings to add more.", {
-      status: 409,
-      code: "QUOTA_EXCEEDED",
-    });
-  }
-}
-
 async function findReference(ctx, externalId) {
   return queryOne(
-    `SELECT er.id AS reference_id, er.payload_hash, er.entity_id AS listing_id
+    `SELECT er.id AS reference_id, er.payload_hash, er.remote_status, er.entity_id AS listing_id
        FROM external_references er
       WHERE er.provider_id = ? AND er.connection_id = ? AND er.entity_type = 'listing' AND er.external_id = ?
       LIMIT 1`,
@@ -405,11 +408,23 @@ async function buildPayload({ record, definition, client }) {
     if (!parsed.success) throw importValidationError(fieldsFromIssues(parsed.error.issues, "detail."));
   }
 
-  const [categorySlug, locationId, agentId] = await Promise.all([
+  // Settled together, so a listing with an unknown type and an unknown place reports both at once.
+  const settled = await Promise.allSettled([
     resolvePropertyType(definition, record.propertyType),
     resolveImportLocation(record.location),
     resolveAgent(client.organizationId, record.agentEmail, warnings),
   ]);
+  const failures = settled.filter((result) => result.status === "rejected").map((result) => result.reason);
+  if (failures.length) {
+    const fieldErrors = failures.filter((error) => error instanceof AppError && error.status === 422 && error.fields);
+    if (fieldErrors.length !== failures.length) throw failures.find((error) => !fieldErrors.includes(error));
+    throw new AppError(fieldErrors[0].message, {
+      status: 422,
+      code: fieldErrors.some((error) => error.code === "UNMAPPED_VALUE") ? "UNMAPPED_VALUE" : fieldErrors[0].code,
+      fields: Object.assign({}, ...fieldErrors.map((error) => error.fields)),
+    });
+  }
+  const [categorySlug, locationId, agentId] = settled.map((result) => result.value);
 
   const payload = {
     category: definition.dbCode,
@@ -519,23 +534,26 @@ export async function importListing({ client, ctx, record, source = "api", impor
       });
     }
 
-    try {
-      await assertCategoryAccess({ organizationId: client.organizationId, category: definition.dbCode });
-    } catch (error) {
-      if (error instanceof AppError && error.status === 403) {
-        throw new AppError(`This company is not approved to list in ${definition.label}.`, {
-          status: 403,
-          code: "CATEGORY_NOT_APPROVED",
-          fields: { category: "Ask LivFinder to approve this category for the company first." },
-        });
-      }
-      throw error;
+    // By account, so an individual's feed (no organization) is held to the same rule (0063).
+    const approved = await queryValue(
+      `SELECT aca.id FROM account_category_access aca JOIN categories c ON c.id = aca.category_id
+        WHERE aca.account_id = ? AND COALESCE(c.root_category_id, c.id) = ? AND aca.status = 'approved' LIMIT 1`,
+      [client.accountId, definition.rootId]
+    );
+    if (!approved) {
+      throw new AppError(`This account is not approved to list in ${definition.label}.`, {
+        status: 403,
+        code: "CATEGORY_NOT_APPROVED",
+        fields: { category: "Ask LivFinder to approve this category for the account first." },
+      });
     }
 
     const { payload, warnings } = await buildPayload({ record, definition, client });
-    const desiredStatus = record.status || "pending_review";
-    const takesNewSlot = !listing || (!SLOT_STATUSES.has(listing.status) && !CLOSED_STATUSES.has(listing.status));
-    if (takesNewSlot) await assertSlotAvailable(client.accountId);
+    // A pushed listing arrives unpublished: the company picks in the portal which ones go live,
+    // unless the push itself asks to submit it. Updates keep the status unless one is asked for.
+    // The plan's storage and live limits are checked by `createListing` / `changeListingStatus`.
+    const desiredStatus = record.status || (listing ? undefined : "draft");
+    if (!listing) await listingsService.assertStorageAvailable(client.accountId);
 
     const imageUrls = [...new Set(record.images || [])];
     const imageResults = imageUrls.length
@@ -568,6 +586,8 @@ export async function importListing({ client, ctx, record, source = "api", impor
         ...payload,
         mediaAssetIds: assets.map((asset) => asset.publicId),
       });
+      // A live listing keeps its approved version on the site until a moderator approves this.
+      await listingsService.holdOwnerChange({ listingId: listing.id, userId: client.createdByUserId, reason: "Updated by the listing feed" });
       await listingsService.updateListing({
         listing,
         payload: updatePayload,
@@ -588,6 +608,21 @@ export async function importListing({ client, ctx, record, source = "api", impor
           userId: client.createdByUserId,
         });
       }
+      // A listing a feed run withdrew because it left the file is back in it: it returns to the
+      // queue, never straight to the site (owner's rule, 2026-10-29).
+      if (reference?.remote_status === "removed" && listing.status === "withdrawn") {
+        try {
+          await listingsService.changeListingStatus({
+            listing: await loadListing(listing.id),
+            toStatus: "pending_review",
+            reason: "Back in the listing feed",
+            userId: client.createdByUserId,
+          });
+        } catch (error) {
+          if (!(error instanceof AppError) || error.status >= 500) throw error;
+          warnings.push(`Back in the feed but not resubmitted: ${error.message}`);
+        }
+      }
       listing = await loadListing(listing.id);
       operation = "update";
     }
@@ -603,7 +638,7 @@ export async function importListing({ client, ctx, record, source = "api", impor
          (provider_id, connection_id, entity_type, entity_id, external_id, remote_status, payload_hash,
           first_synced_at, last_synced_at, last_success_at, sync_count, created_at)
        VALUES (?, ?, 'listing', ?, ?, 'live', ?, NOW(3), NOW(3), NOW(3), 1, NOW(3))
-       ON DUPLICATE KEY UPDATE entity_id = VALUES(entity_id), payload_hash = VALUES(payload_hash),
+       ON DUPLICATE KEY UPDATE entity_id = VALUES(entity_id), payload_hash = VALUES(payload_hash), remote_status = 'live',
                                last_synced_at = NOW(3), last_success_at = NOW(3), sync_count = sync_count + 1`,
       [ctx.providerId, ctx.connectionId, listing.id, record.externalId, storedHash]
     );
@@ -615,8 +650,8 @@ export async function importListing({ client, ctx, record, source = "api", impor
       subjectLabel: listing.title,
       userId: client.createdByUserId,
       actorType: "api",
-      actorLabel: `API key "${client.name}" (${client.clientId})`,
-      metadata: { externalId: record.externalId, importId, apiClientId: client.publicId, organizationId: client.organizationPublicId, sourceIp: client.ip },
+      actorLabel: actorLabel(client),
+      metadata: { externalId: record.externalId, importId, apiClientId: client.publicId, feedId: client.feedPublicId, organizationId: client.organizationPublicId, sourceIp: client.ip },
       ip,
       requestId,
     });
@@ -630,8 +665,13 @@ export async function importListing({ client, ctx, record, source = "api", impor
   });
 }
 
-/** Withdraws (or archives a draft of) a listing this company pushed. */
-export async function withdrawImportedListing({ client, ctx, externalId, importId = null, ip = null, requestId = null }) {
+const actorLabel = (client) => (client.feedPublicId ? `Listing feed "${client.name}"` : `API key "${client.name}" (${client.clientId})`);
+
+/**
+ * Withdraws (or archives a draft of) a listing this company pushed. `removedFromFeed` marks it as
+ * gone from a feed file, so the listing returns to the queue if a later file has it again.
+ */
+export async function withdrawImportedListing({ client, ctx, externalId, importId = null, ip = null, requestId = null, removedFromFeed = false }) {
   return withAccountLock(client.accountId, async () => {
     const reference = await findReference(ctx, externalId);
     const listing = reference ? await loadListing(reference.listing_id) : null;
@@ -647,13 +687,16 @@ export async function withdrawImportedListing({ client, ctx, externalId, importI
       const result = await listingsService.changeListingStatus({
         listing,
         toStatus: target,
-        reason: "Withdrawn through the listing API",
+        reason: removedFromFeed ? "No longer in the listing feed" : "Withdrawn through the listing API",
         userId: client.createdByUserId,
       });
       changed = result.changed;
     }
     // Forget the last payload, so pushing the listing again resubmits it rather than reading as unchanged.
-    await execute("UPDATE external_references SET payload_hash = NULL, last_synced_at = NOW(3) WHERE id = ?", [reference.reference_id]);
+    await execute(
+      `UPDATE external_references SET payload_hash = NULL, last_synced_at = NOW(3)${removedFromFeed ? ", remote_status = 'removed'" : ""} WHERE id = ?`,
+      [reference.reference_id]
+    );
     if (changed) {
       await recordAudit({
         action: "listing.import_withdrawn",
@@ -662,8 +705,8 @@ export async function withdrawImportedListing({ client, ctx, externalId, importI
         subjectLabel: listing.title,
         userId: client.createdByUserId,
         actorType: "api",
-        actorLabel: `API key "${client.name}" (${client.clientId})`,
-        metadata: { externalId, importId, apiClientId: client.publicId, sourceIp: client.ip },
+        actorLabel: actorLabel(client),
+        metadata: { externalId, importId, apiClientId: client.publicId, feedId: client.feedPublicId, sourceIp: client.ip },
         ip,
         requestId,
       });

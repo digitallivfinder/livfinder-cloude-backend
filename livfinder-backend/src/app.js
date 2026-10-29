@@ -21,6 +21,8 @@ import devBoardRouter from "./modules/devBoard/devBoard.routes.js";
 import engagementRouter from "./modules/engagement/engagement.routes.js";
 import webhooksRouter from "./modules/system/webhooks.routes.js";
 import partnerRouter from "./modules/partner/partner.routes.js";
+import { adminFeedMappingsRouter, portalFeedFormatsRouter, publicFeedFormatsRouter } from "./modules/feeds/feeds.routes.js";
+import { leadFeedRouter, portalLeadsRouter } from "./modules/leads/leads.routes.js";
 import importsAdminRouter from "./modules/imports/imports.admin.routes.js";
 import { legacyMediaRewrite } from "./middleware/legacyMedia.js";
 
@@ -79,6 +81,8 @@ export function createApp() {
   // API-key callers pushing listings. Ahead of the global parser for its larger body limit, and
   // of the session/CSRF middleware a key-signed server call never uses. See partner.routes.js.
   app.use("/v1/partner", partnerRouter);
+  // The read-only lead feed address (Phase 6): a token in the URL, no session.
+  app.use("/v1", leadFeedRouter);
 
   app.use(express.json({ limit: env.BODY_LIMIT }));
   app.use(express.urlencoded({ extended: false, limit: env.BODY_LIMIT }));
@@ -101,12 +105,16 @@ export function createApp() {
   // Projects owns /v1/public/projects and /v1/public/developers. Mounted first
   // because the general public router ends in a `/:category/…` catch-all that
   // would otherwise answer /projects/facets as a category named "projects".
+  app.use("/v1/public", publicFeedFormatsRouter);
   app.use("/v1/public", projectsPublicRouter);
   app.use("/v1/public", publicRouter);
   app.use("/v1/auth", authRouter);
   app.use("/v1/accounts", accountsRouter);
   app.use("/v1/media", mediaRouter);
+  app.use("/v1/portal", portalFeedFormatsRouter);
+  app.use("/v1/portal", portalLeadsRouter);
   app.use("/v1/portal", portalRouter);
+  app.use("/v1/admin", adminFeedMappingsRouter);
   app.use("/v1/admin", adminRouter);
   // Self-contained, like projects — its own tree and its own API, not folded
   // into admin.routes.js.

@@ -39,12 +39,14 @@ const DETAIL_TABLE_BY_ROOT = {
 
 /**
  * `source` decides which base relation the lookup runs against:
- *   "public" — v_public_listings, so an unpublished row is a 404 no matter what
- *              id the caller knows.
+ *   "public" — v_reachable_listings: live listings, plus sold, rented and withdrawn ones that
+ *              were approved, whose page keeps working at its URL (0062). Anything else is a
+ *              404 no matter what id the caller knows. Search and lists use the projection,
+ *              which holds live listings only.
  *   "any"    — the raw table, for the owner's portal and for admin.
  */
 function baseRelation(source) {
-  return source === "public" ? "v_public_listings" : "listings";
+  return source === "public" ? "v_reachable_listings" : "listings";
 }
 
 async function loadRelated(listing, { includePrivate = false } = {}) {
@@ -200,7 +202,16 @@ export async function getListingDetail(identifier, { source = "public", includeP
   const listing = await fetchListingRow(identifier, source);
   if (!listing) return null;
   const related = await loadRelated(listing, { includePrivate });
-  return { raw: listing, ...related, detail: serializeListingDetail({ listing, ...related }) };
+  const detail = serializeListingDetail({ listing, ...related });
+  if (source === "public") {
+    // Changes waiting for approval: the public page stays the approved version (0060).
+    const pending = await queryOne("SELECT pending_revision_id FROM listings WHERE id = ?", [listing.id]);
+    if (pending?.pending_revision_id) {
+      const { frozenDetail } = await import("./listingRevisions.service.js");
+      return { raw: listing, ...related, detail: await frozenDetail(pending, detail) };
+    }
+  }
+  return { raw: listing, ...related, detail };
 }
 
 export async function getListingByPath(pathname, { source = "public" } = {}) {
