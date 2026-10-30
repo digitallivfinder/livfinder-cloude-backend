@@ -28,6 +28,7 @@ import { assignPlanToAccount } from "../accounts/accounts.service.js";
 import * as addons from "../accounts/addons.service.js";
 import { openRevisionSummary } from "../listings/listingRevisions.service.js";
 import { emitLeadEvent } from "../leads/webhooks.service.js";
+import { syncLeadWithInquiry } from "../leads/portalLeads.service.js";
 import { beginDeveloperChange, openProjectRevisionSummary } from "../projects/projectRevisions.service.js";
 import { createInvoiceCheckout } from "../system/payments.service.js";
 import env from "../../config/env.js";
@@ -327,6 +328,9 @@ router.patch(
           connection
         );
       }
+      if (req.body.status && req.body.status !== inquiry.status) {
+        await syncLeadWithInquiry({ scope: { accountId, organizationId }, inquiryId: inquiry.id, inquiryStatus: req.body.status, userId }, connection);
+      }
       if (req.body.note) {
         await execute(
           `INSERT INTO inquiry_notes (inquiry_id, user_id, note, is_internal, created_at)
@@ -357,89 +361,6 @@ router.get(
     const { accountId, organizationId } = scope(req);
     const result = await engagement.listLeads({ accountId, organizationId, ...params });
     return res.json(listResponse(result.data, { page: result.page, pageSize: result.pageSize, total: result.total }));
-  })
-);
-
-router.patch(
-  "/leads/:id",
-  writeLimiter,
-  requireAccountCapability("can_manage_leads"),
-  validate({
-    body: z.object({
-      stageId: z.coerce.number().int().positive().optional(),
-      status: z.enum(["new", "working", "qualified", "unqualified", "converted", "lost", "dormant"]).optional(),
-      ownerAgentId: z.string().max(64).nullable().optional(),
-      note: z.string().trim().max(2000).optional(),
-      nextActionAt: z.string().max(40).optional(),
-    }),
-  }),
-  asyncHandler(async (req, res) => {
-    const { accountId, organizationId, userId } = scope(req);
-    const ownAgent = ownAgentClause({ organizationId, userId });
-    const lead = await queryOne(
-      `SELECT id, public_id, stage_id, status FROM leads
-        WHERE public_id = ? AND (account_id = ? OR organization_id = ?) AND deleted_at IS NULL`,
-      [req.params.id, accountId, organizationId]
-    );
-    if (!lead) throw AppError.notFound("That lead was not found.");
-
-    // Stage change and its history row are one transaction; a pipeline whose
-    // history disagrees with its current stage is unauditable.
-    await withTransaction(async (connection) => {
-      const assignments = ["last_activity_at = NOW(3)"];
-      const params = [];
-      if (req.body.stageId && req.body.stageId !== lead.stage_id) {
-        const stage = await queryOne(
-          "SELECT id, name, stage_type FROM lead_pipeline_stages WHERE id = ?",
-          [req.body.stageId],
-          connection
-        );
-        if (!stage) throw AppError.validation("Some information is invalid.", { stageId: "Unknown pipeline stage." });
-        assignments.push("stage_id = ?", "stage_type = ?", "stage_entered_at = NOW(3)");
-        params.push(stage.id, stage.stage_type);
-        await execute(
-          `INSERT INTO lead_stage_history (lead_id, from_stage_id, to_stage_id, changed_by_user_id, note, changed_at)
-           VALUES (?, ?, ?, ?, ?, NOW(3))`,
-          [lead.id, lead.stage_id, stage.id, req.auth.user.id, req.body.note || null],
-          connection
-        );
-      }
-      if (req.body.status) {
-        assignments.push("status = ?");
-        params.push(req.body.status);
-      }
-      if (req.body.ownerAgentId !== undefined) {
-        const agent = req.body.ownerAgentId
-          ? await queryOne(`SELECT id FROM agents WHERE public_id = ? AND ${ownAgent.sql} AND deleted_at IS NULL`, [req.body.ownerAgentId, ...ownAgent.params], connection)
-          : null;
-        if (req.body.ownerAgentId && !agent) {
-          throw AppError.validation("Some information is invalid.", { ownerAgentId: "That agent is not on this account." });
-        }
-        assignments.push("owner_agent_id = ?", "assigned_at = NOW(3)", "assignment_method = 'manual'");
-        params.push(agent?.id ?? null);
-      }
-      if (req.body.nextActionAt) {
-        assignments.push("next_action_at = ?");
-        params.push(new Date(req.body.nextActionAt));
-      }
-      await execute(`UPDATE leads SET ${assignments.join(", ")} WHERE id = ?`, [...params, lead.id], connection);
-
-      if (req.body.note) {
-        await execute(
-          // `subject_line` and `user_id` — the previous names did not exist, so adding a note
-          // to a lead failed with a 500 rather than recording anything.
-          `INSERT INTO activities (public_id, organization_id, lead_id, contact_id, activity_type, subject_line, body,
-                                   user_id, occurred_at, created_at, updated_at)
-           SELECT ?, l.organization_id, l.id, l.contact_id, 'note', 'Portal note', ?, ?, NOW(3), NOW(3), NOW(3)
-             FROM leads l WHERE l.id = ?`,
-          [ulid(), req.body.note, req.auth.user.id, lead.id],
-          connection
-        );
-      }
-    });
-
-    await auditFromRequest(req, { action: "lead.updated", subjectType: "lead", subjectId: lead.id, changes: req.body });
-    return res.json(detailResponse({ id: lead.public_id, updated: true }));
   })
 );
 
@@ -931,14 +852,11 @@ router.get(
   "/integrations",
   requireAccountCapability("can_view_integrations"),
   asyncHandler(async (req, res) => {
-    // API keys belong to companies; an individual's page shows feeds and lead delivery only (0065).
-    const organizationId = req.auth?.activeMembership?.organization_id;
-    if (!organizationId) return res.json({ data: [] });
     const rows = await query(
       `SELECT ac.public_id, ac.name, ac.client_id, ac.secret_hint, ac.status, ac.scopes, ac.allowed_ips,
               ac.last_used_at, ac.created_at, ac.rate_limit_per_minute
-         FROM api_clients ac WHERE ac.organization_id = ? ORDER BY ac.created_at DESC`,
-      [organizationId]
+         FROM api_clients ac WHERE ac.account_id = ? ORDER BY ac.created_at DESC`,
+      [requireAccountId(req)]
     );
     const json = (value) => (typeof value === "string" ? JSON.parse(value || "[]") : value || []);
     return res.json({
@@ -973,10 +891,11 @@ router.post(
     }),
   }),
   asyncHandler(async (req, res) => {
-    const organizationId = requireOrganizationId(req);
-    await addons.assertAddonActive(requireAccountId(req), "integrations");
+    const accountId = requireAccountId(req);
+    await addons.assertAddonActive(accountId, "integrations");
     const created = await organizationService.createApiClient({
-      organizationId,
+      accountId,
+      organizationId: req.auth.activeMembership?.organization_id ?? null,
       name: req.body.name,
       scopes: [...new Set(req.body.scopes || ["listings:read"])],
       allowedIps: req.body.allowedIps || [],
@@ -1005,8 +924,7 @@ router.patch(
       .refine((body) => body.name !== undefined || body.allowedIps !== undefined, { message: "Nothing to change." }),
   }),
   asyncHandler(async (req, res) => {
-    const organizationId = requireOrganizationId(req);
-    await organizationService.updateApiClient({ organizationId, publicId: req.params.id, ...req.body });
+    await organizationService.updateApiClient({ accountId: requireAccountId(req), publicId: req.params.id, ...req.body });
     await auditFromRequest(req, { action: "api_client.updated", subjectType: "api_client", metadata: { id: req.params.id }, changes: req.body });
     return res.json(detailResponse({ updated: true }));
   })
@@ -1026,7 +944,7 @@ router.get(
   requireAccountCapability("can_view_integrations"),
   validate({ query: importListQuery }),
   asyncHandler(async (req, res) => {
-    // A company's runs by organization; an individual's (feeds only) by account.
+    // A company's runs by organization; an individual's by account.
     const organizationId = req.auth?.activeMembership?.organization_id ?? null;
     const { page = 1, pageSize = 20, status, type } = q(req);
     const result = await importsRepo.listImports({
@@ -1089,8 +1007,7 @@ router.delete(
   writeLimiter,
   requireAccountCapability("can_view_integrations"),
   asyncHandler(async (req, res) => {
-    const organizationId = requireOrganizationId(req);
-    await organizationService.revokeApiClient({ organizationId, publicId: req.params.id });
+    await organizationService.revokeApiClient({ accountId: requireAccountId(req), publicId: req.params.id });
     await auditFromRequest(req, { action: "api_client.revoked", subjectType: "api_client", metadata: { id: req.params.id } });
     return res.json(detailResponse({ revoked: true }));
   })

@@ -302,6 +302,78 @@ export async function storeDocument({ buffer, originalFileName, accountId, userI
   return { id: result.insertId, url, mime_type: "application/pdf" };
 }
 
+/** What a lead document may be: the bytes must agree with the extension, not just the name. */
+const LEAD_DOCUMENT_TYPES = Object.freeze({
+  pdf: { mime: "application/pdf", magic: "25504446" },
+  jpg: { mime: "image/jpeg", magic: "ffd8ff" },
+  jpeg: { mime: "image/jpeg", magic: "ffd8ff" },
+  png: { mime: "image/png", magic: "89504e47" },
+  doc: { mime: "application/msword", magic: "d0cf11e0" },
+  xls: { mime: "application/vnd.ms-excel", magic: "d0cf11e0" },
+  docx: { mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", magic: "504b0304" },
+  xlsx: { mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", magic: "504b0304" },
+});
+
+export const MAX_LEAD_DOCUMENT_BYTES = 20 * 1024 * 1024;
+
+/**
+ * A file that belongs to a lead: a passport copy, an offer, a signed contract. Always private,
+ * read back only through an authorised route, and outside the account's storage allowance
+ * (`storage_used` counts listings, not bytes).
+ */
+export async function storeLeadDocument({ buffer, originalFileName, accountId, userId }) {
+  if (buffer.length > MAX_LEAD_DOCUMENT_BYTES) throw AppError.payloadTooLarge("Files must be 20 MB or smaller.");
+  const extension = path.extname(String(originalFileName || "")).slice(1).toLowerCase();
+  const type = Object.hasOwn(LEAD_DOCUMENT_TYPES, extension) ? LEAD_DOCUMENT_TYPES[extension] : null;
+  if (!type || !buffer.subarray(0, type.magic.length / 2).equals(Buffer.from(type.magic, "hex"))) {
+    throw AppError.unsupportedMedia("Upload a PDF, Word, Excel, JPG or PNG file.");
+  }
+
+  const scan = await scanBuffer(buffer);
+  if (scan.status === "infected") {
+    logger.warn({ detail: scan.detail, originalFileName }, "upload rejected by the malware scanner");
+    throw AppError.badRequest("That file was rejected by the malware scanner.");
+  }
+
+  const storage = getStorage();
+  const key = storageKey({ scope: "leads/documents", extension });
+  await storage.put(key, buffer, { contentType: type.mime, visibility: "private" });
+
+  const result = await execute(
+    `INSERT INTO media_assets
+       (public_id, account_id, uploaded_by_user_id, media_type, storage_disk, storage_path, url,
+        file_name, original_file_name, mime_type, extension, file_size_bytes, checksum, source,
+        scan_status, processing_status, reference_count, last_referenced_at, tier, created_at)
+     VALUES (?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'upload', ?, 'ready', 1, NOW(3), 'hot', NOW(3))`,
+    [
+      ulid(),
+      accountId,
+      userId,
+      storage.driver,
+      key,
+      `private://${key}`,
+      key.split("/").pop(),
+      String(originalFileName).slice(0, 255),
+      type.mime,
+      extension,
+      buffer.length,
+      crypto.createHash("sha256").update(buffer).digest("hex"),
+      scan.status,
+    ]
+  );
+  return { id: result.insertId, mimeType: type.mime, sizeBytes: buffer.length };
+}
+
+/** The bytes of a private document, for a route that has already checked who is asking. */
+export async function readLeadDocument(storagePath) {
+  return getStorage().get(storagePath, { visibility: "private" });
+}
+
+export async function removeLeadDocument(assetId, storagePath) {
+  await getStorage().delete(storagePath, { visibility: "private" });
+  await execute("UPDATE media_assets SET deleted_at = NOW(3) WHERE id = ?", [assetId]);
+}
+
 export async function listRenditions(assetId) {
   const rows = await query(
     "SELECT preset_code, url, width, height FROM media_renditions WHERE media_asset_id = ? AND status = 'ready'",

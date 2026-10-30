@@ -6,6 +6,7 @@ import logger from "../config/logger.js";
 import { execute, queryOne } from "../db/query.js";
 import { AppError } from "../utils/errors.js";
 import { sha256 } from "../utils/ids.js";
+import { withoutSecret } from "../utils/redactUrl.js";
 import { importProviderId } from "../modules/imports/importConnection.js";
 import { assertAddonActive } from "../modules/accounts/addons.service.js";
 
@@ -99,7 +100,7 @@ async function resolveClient(credentials) {
             o.deleted_at AS organization_deleted_at,
             a.status AS account_status
        FROM api_clients ac
-       JOIN organizations o ON o.id = ac.organization_id
+       LEFT JOIN organizations o ON o.id = ac.organization_id
        JOIN accounts a ON a.id = COALESCE(ac.account_id, o.account_id)
       WHERE ac.client_id = ?
       LIMIT 1`,
@@ -112,23 +113,42 @@ async function resolveClient(credentials) {
   if (stored.length !== presented.length || !crypto.timingSafeEqual(stored, presented)) return null;
   if (row.status !== "active") return null;
   if (row.expires_at && new Date(row.expires_at) <= new Date()) return null;
-  if (row.organization_deleted_at || row.organization_status !== "active") return null;
+  // An individual's key has no organization to be suspended.
+  if (row.organization_id && (row.organization_deleted_at || row.organization_status !== "active")) return null;
   if (row.account_status !== "active") return null;
   return row;
 }
 
-/** Signs the request in as an API key holding `scope`. Sets `req.apiClient`. */
-export function requireApiClient(scope) {
+/**
+ * `?client_id=…&secret=…`, for the XML and CSV links only, so a link can be pasted into a system
+ * that cannot set a header and opens with no login box. The secret leaves the URL here, before
+ * anything can log it: the request log and the error log only ever see the cleaned one.
+ */
+function credentialsFromLink(req) {
+  const { client_id: clientId, secret } = req.query ?? {};
+  req.url = withoutSecret(req.url);
+  req.originalUrl = withoutSecret(req.originalUrl);
+  return typeof clientId === "string" && typeof secret === "string" && clientId && secret ? { clientId, secret } : null;
+}
+
+/**
+ * Signs the request in as an API key holding `scope`. Sets `req.apiClient`. The Authorization
+ * header is the normal way; `allowLinkCredentials` also takes them from the link.
+ */
+export function requireApiClient(scope, { allowLinkCredentials = false } = {}) {
   return async (req, res, next) => {
     try {
       const header = req.get("authorization");
-      if (!header) {
+      // Read on every route, so a secret sent to the wrong one still never reaches a log.
+      const linkCredentials = credentialsFromLink(req);
+      const fromLink = allowLinkCredentials ? linkCredentials : null;
+      if (!header && !fromLink) {
         throw new AppError("Send the API key as HTTP Basic credentials: client id and secret.", {
           status: 401,
           code: "API_KEY_REQUIRED",
         });
       }
-      const credentials = parseBasic(header);
+      const credentials = header ? parseBasic(header) : fromLink;
       if (!credentials) throw invalidKey();
 
       const row = await resolveClient(credentials);
@@ -145,7 +165,7 @@ export function requireApiClient(scope) {
         clientId: row.client_id,
         organizationId: row.organization_id,
         organizationPublicId: row.organization_public_id,
-        organizationName: row.organization_name,
+        organizationName: row.organization_name ?? null,
         accountId: row.account_id,
         createdByUserId: row.created_by_user_id ?? null,
         rateLimitPerMinute: Number(row.rate_limit_per_minute) || 60,
@@ -206,6 +226,7 @@ export function logPartnerRequest(req, res, next) {
     const endpoint = `${req.baseUrl}${req.route?.path ?? req.path}`.slice(0, 255);
     const excerpt = (value) => {
       if (value === undefined || value === null) return null;
+      if (Buffer.isBuffer(value)) return value.toString("utf8", 0, 2000);
       try {
         return JSON.stringify(value).slice(0, 2000);
       } catch {
@@ -227,7 +248,7 @@ export function logPartnerRequest(req, res, next) {
             req.apiClient?.organizationId ?? null,
             req.method,
             endpoint,
-            req.originalUrl.slice(0, 500),
+            withoutSecret(req.originalUrl).slice(0, 500),
             status,
             durationMs,
             Number(req.get("content-length")) || null,

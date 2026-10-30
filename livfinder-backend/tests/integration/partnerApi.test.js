@@ -4,6 +4,7 @@ import {
   app, client, cleanupListings, cleanupUsers, createDisposableStaffUser, execute, query, queryOne,
 } from "../helpers/testApp.js";
 import { closePool } from "../../src/db/pool.js";
+import { completeRecord, useFakeImages } from "../helpers/completeListing.js";
 import { createApiClient } from "../../src/modules/portal/organization.service.js";
 import { IMPORT_PROVIDER_CODE } from "../../src/modules/imports/importConnection.js";
 
@@ -29,6 +30,7 @@ let ipLockedKey = null;
 let revokedKey = null;
 let otherKey = null;
 let location = null;
+let agent = null;
 let unapprovedCategory = null;
 let member = null;
 let staff = null;
@@ -48,21 +50,16 @@ const as = (key) => ({
 });
 
 function listing(externalId, overrides = {}) {
-  return {
-    category: "real-estate",
-    purpose: "sale",
+  return completeRecord("real-estate", externalId, {
     title: `QA import ${externalId}`,
-    description: "<p>Imported by the partner API test.</p>",
-    price: 2500000,
-    currency: "AED",
-    location: { country: location.country_name, city: location.city_name },
-    detail: { bedrooms: 3, bathrooms: 3, builtAreaSqft: 2100 },
+    agentEmail: agent?.email,
     ...overrides,
-  };
+  });
 }
 
 async function makeKey(organizationId, scopes, extra = {}) {
-  const key = await createApiClient({ organizationId, name: `QA key ${suffix}`, scopes, userId: null, ...extra });
+  const { account_id: accountId } = await queryOne("SELECT account_id FROM organizations WHERE id = ?", [organizationId]);
+  const key = await createApiClient({ accountId, organizationId, name: `QA key ${suffix}`, scopes, userId: null, ...extra });
   const row = await queryOne("SELECT id FROM api_clients WHERE public_id = ?", [key.id]);
   keyIds.push(row.id);
   return { ...key, rowId: row.id };
@@ -121,6 +118,9 @@ beforeAll(async () => {
       WHERE ci.level = 'city' AND ci.status = 'active' AND ci.deleted_at IS NULL AND co.slug = 'united-arab-emirates'
       ORDER BY ci.active_listing_count DESC LIMIT 1`
   );
+
+  agent = await queryOne("SELECT email FROM agents WHERE organization_id = ? AND deleted_at IS NULL AND email IS NOT NULL LIMIT 1", [company.organization_id]);
+  useFakeImages();
 
   writeKey = await makeKey(company.organization_id, ["listings:write"]);
   readKey = await makeKey(company.organization_id, ["listings:read"]);
@@ -304,17 +304,177 @@ describe("single push", () => {
     expect(row.revision).toBe("pending");
   });
 
-  it("reports an image it could not fetch as a warning, not a failure", async () => {
+  it("reports an image it could not fetch as a warning, when enough others arrived", async () => {
     const withImage = ext("image");
-    const response = await as(writeKey).put(
-      `/v1/partner/listings/${withImage}`,
-      listing(withImage, { images: ["https://images.invalid/listing/1.jpg"] })
-    );
+    const images = [...listing(withImage).images, "https://images.example/broken/1.jpg"];
+    const response = await as(writeKey).put(`/v1/partner/listings/${withImage}`, listing(withImage, { images }));
     expect(response.status).toBe(201);
     const row = await queryOne("SELECT id FROM listings WHERE public_id = ?", [response.body.data.listingId]);
     createdListingIds.add(row.id);
     expect(response.body.data.images.failed).toHaveLength(1);
     expect(response.body.data.warnings.join(" ")).toMatch(/Image not added/);
+  });
+
+  it("refuses a listing that ends up with fewer than 3 images, and says why", async () => {
+    const bad = ext("few-images");
+    const images = ["https://images.example/ok/1.jpg", "https://images.example/ok/2.jpg", "https://images.example/broken/2.jpg"];
+    const response = await as(writeKey).put(`/v1/partner/listings/${bad}`, listing(bad, { images }));
+    expect(response.status).toBe(422);
+    expect(response.body.error.fields.images).toMatch(/At least 3 different images must load; 2 did/);
+  });
+
+  it("refuses an incomplete listing, naming everything it lacks", async () => {
+    const bad = ext("thin");
+    const response = await as(writeKey).put(`/v1/partner/listings/${bad}`, {
+      externalId: bad,
+      category: "real-estate",
+      title: "QA thin listing",
+      location: { country: location.country_name, city: location.city_name },
+    });
+    expect(response.status).toBe(422);
+    expect(Object.keys(response.body.error.fields)).toEqual(expect.arrayContaining(["purpose", "description", "bedrooms", "features", "images"]));
+  });
+
+  it("refuses a company's listing with no agent", async () => {
+    const bad = ext("no-agent");
+    const response = await as(writeKey).put(`/v1/partner/listings/${bad}`, listing(bad, { agentEmail: undefined }));
+    expect(response.status).toBe(422);
+    expect(response.body.error.fields.agentEmail).toBeTruthy();
+  });
+
+  it("asks for the sub-community where the community has them", async () => {
+    const bad = ext("no-sub");
+    const whole = listing(bad);
+    const response = await as(writeKey).put(`/v1/partner/listings/${bad}`, { ...whole, location: { country: "AE", city: "Dubai", community: "Dubai Marina" } });
+    expect(response.status).toBe(422);
+    expect(response.body.error.fields.subCommunity).toMatch(/sub-community in Dubai Marina/);
+  });
+
+  describe("a location goes as deep as LivFinder's list, and no deeper", () => {
+    const push = (name, place) => {
+      const id = ext(name);
+      return as(writeKey).put(`/v1/partner/listings/${id}`, listing(id, { location: place }));
+    };
+    const saved = async (response) => {
+      expect(response.status, JSON.stringify(response.body.error)).toBe(201);
+      const row = await queryOne("SELECT id FROM listings WHERE public_id = ?", [response.body.data.listingId]);
+      createdListingIds.add(row.id);
+    };
+    const place = (sql) => queryOne(sql);
+    const live = "deleted_at IS NULL AND status = 'active'";
+
+    it("saves a country that has no cities or states on LivFinder", async () => {
+      const country = await place(
+        `SELECT c.id, c.name FROM locations c WHERE c.level = 'country' AND c.${live}
+           AND NOT EXISTS (SELECT 1 FROM locations x WHERE x.country_id = c.id AND x.level IN ('city', 'state') AND x.deleted_at IS NULL) LIMIT 1`
+      );
+      await saved(await push("country-only", { country: country.name }));
+    });
+
+    it("saves a state that has no cities, by its id", async () => {
+      const state = await place(
+        `SELECT s.id FROM locations s WHERE s.level = 'state' AND s.${live}
+           AND NOT EXISTS (SELECT 1 FROM locations x WHERE x.state_id = s.id AND x.level = 'city' AND x.deleted_at IS NULL) LIMIT 1`
+      );
+      await saved(await push("state-only", { id: String(state.id) }));
+    });
+
+    it("saves a city that has no communities", async () => {
+      const city = await place(
+        `SELECT c.id FROM locations c WHERE c.level = 'city' AND c.${live}
+           AND NOT EXISTS (SELECT 1 FROM locations x WHERE x.city_id = c.id AND x.level IN ('community', 'district') AND x.deleted_at IS NULL) LIMIT 1`
+      );
+      await saved(await push("city-only", { id: String(city.id) }));
+    });
+
+    it("saves a community that has no sub-communities", async () => {
+      const community = await place(
+        `SELECT c.id FROM locations c WHERE c.level = 'community' AND c.${live}
+           AND NOT EXISTS (SELECT 1 FROM locations x WHERE x.community_id = c.id AND x.level = 'sub_community' AND x.deleted_at IS NULL) LIMIT 1`
+      );
+      await saved(await push("community-only", { id: String(community.id) }));
+    });
+
+    it("holds an id to the same rule as names", async () => {
+      const uae = await place(`SELECT id FROM locations WHERE level = 'country' AND slug = 'united-arab-emirates' LIMIT 1`);
+      const country = await push("country-id", { id: String(uae.id) });
+      expect(country.status).toBe(422);
+      expect(country.body.error.fields.city).toMatch(/Give the city/);
+
+      const dubai = await place(`SELECT id FROM locations WHERE level = 'city' AND slug = 'dubai' AND country_id = ${uae.id} LIMIT 1`);
+      const city = await push("city-id", { id: String(dubai.id) });
+      expect(city.status).toBe(422);
+      expect(city.body.error.fields.community).toMatch(/Give the community/);
+    });
+  });
+
+  describe("each level of a location must belong to the one above it", () => {
+    const push = (name, place) => {
+      const id = ext(name);
+      return as(writeKey).put(`/v1/partner/listings/${id}`, listing(id, { location: place }));
+    };
+
+    it("refuses a state from another country, and says where it really is", async () => {
+      const state = await queryOne(
+        `SELECT s.name, c.name AS country FROM locations s JOIN locations c ON c.id = s.country_id
+          WHERE s.level = 'state' AND s.deleted_at IS NULL AND c.slug = 'india' ORDER BY s.id LIMIT 1`
+      );
+      const before = await queryOne("SELECT COUNT(*) AS n FROM feed_value_mappings WHERE external_value = ?", [state.name.toLowerCase()]);
+      const response = await push("wrong-state", { country: "AE", state: state.name, city: "Dubai" });
+      expect(response.status).toBe(422);
+      const message = response.body.error.fields["location.state"];
+      expect(message).toContain(`"${state.name}" is not in United Arab Emirates`);
+      expect(message).toContain(state.country);
+      const after = await queryOne("SELECT COUNT(*) AS n FROM feed_value_mappings WHERE external_value = ?", [state.name.toLowerCase()]);
+      expect(after.n).toBe(before.n);
+    });
+
+    it("refuses a city from another state", async () => {
+      const response = await push("wrong-city", { country: "AE", state: "Sharjah", city: "Dubai" });
+      expect(response.status).toBe(422);
+      expect(response.body.error.fields["location.city"]).toMatch(/"Dubai" is not in Sharjah.*United Arab Emirates/);
+    });
+
+    it("refuses a community from another city", async () => {
+      const response = await push("wrong-community", { country: "AE", city: "Abu Dhabi", community: "Dubai Marina" });
+      expect(response.status).toBe(422);
+      expect(response.body.error.fields["location.community"]).toMatch(/"Dubai Marina" is not in Abu Dhabi/);
+    });
+
+    it("holds names sent with an id to that id", async () => {
+      const place = await queryOne("SELECT id FROM locations WHERE level = 'sub_community' AND name = 'Bay Central' LIMIT 1");
+      const response = await push("id-mismatch", { id: String(place.id), country: "IN", city: "Abu Dhabi" });
+      expect(response.status).toBe(422);
+      expect(response.body.error.fields["location.country"]).toMatch(/does not match location id/);
+      expect(response.body.error.fields["location.city"]).toMatch(/Bay Central/);
+    });
+
+    it("accepts names that do fit their id", async () => {
+      const place = await queryOne("SELECT id FROM locations WHERE level = 'sub_community' AND name = 'Bay Central' LIMIT 1");
+      const id = ext("id-match");
+      const response = await as(writeKey).put(`/v1/partner/listings/${id}`, listing(id, { location: { id: String(place.id), country: "AE", city: "Dubai", community: "Dubai Marina" } }));
+      expect(response.status, JSON.stringify(response.body.error)).toBe(201);
+      const row = await queryOne("SELECT id FROM listings WHERE public_id = ?", [response.body.data.listingId]);
+      createdListingIds.add(row.id);
+    });
+  });
+
+  it("adds an amenity LivFinder does not have, and the listing shows it", async () => {
+    const id = ext("amenity");
+    const amenity = `QA rooftop cinema ${suffix}`;
+    const response = await as(writeKey).put(`/v1/partner/listings/${id}`, listing(id, { features: ["Private pool", amenity] }));
+    expect(response.status).toBe(201);
+    const row = await queryOne("SELECT id FROM listings WHERE public_id = ?", [response.body.data.listingId]);
+    createdListingIds.add(row.id);
+    const feature = await queryOne(
+      `SELECT f.id, f.name FROM features f JOIN listing_features lf ON lf.feature_id = f.id WHERE lf.listing_id = ? AND f.name = ?`,
+      [row.id, amenity]
+    );
+    expect(feature).toBeTruthy();
+    expect(await queryOne("SELECT 1 AS ok FROM category_features WHERE category_id = 1 AND feature_id = ?", [feature.id])).toBeTruthy();
+    await execute("DELETE FROM listing_features WHERE feature_id = ?", [feature.id]);
+    await execute("DELETE FROM category_features WHERE feature_id = ?", [feature.id]);
+    await execute("DELETE FROM features WHERE id = ?", [feature.id]);
   });
 
   it("explains what to fix, with the partner's field names, and records the failure", async () => {

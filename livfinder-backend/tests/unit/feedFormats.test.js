@@ -65,7 +65,6 @@ describe("reading a file", () => {
   it("reads values by type: numbers with separators, yes/no, list values in any case, lists", () => {
     const csv = `${header}\nCAR-1,2022 Porsche 911,"850,000",AED,AE,Dubai,2022,Dual Clutch,yes,https://a.example/1.jpg|https://a.example/2.jpg\n`;
     const [item] = parseFeed({ category: "cars", format: "csv", content: csv }).items;
-    expect(item.errors).toBeNull();
     expect(item.record).toMatchObject({
       externalId: "CAR-1",
       category: "cars",
@@ -86,11 +85,33 @@ describe("reading a file", () => {
       "CAR-1,Twice,100000,AED,AE,Dubai,2022,automatic,no,",
     ].join("\n");
     const { items } = parseFeed({ category: "cars", format: "csv", content: csv });
-    expect(items.map((item) => [item.row, Boolean(item.errors)])).toEqual([[2, false], [3, true], [4, true], [5, true], [6, true]]);
+    expect(items.map((item) => item.row)).toEqual([2, 3, 4, 5, 6]);
+    expect(items[0].errors.modelYear).toBeUndefined();
     expect(Object.keys(items[1].errors)).toContain("modelYear");
     expect(items[2].errors.transmission).toMatch(/Use one of/);
     expect(items[3].errors.externalId).toBe("This is required.");
     expect(items[4].errors.externalId).toMatch(/also on row 2/);
+  });
+
+  it("names everything a listing is missing, in one go", () => {
+    const [item] = parseFeed({ category: "cars", format: "csv", content: `externalId,title\nCAR-5,A car title\n` }).items;
+    expect(Object.keys(item.errors)).toEqual(expect.arrayContaining(["purpose", "description", "price", "currency", "country", "brand", "model", "mileageKm", "features", "images"]));
+    expect(item.errors.images).toMatch(/at least 3/);
+  });
+
+  it("does not ask an electric car for its engine, or a sale for its rent terms", () => {
+    const electric = parseFeed({ category: "cars", format: "csv", content: `externalId,title,fuelType\nCAR-6,An electric car,electric\n` }).items[0];
+    expect(electric.errors.engineSizeCc).toBeUndefined();
+    expect(electric.errors.mileageKm).toBeTruthy();
+    const sale = parseFeed({ category: "real-estate", format: "csv", content: `externalId,title,purpose\nRE-1,A flat for sale,sale\n` }).items[0];
+    expect(sale.errors.rentPeriod).toBeUndefined();
+    const rent = parseFeed({ category: "real-estate", format: "csv", content: `externalId,title,purpose\nRE-2,A flat to rent,rent\n` }).items[0];
+    expect(rent.errors.rentPeriod).toBeTruthy();
+  });
+
+  it("takes latitude and longitude together or not at all", () => {
+    const one = parseFeed({ category: "cars", format: "csv", content: `externalId,title,latitude\nCAR-7,A car title,25.1\n` }).items[0];
+    expect(one.errors.longitude).toMatch(/both/);
   });
 
   it("warns about a column it does not know instead of failing", () => {

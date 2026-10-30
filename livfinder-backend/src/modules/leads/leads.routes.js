@@ -1,14 +1,18 @@
 import { Router } from "express";
+import multer from "multer";
 import { z } from "zod";
 import { asyncHandler } from "../../middleware/errors.js";
 import { requireAccountCapability, requireAuth } from "../../middleware/auth.js";
-import { generalLimiter, writeLimiter } from "../../middleware/rateLimit.js";
+import { generalLimiter, uploadLimiter, writeLimiter } from "../../middleware/rateLimit.js";
 import { validate } from "../../middleware/validation.js";
 import { AppError } from "../../utils/errors.js";
 import { detailResponse } from "../../utils/http.js";
 import { assertAddonActive } from "../accounts/addons.service.js";
 import { auditFromRequest } from "../system/audit.service.js";
 import { requireAccountId } from "../portal/authorization.js";
+import { MAX_LEAD_DOCUMENT_BYTES } from "../media/media.service.js";
+import { FUNNEL_STEPS, LOST_REASON_CODES } from "./leadFunnel.js";
+import * as leadsWorkspace from "./portalLeads.service.js";
 import { LEAD_FEED_VERSION, leadsToCsv, leadsToXml, listLeadsSince } from "./leadExport.service.js";
 import { accountForToken, createFeedToken, listFeedTokens, revokeFeedToken } from "./leadFeedTokens.service.js";
 import {
@@ -117,6 +121,171 @@ portalLeadsRouter.get(
     res.setHeader("Content-Disposition", `attachment; filename="livfinder-leads${from ? `-${from}` : ""}${to ? `-to-${to}` : ""}.csv"`);
     res.setHeader("Cache-Control", "no-store");
     return res.type("text/csv").send(leadsToCsv(leads));
+  })
+);
+
+/* -------------------------------------------------------------------------- */
+/* Portal: the lead workspace                                                  */
+/* -------------------------------------------------------------------------- */
+
+const manageLeads = [requireAuth, requireAccountCapability("can_manage_leads")];
+
+const leadScope = (req) => ({
+  accountId: requireAccountId(req),
+  organizationId: req.auth.activeMembership?.organization_id ?? null,
+});
+
+// One file at a time, held in memory until it has been checked and stored privately.
+const leadDocumentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_LEAD_DOCUMENT_BYTES, files: 1 },
+});
+
+const optionalPhone = z
+  .string()
+  .trim()
+  .max(24)
+  .regex(/^\+?[0-9 ()-]{6,}$/, "Enter a valid phone number.")
+  .transform((value) => value.replace(/[ ()-]/g, ""))
+  .optional()
+  .or(z.literal("").transform(() => undefined));
+
+const newLeadSchema = z
+  .object({
+    category: z.string().trim().min(1).max(40),
+    name: z.string().trim().min(1, "Enter a name.").max(200),
+    phone: optionalPhone,
+    email: z.string().trim().toLowerCase().email("Enter a valid email.").max(255).optional().or(z.literal("").transform(() => undefined)),
+    listingId: z.string().trim().max(64).optional(),
+    source: z.enum(["phone", "walk_in", "referral", "other"]).optional(),
+    note: z.string().trim().max(2000).optional(),
+  })
+  .refine((value) => value.phone || value.email, { message: "Enter a phone number or an email.", path: ["phone"] });
+
+const leadUpdateSchema = z.object({
+  step: z.enum(FUNNEL_STEPS).optional(),
+  lostReason: z.enum(Object.keys(LOST_REASON_CODES)).optional(),
+  lostNote: z.string().trim().max(500).optional(),
+  priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
+  ownerAgentId: z.string().max(64).nullable().optional(),
+  nextActionAt: z.string().max(40).nullable().optional(),
+  nextActionNote: z.string().trim().max(255).optional(),
+});
+
+const viewingSchema = z.object({
+  scheduledStart: z.string().min(1).max(40),
+  location: z.string().trim().max(500).optional(),
+  notes: z.string().trim().max(2000).optional(),
+});
+
+portalLeadsRouter.post(
+  "/leads",
+  writeLimiter,
+  ...manageLeads,
+  validate({ body: newLeadSchema }),
+  asyncHandler(async (req, res) => {
+    const { leadId, ...lead } = await leadsWorkspace.createManualLead({ scope: leadScope(req), payload: req.body, userId: req.auth.user.id });
+    await auditFromRequest(req, { action: "lead.created", subjectType: "lead", subjectId: leadId, changes: { source: req.body.source } });
+    return res.status(201).json(detailResponse(lead));
+  })
+);
+
+portalLeadsRouter.post(
+  "/inquiries/:id/lead",
+  writeLimiter,
+  ...manageLeads,
+  asyncHandler(async (req, res) => res.json(detailResponse(await leadsWorkspace.ensureInquiryLead({ scope: leadScope(req), inquiryPublicId: req.params.id }))))
+);
+
+portalLeadsRouter.get(
+  "/leads/:id",
+  ...manageLeads,
+  asyncHandler(async (req, res) => res.json(detailResponse(await leadsWorkspace.getLead(leadScope(req), req.params.id))))
+);
+
+portalLeadsRouter.patch(
+  "/leads/:id",
+  writeLimiter,
+  ...manageLeads,
+  validate({ body: leadUpdateSchema }),
+  asyncHandler(async (req, res) => {
+    const { leadId, ...result } = await leadsWorkspace.updateLead({ scope: leadScope(req), publicId: req.params.id, payload: req.body, userId: req.auth.user.id });
+    await auditFromRequest(req, { action: "lead.updated", subjectType: "lead", subjectId: leadId, changes: req.body });
+    return res.json(detailResponse(result));
+  })
+);
+
+portalLeadsRouter.post(
+  "/leads/:id/notes",
+  writeLimiter,
+  ...manageLeads,
+  validate({ body: z.object({ body: z.string().trim().min(1, "Write a note.").max(5000) }) }),
+  asyncHandler(async (req, res) => {
+    await leadsWorkspace.addNote({ scope: leadScope(req), publicId: req.params.id, body: req.body.body, userId: req.auth.user.id });
+    return res.status(201).json(detailResponse({ created: true }));
+  })
+);
+
+portalLeadsRouter.delete(
+  "/leads/:id/notes/:noteId",
+  writeLimiter,
+  ...manageLeads,
+  asyncHandler(async (req, res) => {
+    await leadsWorkspace.deleteNote({ scope: leadScope(req), publicId: req.params.id, noteId: req.params.noteId });
+    return res.json(detailResponse({ deleted: true }));
+  })
+);
+
+portalLeadsRouter.post(
+  "/leads/:id/documents",
+  uploadLimiter,
+  ...manageLeads,
+  leadDocumentUpload.single("file"),
+  asyncHandler(async (req, res) => {
+    if (!req.file) throw AppError.badRequest("Attach a file.");
+    // Browsers send multipart filenames as latin1; the name is shown back to the client as UTF-8.
+    const file = { ...req.file, originalname: Buffer.from(req.file.originalname, "latin1").toString("utf8") };
+    const { leadId, ...document } = await leadsWorkspace.addDocument({ scope: leadScope(req), publicId: req.params.id, file, userId: req.auth.user.id });
+    await auditFromRequest(req, { action: "lead.document_added", subjectType: "lead", subjectId: leadId, changes: { title: document.title } });
+    return res.status(201).json(detailResponse(document));
+  })
+);
+
+export function sendLeadDocument(res, document) {
+  const ascii = document.fileName.replace(/[^\x20-\x7e]|["\\]/g, "_");
+  res.setHeader("Cache-Control", "private, no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Content-Disposition", `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(document.fileName)}`);
+  return res.type(document.mimeType).send(document.body);
+}
+
+portalLeadsRouter.get(
+  "/leads/:id/documents/:documentId",
+  ...manageLeads,
+  asyncHandler(async (req, res) =>
+    sendLeadDocument(res, await leadsWorkspace.downloadDocument({ scope: leadScope(req), publicId: req.params.id, documentId: req.params.documentId }))
+  )
+);
+
+portalLeadsRouter.delete(
+  "/leads/:id/documents/:documentId",
+  writeLimiter,
+  ...manageLeads,
+  asyncHandler(async (req, res) => {
+    await leadsWorkspace.deleteDocument({ scope: leadScope(req), publicId: req.params.id, documentId: req.params.documentId, userId: req.auth.user.id });
+    return res.json(detailResponse({ deleted: true }));
+  })
+);
+
+portalLeadsRouter.post(
+  "/leads/:id/viewings",
+  writeLimiter,
+  ...manageLeads,
+  validate({ body: viewingSchema }),
+  asyncHandler(async (req, res) => {
+    const { leadId, ...viewing } = await leadsWorkspace.addViewing({ scope: leadScope(req), publicId: req.params.id, payload: req.body, userId: req.auth.user.id });
+    await auditFromRequest(req, { action: "lead.viewing_added", subjectType: "lead", subjectId: leadId, changes: req.body });
+    return res.status(201).json(detailResponse(viewing));
   })
 );
 

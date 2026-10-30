@@ -271,6 +271,10 @@ async function leadOptions(rootId) {
   };
 }
 
+export async function adminLeadId(identifier) {
+  return queryValue("SELECT id FROM leads WHERE (public_id = ? OR reference = ?) AND deleted_at IS NULL LIMIT 1", [identifier, identifier]);
+}
+
 export async function getAdminLead(identifier) {
   const row = await queryOne(
     `SELECT l.* FROM leads l WHERE (l.public_id = ? OR l.reference = ?) AND l.deleted_at IS NULL LIMIT 1`,
@@ -282,7 +286,7 @@ export async function getAdminLead(identifier) {
   const base = list.items[0];
   if (!base) return null;
 
-  const [activities, stageHistory, otherContactLeads, otherListingInquiries, requirements] = await Promise.all([
+  const [activities, stageHistory, otherContactLeads, otherListingInquiries, requirements, documents] = await Promise.all([
     query(
       `SELECT a.public_id, a.activity_type, a.subject_line AS subject, a.body, a.occurred_at,
               COALESCE(u.display_name, ag.display_name) AS actor_name
@@ -321,12 +325,27 @@ export async function getAdminLead(identifier) {
         )
       : Promise.resolve([]),
     query("SELECT * FROM lead_requirements WHERE lead_id = ? LIMIT 5", [row.id]).catch(() => []),
+    // Documents the client attached in the portal; admin supports them, so admin can read them.
+    query(
+      `SELECT d.public_id, d.title, d.file_size_bytes, d.created_at, u.display_name AS uploader
+         FROM documents d LEFT JOIN users u ON u.id = d.uploaded_by_user_id
+        WHERE d.owner_type = 'lead' AND d.owner_id = ? AND d.deleted_at IS NULL
+        ORDER BY d.created_at DESC`,
+      [row.id]
+    ),
   ]);
 
   return {
     ...base,
     notes: row.notes,
     lostNote: row.lost_note,
+    documents: documents.map((document) => ({
+      id: document.public_id,
+      title: document.title,
+      sizeBytes: Number(document.file_size_bytes),
+      uploaderName: document.uploader,
+      at: isoDate(document.created_at),
+    })),
     activities: activities.map((activity) => ({
       id: activity.public_id,
       type: activity.activity_type,

@@ -3,7 +3,7 @@ import { callProcedure, execute, query, queryOne, queryValue } from "../../db/qu
 import { AppError } from "../../utils/errors.js";
 import { recordAudit } from "../system/audit.service.js";
 import * as importsRepo from "../imports/imports.repository.js";
-import { importImages, payloadHash, resolveImportLocation } from "../imports/listingImport.service.js";
+import { assertLocationComplete, importImages, payloadHash, resolveImportLocation } from "../imports/listingImport.service.js";
 import { developmentSchema, upsertDevelopment } from "../admin/admin.mutations.js";
 import { beginDeveloperChange } from "../projects/projectRevisions.service.js";
 
@@ -31,6 +31,7 @@ function fieldsFromIssues(issues) {
 /** Location names (or an id) to the per-level ids a project stores. */
 async function locationIds(location) {
   const id = await resolveImportLocation(location);
+  await assertLocationComplete(id);
   const row = await queryOne("SELECT id, level, country_id, state_id, city_id, community_id FROM locations WHERE id = ?", [id]);
   const own = (level) => (row.level === level ? row.id : null);
   return {
@@ -107,6 +108,14 @@ export async function importDevelopment({ client, ctx, record, importId = null }
 
   const hash = payloadHash(record);
   let reference = await findReference(ctx, record.externalId);
+  // A development made in LivFinder shows on the link by its own id; sent back, it is the same one.
+  if (!reference) {
+    const own = await queryOne(
+      "SELECT id AS project_id FROM projects WHERE public_id = ? AND organization_id = ? AND deleted_at IS NULL LIMIT 1",
+      [record.externalId, client.organizationId]
+    );
+    if (own) reference = { reference_id: null, payload_hash: null, project_id: own.project_id };
+  }
   let project = reference
     ? await queryOne("SELECT id, public_id, name, moderation_status FROM projects WHERE id = ? AND deleted_at IS NULL", [reference.project_id])
     : null;

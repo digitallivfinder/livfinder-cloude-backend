@@ -75,13 +75,6 @@ const server = app.listen(env.PORT, async () => {
     } catch (error) {
       logger.error({ err: error }, "webhook worker could not be started");
     }
-    // Company feeds (0063): scheduled fetches, the 10-minute change watch, and "Run now".
-    try {
-      const { startFeedScheduler } = await import("./modules/feeds/feedRunner.js");
-      startFeedScheduler();
-    } catch (error) {
-      logger.error({ err: error }, "feed scheduler could not be started");
-    }
   }
 });
 

@@ -17,6 +17,8 @@ import * as crm from "./admin.crm.js";
 import * as content from "./admin.content.js";
 import * as settings from "./admin.settings.js";
 import * as mutations from "./admin.mutations.js";
+import { documentFile } from "../leads/portalLeads.service.js";
+import { sendLeadDocument } from "../leads/leads.routes.js";
 import { adminPermissionUniverse } from "../auth/adminPermissions.js";
 import { toAdminPermissions } from "../auth/adminPermissions.js";
 import { allPermissionCodes } from "../auth/rbac.js";
@@ -859,6 +861,16 @@ router.get(
     const lead = await crm.getAdminLead(req.params.id);
     if (!lead) throw AppError.notFound("That lead was not found.");
     return res.json(detailResponse(lead));
+  })
+);
+
+router.get(
+  "/leads/:id/documents/:documentId",
+  requirePermission("leads.view"),
+  asyncHandler(async (req, res) => {
+    const leadId = await crm.adminLeadId(req.params.id);
+    if (!leadId) throw AppError.notFound("That lead was not found.");
+    return sendLeadDocument(res, await documentFile(leadId, req.params.documentId));
   })
 );
 

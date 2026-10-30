@@ -1,14 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { cleanupListings, cleanupUsers, createDisposablePortalOwner, execute, query, queryOne } from "../helpers/testApp.js";
-import { saveAccountFeed } from "../../src/modules/feeds/feedSources.repository.js";
-import { runFeed } from "../../src/modules/feeds/feedRunner.js";
+import { cleanupListings, cleanupUsers, createDisposablePortalOwner, createTestApiKey, execute, pushFile, query, queryOne } from "../helpers/testApp.js";
 import { dismissMapping, listMappings, mappingCandidates, setMapping } from "../../src/modules/feeds/valueMappings.js";
 import { closePool } from "../../src/db/pool.js";
+import { completeCsv, completeRecord, useFakeImages } from "../helpers/completeListing.js";
 
 /**
  * The mapping queue (Phase 5): a company's own place name that LivFinder does not know fails the
  * listing with a clear reason and joins the admin's queue, scoped to the place it was sent for;
- * once an admin maps it, the feed's next run takes the listing in. Runs on a throwaway account;
+ * once an admin maps it, the next push takes the listing in. Runs on a throwaway account;
  * the mapping rows it creates are removed.
  */
 
@@ -17,13 +16,19 @@ const unknownCommunity = `QA Marina Quarter ${suffix}`;
 const unknownType = `QA Sky Loft ${suffix}`;
 let owner = null;
 let accountId = null;
-let feed = null;
+let key = null;
 let dubai = null;
 let community = null;
 
-const header = "externalId,title,price,currency,country,city,community,propertyType,bedrooms";
-const file = `${header}\nRE-1,Apartment in a place we call our own,1500000,AED,AE,Dubai,${unknownCommunity},${unknownType},2\n`;
-const serve = (body) => async (url) => ({ buffer: Buffer.from(body), etag: null, lastModified: null, contentType: "text/csv", finalUrl: url });
+const file = () =>
+  completeCsv("real-estate", [
+    completeRecord("real-estate", "RE-1", {
+      title: "Apartment in a place we call our own",
+      propertyType: unknownType,
+      location: { country: "AE", city: "Dubai", community: unknownCommunity, subCommunity: community.sub_community },
+    }),
+  ]);
+const push = () => pushFile(key, "/listings/real-estate.csv", file(), "text/csv");
 const queued = async () => (await listMappings({ status: "unmapped", pageSize: 100 })).rows.filter((row) => row.value.includes(String(suffix)));
 
 beforeAll(async () => {
@@ -45,10 +50,14 @@ beforeAll(async () => {
       WHERE ci.level = 'city' AND ci.slug = 'dubai' AND co.slug = 'united-arab-emirates' AND ci.deleted_at IS NULL LIMIT 1`
   );
   community = await queryOne(
-    "SELECT public_id, name FROM locations WHERE city_id = ? AND level = 'community' AND deleted_at IS NULL ORDER BY active_listing_count DESC LIMIT 1",
+    `SELECT l.public_id, l.name, s.name AS sub_community FROM locations l
+       JOIN locations s ON s.community_id = l.id AND s.level = 'sub_community' AND s.deleted_at IS NULL
+      WHERE l.city_id = ? AND l.level = 'community' AND l.deleted_at IS NULL
+      ORDER BY l.active_listing_count DESC LIMIT 1`,
     [dubai.id]
   );
-  feed = await saveAccountFeed({ accountId, organizationId: null, category: "real-estate", url: "https://feeds.example.com/re.csv", userId: owner.id });
+  key = await createTestApiKey({ accountId, userId: owner.id });
+  useFakeImages();
 });
 
 afterAll(async () => {
@@ -56,17 +65,18 @@ afterAll(async () => {
   await cleanupListings(listings.map((item) => item.public_id));
   await execute("DELETE FROM feed_value_mappings WHERE external_value LIKE ?", [`%${suffix}%`]);
   await execute("DELETE FROM integration_connections WHERE account_id = ? AND organization_id IS NULL", [accountId]);
+  await execute("DELETE FROM api_clients WHERE account_id = ?", [accountId]);
   if (owner) await cleanupUsers([owner.email]);
   await closePool();
 });
 
 describe("the mapping queue", () => {
   it("fails a listing with an unknown place name, and queues the name within its city", async () => {
-    const result = await runFeed(feed.id, { fetchFile: serve(file) });
-    expect(result).toMatchObject({ outcome: "imported", status: "failed" });
+    const { imports: [result] } = await push();
+    expect(result).toMatchObject({ status: "failed" });
     const item = await queryOne(
       "SELECT fi.errors FROM feed_import_items fi JOIN feed_imports r ON r.id = fi.import_id WHERE r.public_id = ?",
-      [result.importId]
+      [result.id]
     );
     expect(JSON.stringify(item.errors)).toContain(unknownCommunity);
 
@@ -81,7 +91,7 @@ describe("the mapping queue", () => {
     await setMapping(Number(locationRow.id), { locationId: community.public_id });
 
     // The property type is unknown too: the run fails on it next, and queues it.
-    const second = await runFeed(feed.id, { fetchFile: serve(file) });
+    const { imports: [second] } = await push();
     expect(second.status).toBe("failed");
     const typeRow = (await queued()).find((row) => row.type === "category");
     expect(typeRow).toBeTruthy();
@@ -89,8 +99,8 @@ describe("the mapping queue", () => {
     expect(types.map((type) => type.id)).toContain("apartment");
     await setMapping(Number(typeRow.id), { categoryCode: "apartment" });
 
-    const third = await runFeed(feed.id, { fetchFile: serve(file) });
-    expect(third).toMatchObject({ outcome: "imported", status: "completed" });
+    const { imports: [third] } = await push();
+    expect(third).toMatchObject({ status: "completed" });
     const listing = await queryOne(
       `SELECT l.status, c.code AS type, loc.public_id AS community
          FROM listings l JOIN categories c ON c.id = l.category_id LEFT JOIN locations loc ON loc.id = l.community_id

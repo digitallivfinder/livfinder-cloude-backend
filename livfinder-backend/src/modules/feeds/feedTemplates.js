@@ -1,4 +1,4 @@
-import { LIST_SEPARATOR, feedFormat } from "./feedFormats.js";
+import { FEED_CATEGORIES, LIST_SEPARATOR, feedFormat } from "./feedFormats.js";
 
 /**
  * Everything a client downloads to build a feed, generated from the format registry so it can
@@ -28,10 +28,13 @@ const EXAMPLES = {
   state: "Dubai",
   city: "Dubai",
   community: "Dubai Marina",
+  subCommunity: "Bay Central",
+  handoverDate: "2027-06-30",
+  availableFrom: "2027-01-01",
   agentEmail: "agent@example.com",
   contactEmail: "sales@example.com",
   contactPhone: "+971500000000",
-  images: ["https://example.com/photos/1.jpg", "https://example.com/photos/2.jpg"],
+  images: ["https://example.com/photos/1.jpg", "https://example.com/photos/2.jpg", "https://example.com/photos/3.jpg"],
   features: ["Private pool", "Sea view"],
   highlights: ["Beachfront", "Branded residences"],
   amenities: ["Gym", "Infinity pool"],
@@ -40,8 +43,9 @@ const EXAMPLES = {
 
 const CATEGORY_EXAMPLES = {
   cars: {
-    propertyType: "supercars", brand: "Porsche", model: "911", title: "2022 Porsche 911 Turbo S", price: 850000,
+    propertyType: "supercars", brand: "Porsche", model: "911 Turbo S", title: "2022 Porsche 911 Turbo S", price: 850000,
     modelYear: 2022, mileageKm: 8000, transmission: "dual_clutch", fuelType: "petrol", drivetrain: "awd",
+    engineSizeCc: 3745, cylinders: 6,
     features: ["Sport Chrono package", "Carbon ceramic brakes"],
   },
   yachts: {
@@ -50,17 +54,17 @@ const CATEGORY_EXAMPLES = {
     features: ["Stabilisers", "Jet ski"],
   },
   jets: {
-    propertyType: "light-jets", brand: "Embraer", model: "Phenom 300", title: "2019 Embraer Phenom 300E", price: 38000000,
+    propertyType: "light-jets", brand: "Embraer", model: "Phenom 300E", title: "2019 Embraer Phenom 300E", price: 38000000,
     aircraftType: "light_jet", yearBuilt: 2019, totalTimeHours: 1200, passengerCapacity: 8,
     features: ["Wi-Fi", "Enrolled on engine program"],
   },
   helicopters: {
-    propertyType: "light-helicopter", brand: "Airbus", model: "H125", title: "2020 Airbus H125", price: 11000000,
+    propertyType: "light-helicopter", brand: "Airbus Helicopters", model: "ACH130", title: "2020 Airbus H125", price: 11000000,
     aircraftType: "light_helicopter", yearBuilt: 2020, totalTimeHours: 450, passengerCapacity: 5,
     features: ["Air conditioning", "Cargo hook"],
   },
   watches: {
-    propertyType: "dive-watches", brand: "Rolex", model: "Submariner", title: "Rolex Submariner Date 126610LN", price: 14500,
+    propertyType: "dive-watches", brand: "Rolex", model: "Daytona", title: "Rolex Submariner Date 126610LN", price: 14500,
     currency: "USD", referenceNumber: "126610LN", yearOfProduction: 2022, caseMaterial: "Oystersteel", caseDiameterMm: 41,
     movementType: "automatic", hasOriginalBox: true, hasOriginalPapers: true,
     features: ["Box and papers", "Unworn"],
@@ -86,13 +90,13 @@ function example(field, category) {
     case "date":
       return "2027-06-30";
     default:
-      return field.list ? [] : "";
+      return field.list ? ["Example"] : "Example";
   }
 }
 
 const SAMPLE_KEYS = new Set([
   "externalId", "title", "name", "tagline", "purpose", "propertyType", "price", "currency", "country", "city",
-  "community", "agentEmail", "images", "features", "brand", "model", "minPrice", "status", "launchStatus",
+  "community", "subCommunity", "agentEmail", "images", "features", "brand", "model", "minPrice", "status", "launchStatus",
   "handoverDate", "totalUnits", "availableUnits", "highlights", "amenities",
 ]);
 
@@ -213,6 +217,89 @@ export function sampleXml(category) {
   }
   lines.push("</livfinder-feed>");
   return `${lines.join("\n")}\n`;
+}
+
+/** A sample of the file that holds every category, each in its own section. */
+export function sampleAllXml() {
+  const sections = FEED_CATEGORIES.flatMap((category) => {
+    const entry = sampleXml(category).trimEnd().split("\n").slice(2, -1);
+    return [`  <category name="${category}" version="${feedFormat(category).version}">`, ...entry.map((line) => `  ${line}`), "  </category>"];
+  });
+  return ['<?xml version="1.0" encoding="UTF-8"?>', '<livfinder-feed version="1">', ...sections, "</livfinder-feed>", ""].join("\n");
+}
+
+/* -------------------------------------------------------------------------- */
+/* What a client pushed, written back out                                      */
+/* -------------------------------------------------------------------------- */
+
+const pathValue = (record, path) => String(path).split(".").reduce((node, key) => node?.[key], record);
+
+const fieldValues = (fields, record) => Object.fromEntries(fields.map((field) => [field.key, pathValue(record, field.path ?? field.key)]));
+
+function entryXml(format, record, status, indent) {
+  const pad = " ".repeat(indent);
+  const lines = [`${pad}<${format.entity} livfinderStatus="${escapeXml(status)}">`, ...grouped(format.fields, fieldValues(format.fields, record), indent + 2)];
+  if (format.entity === "development") {
+    const inner = " ".repeat(indent + 2);
+    lines.push(`${inner}<unitTypes>`);
+    for (const unit of record.unitTypes || []) {
+      lines.push(`${inner}  <unitType>`, ...xmlFields(format.unitTypeFields, fieldValues(format.unitTypeFields, unit), indent + 6), `${inner}  </unitType>`);
+    }
+    lines.push(`${inner}</unitTypes>`, `${inner}<paymentPlans>`);
+    for (const plan of record.paymentPlans || []) {
+      lines.push(`${inner}  <paymentPlan>`, ...xmlFields(format.paymentPlanFields, fieldValues(format.paymentPlanFields, plan), indent + 6));
+      lines.push(`${inner}    <milestones>`);
+      for (const step of plan.milestones || []) {
+        lines.push(`${inner}      <milestone>`, ...xmlFields(format.milestoneFields, fieldValues(format.milestoneFields, step), indent + 10), `${inner}      </milestone>`);
+      }
+      lines.push(`${inner}    </milestones>`, `${inner}  </paymentPlan>`);
+    }
+    lines.push(`${inner}</paymentPlans>`);
+  }
+  lines.push(`${pad}</${format.entity}>`);
+  return lines;
+}
+
+/**
+ * The all-categories file for one client: `sections` is `[{ category, entries }]`, an entry being
+ * `{ record, status }`. It can be pushed straight back: `livfinderStatus` is ignored on the way in.
+ */
+export function listingsXml(sections, baseUrl = "") {
+  const lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<livfinder-feed version="1">'];
+  for (const { category, entries } of sections) {
+    const format = feedFormat(category);
+    const open = `  <category name="${category}" version="${format.version}" label="${escapeXml(format.label)}" count="${entries.length}" format="${escapeXml(`${baseUrl}/v1/public/feed-formats/${category}`)}"`;
+    if (!entries.length) {
+      lines.push(`${open}/>`);
+      continue;
+    }
+    lines.push(`${open}>`, ...entries.flatMap((entry) => entryXml(format, entry.record, entry.status, 4)), "  </category>");
+  }
+  lines.push("</livfinder-feed>", "");
+  return lines.join("\n");
+}
+
+const csvValue = (field, value) => csvCell(field.list && Array.isArray(value) ? value.join(LIST_SEPARATOR) : value);
+
+/** One category's pushed entries as a CSV file, with `livfinderStatus` as its last column. */
+export function listingsCsv(category, entries) {
+  const format = feedFormat(category);
+  const columns = [...csvColumns(category), "livfinderStatus"];
+  const line = (cells) => columns.map((column) => cells[column] ?? "").join(",");
+  const rows = entries.flatMap(({ record, status }) => {
+    const own = Object.fromEntries(format.fields.map((field) => [field.key, csvValue(field, pathValue(record, field.path ?? field.key))]));
+    if (format.entity !== "development") return [line({ ...own, livfinderStatus: csvCell(status) })];
+    // A development is one row per unit type and payment plan; rows after the first repeat only its id.
+    const units = record.unitTypes || [];
+    const plans = record.paymentPlans || [];
+    return Array.from({ length: Math.max(units.length, plans.length, 1) }, (_, index) => {
+      const cells = index ? { externalId: own.externalId } : { ...own, livfinderStatus: csvCell(status) };
+      for (const field of format.unitTypeFields) cells[`unit.${field.key}`] = units[index] ? csvCell(pathValue(units[index], field.path ?? field.key)) : "";
+      for (const field of format.paymentPlanFields) cells[`plan.${field.key}`] = plans[index] ? csvCell(pathValue(plans[index], field.path ?? field.key)) : "";
+      return line(cells);
+    });
+  });
+  return [columns.join(","), ...rows].join("\r\n") + "\r\n";
 }
 
 /* -------------------------------------------------------------------------- */

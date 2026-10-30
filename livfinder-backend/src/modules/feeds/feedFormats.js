@@ -1,4 +1,5 @@
 import { DETAIL_SCHEMAS } from "../listings/listings.schemas.js";
+import { isAlwaysRequired, requirementNote, requirementOf } from "./listingRequirements.js";
 import { IMPORT_CATEGORIES, listingRecordSchema } from "../imports/listingImport.service.js";
 import {
   DEVELOPMENT_AVAILABILITY,
@@ -241,20 +242,25 @@ const PLAN_FIELDS = [
 export function feedFormat(category) {
   if (!FEED_CATEGORIES.includes(category)) return null;
   const base = { category, label: LABELS[category], version: FORMAT_VERSIONS[category], listSeparator: LIST_SEPARATOR };
+  const withRules = (field) => ({
+    ...field,
+    required: isAlwaysRequired(category, field),
+    requirement: requirementOf(category, field),
+    description: requirementNote(category, field) ?? field.description,
+  });
   if (category === "developments") {
     return {
       ...base,
       entity: "development",
-      fields: DEVELOPMENT_FIELDS,
+      fields: DEVELOPMENT_FIELDS.map(withRules),
       unitTypeFields: UNIT_FIELDS,
       paymentPlanFields: PLAN_FIELDS,
       milestoneFields: MILESTONE_FIELDS,
     };
   }
-  const fields = [...envelopeFields(category), ...detailFields(category)].map((field) => ({
-    ...field,
-    description: field.description ?? DESCRIPTIONS[field.key],
-  }));
+  const fields = [...envelopeFields(category), ...detailFields(category)]
+    .map((field) => ({ ...field, description: field.description ?? DESCRIPTIONS[field.key] }))
+    .map(withRules);
   return { ...base, entity: "listing", fields };
 }
 

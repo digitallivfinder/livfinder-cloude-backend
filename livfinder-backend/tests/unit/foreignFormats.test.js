@@ -76,7 +76,6 @@ describe("Property Finder", () => {
   it("is recognised and read into LivFinder's real-estate fields", () => {
     const result = parseFeed({ category: "real-estate", format: "xml", content: PROPERTY_FINDER });
     expect(result.source).toBe("property_finder");
-    expect(result.items.map((item) => item.errors)).toEqual([null, null]);
     const [sale, rent] = result.items.map((item) => item.record);
     expect(sale).toMatchObject({
       externalId: "PF-1001",
@@ -112,7 +111,6 @@ describe("Bayut", () => {
     const result = parseFeed({ category: "real-estate", format: "xml", content: BAYUT });
     expect(result.source).toBe("bayut");
     const [item] = result.items;
-    expect(item.errors).toBeNull();
     expect(item.record).toMatchObject({
       externalId: "BY-77",
       purpose: "rent",
@@ -139,5 +137,13 @@ describe("telling formats apart", () => {
     const missingTitle = PROPERTY_FINDER.replace("<title_en>2 bedroom apartment with marina view</title_en>", "");
     const [first] = parseFeed({ category: "real-estate", format: "xml", content: missingTitle }).items;
     expect(first.errors).toMatchObject({ title: "This is required." });
+  });
+});
+
+describe("an export that lacks LivFinder's required fields", () => {
+  it("is read, and each listing says what it is missing", () => {
+    const [entry] = parseFeed({ category: "real-estate", format: "xml", content: PROPERTY_FINDER }).items;
+    expect(entry.errors.images).toMatch(/at least 3/);
+    expect(entry.errors.parkingSpaces).toBe("This is required.");
   });
 });

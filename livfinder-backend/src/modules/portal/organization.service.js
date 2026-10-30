@@ -594,8 +594,8 @@ export function normalizeAllowedIps(list = []) {
   return result;
 }
 
-export async function createApiClient({ organizationId, name, scopes, allowedIps = [], userId }) {
-  const accountId = await queryValue("SELECT account_id FROM organizations WHERE id = ?", [organizationId]);
+/** A key belongs to its account; a company's also carries the organization, an individual's has none. */
+export async function createApiClient({ accountId, organizationId = null, name, scopes, allowedIps = [], userId }) {
   const publicId = ulid();
   const clientId = `lf_${crypto.randomBytes(16).toString("hex")}`;
   const secret = randomToken(32);
@@ -614,8 +614,8 @@ export async function createApiClient({ organizationId, name, scopes, allowedIps
   return { id: publicId, name, clientId, secret, scopes, allowedIps: ips, createdAt: new Date().toISOString() };
 }
 
-export async function updateApiClient({ organizationId, publicId, name, allowedIps }) {
-  const row = await queryOne("SELECT id, status FROM api_clients WHERE public_id = ? AND organization_id = ?", [publicId, organizationId]);
+export async function updateApiClient({ accountId, publicId, name, allowedIps }) {
+  const row = await queryOne("SELECT id, status FROM api_clients WHERE public_id = ? AND account_id = ?", [publicId, accountId]);
   if (!row) throw AppError.notFound("That credential was not found.");
   if (row.status === "revoked") throw AppError.conflict("A revoked credential cannot be changed.");
   const assignments = [];
@@ -632,10 +632,10 @@ export async function updateApiClient({ organizationId, publicId, name, allowedI
   return true;
 }
 
-export async function revokeApiClient({ organizationId, publicId }) {
+export async function revokeApiClient({ accountId, publicId }) {
   const result = await execute(
-    "UPDATE api_clients SET status = 'revoked', revoked_at = NOW(3) WHERE public_id = ? AND organization_id = ?",
-    [publicId, organizationId]
+    "UPDATE api_clients SET status = 'revoked', revoked_at = NOW(3) WHERE public_id = ? AND account_id = ?",
+    [publicId, accountId]
   );
   if (!result.affectedRows) throw AppError.notFound("That credential was not found.");
   return true;

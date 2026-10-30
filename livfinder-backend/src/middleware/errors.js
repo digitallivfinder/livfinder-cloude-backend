@@ -1,5 +1,6 @@
 import { ZodError } from "zod";
 import { AppError } from "../utils/errors.js";
+import { withoutSecret } from "../utils/redactUrl.js";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
 
@@ -40,7 +41,7 @@ export function errorHandler(error, req, res, next) {
     status,
     code: appError.code,
     method: req.method,
-    path: req.originalUrl,
+    path: withoutSecret(req.originalUrl),
     userId: req.auth?.user?.id ?? null,
     err: {
       message: appError.message,

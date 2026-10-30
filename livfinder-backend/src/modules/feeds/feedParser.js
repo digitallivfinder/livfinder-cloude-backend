@@ -6,6 +6,7 @@ import { parseListingRecord } from "../imports/listingImport.service.js";
 import { FORMAT_VERSIONS, LIST_SEPARATOR, feedFormat } from "./feedFormats.js";
 import { LIST_ITEM, csvColumns } from "./feedTemplates.js";
 import { readForeignXml } from "./foreignFormats.js";
+import { missingRequired } from "./listingRequirements.js";
 
 /**
  * Reads one category's feed file (LivFinder XML or CSV) into the records the import takes.
@@ -103,10 +104,23 @@ function readFields(fields, values, prefix = "") {
 /* -------------------------------------------------------------------------- */
 
 function listingItem(category, format, values, row) {
+  // Withdrawing needs only the id: the listing is already on LivFinder.
+  if (String(values.status ?? "").trim().toLowerCase() === "withdrawn") {
+    const id = String(values.externalId ?? "").trim();
+    if (!id) return { row, externalId: null, record: null, errors: { externalId: "This is required." } };
+    return { row, externalId: id, record: { externalId: id, category, withdraw: true }, errors: null };
+  }
   const { out, errors } = readFields(format.fields, values);
   const externalId = typeof out.externalId === "string" ? out.externalId : null;
-  if (Object.keys(errors).length) return { row, externalId, record: null, errors };
+  // Every missing field at once, so a client fixes a listing in one go.
+  const REQUIRED = "This is required.";
+  const unreadable = Object.values(errors).some((message) => message !== REQUIRED);
+  for (const [key, message] of Object.entries(missingRequired(category, out))) {
+    if (!errors[key] || errors[key] === REQUIRED) errors[key] = message;
+  }
   const record = { ...out, category };
+  // What was sent stays with a rejected entry, so the notice can name the listing.
+  if (Object.keys(errors).length) return { row, externalId, record: unreadable ? null : record, errors };
   try {
     const parsed = parseListingRecord(record);
     if (parsed.detail) {
@@ -143,8 +157,7 @@ function developmentItem(format, entry, row) {
     });
     return { ...read.out, ...(milestones.length ? { milestones } : {}) };
   });
-  if (!out.location?.country) errors.country ??= "Give the country.";
-  if (!out.location?.city) errors.city ??= "Give the city.";
+  for (const [key, message] of Object.entries(missingRequired("developments", { ...out, unitTypes, paymentPlans }))) errors[key] ??= message;
   const externalId = typeof out.externalId === "string" ? out.externalId : null;
   if (Object.keys(errors).length) return { row, externalId, record: null, errors };
   return { row, externalId, record: { ...out, unitTypes, paymentPlans }, errors: null };
@@ -168,12 +181,18 @@ function markDuplicates(items) {
 /* XML                                                                         */
 /* -------------------------------------------------------------------------- */
 
+// The same entries sit directly under the root in a one-category file, and under a <category>
+// section in a file holding several.
+const ENTRY_PATHS = [
+  "listing",
+  "development",
+  "development.unitTypes.unitType",
+  "development.paymentPlans.paymentPlan",
+  "development.paymentPlans.paymentPlan.milestones.milestone",
+];
 const ARRAY_PATHS = new Set([
-  "livfinder-feed.listing",
-  "livfinder-feed.development",
-  "livfinder-feed.development.unitTypes.unitType",
-  "livfinder-feed.development.paymentPlans.paymentPlan",
-  "livfinder-feed.development.paymentPlans.paymentPlan.milestones.milestone",
+  "livfinder-feed.category",
+  ...ENTRY_PATHS.flatMap((path) => [`livfinder-feed.${path}`, `livfinder-feed.category.${path}`]),
 ]);
 
 const xml = new XMLParser({
@@ -238,9 +257,14 @@ function readXml(category, format, text) {
       category: `Send a ${category} file to this feed.`,
     });
   }
-  const version = Number(root["@_version"] ?? FORMAT_VERSIONS[category]);
+  return readEntries(category, format, root);
+}
+
+/** The entries of one category, from the root of a one-category file or a <category> section. */
+function readEntries(category, format, parent) {
+  const version = Number(parent["@_version"] ?? FORMAT_VERSIONS[category]);
   const entity = format.entity;
-  const nodes = root[entity] || [];
+  const nodes = parent[entity] || [];
   if (nodes.length > MAX_FEED_ROWS) throw fileError(`A feed file can hold at most ${MAX_FEED_ROWS} entries.`);
   const warnings = new Set();
   const items = nodes.map((node, index) => {
@@ -316,14 +340,18 @@ function readCsv(category, format, text) {
 
 /* -------------------------------------------------------------------------- */
 
+function fileText(content) {
+  const bytes = Buffer.isBuffer(content) ? content.length : Buffer.byteLength(String(content ?? ""));
+  if (!bytes) throw fileError("The feed file is empty.");
+  if (bytes > MAX_FEED_BYTES) throw fileError(`A feed file can be at most ${MAX_FEED_BYTES / 1024 / 1024} MB.`);
+  return Buffer.isBuffer(content) ? content.toString("utf8") : String(content);
+}
+
 /** Parses one feed file. Throws a 422 `FEED_INVALID` for a file that cannot be read at all. */
 export function parseFeed({ category, format, content }) {
   const spec = feedFormat(category);
   if (!spec) throw fileError(`There is no feed format for "${category}".`, { category: "Unknown category." });
-  const bytes = Buffer.isBuffer(content) ? content.length : Buffer.byteLength(String(content ?? ""));
-  if (!bytes) throw fileError("The feed file is empty.");
-  if (bytes > MAX_FEED_BYTES) throw fileError(`A feed file can be at most ${MAX_FEED_BYTES / 1024 / 1024} MB.`);
-  const text = Buffer.isBuffer(content) ? content.toString("utf8") : String(content);
+  const text = fileText(content);
   const kind = format || (text.trimStart().startsWith("<") ? "xml" : "csv");
   const result = kind === "xml" ? readXml(category, spec, text) : readCsv(category, spec, text);
   if (result.version !== FORMAT_VERSIONS[category]) {
@@ -332,4 +360,43 @@ export function parseFeed({ category, format, content }) {
     });
   }
   return { category, entity: spec.entity, format: kind, source: result.source ?? "livfinder", ...result, items: markDuplicates(result.items) };
+}
+
+/**
+ * Parses a pushed XML file into one result per category: a `<category name="…">` section for each
+ * in the file, or the single category of a one-category file or a Property Finder or Bayut export.
+ */
+export function parsePushedXml(content) {
+  const text = fileText(content);
+  let doc;
+  try {
+    doc = xml.parse(text, true);
+  } catch (error) {
+    throw fileError("The XML file could not be read.", { file: String(error.message || error).slice(0, 300) });
+  }
+  const root = doc?.["livfinder-feed"];
+  if (!root || typeof root !== "object") return [parseFeed({ category: "real-estate", format: "xml", content: text })];
+  if (root["@_category"]) return [parseFeed({ category: root["@_category"], format: "xml", content: text })];
+
+  const sections = root.category || [];
+  if (!sections.length) throw fileError('The file has no <category name="…"> sections.');
+  const seen = new Set();
+  const results = sections.map((section) => {
+    const category = section["@_name"];
+    const spec = feedFormat(category);
+    if (!spec) throw fileError(`There is no feed format for "${category ?? ""}".`, { category: "Unknown category." });
+    if (seen.has(category)) throw fileError(`The ${category} section appears twice. Put all its entries in one section.`);
+    seen.add(category);
+    const result = readEntries(category, spec, section);
+    if (result.version !== FORMAT_VERSIONS[category]) {
+      throw fileError(`Version ${result.version} of the ${category} format is not supported; use version ${FORMAT_VERSIONS[category]}.`, {
+        version: `Use version ${FORMAT_VERSIONS[category]}.`,
+      });
+    }
+    return { category, entity: spec.entity, format: "xml", source: "livfinder", ...result, items: markDuplicates(result.items) };
+  });
+  if (results.reduce((total, result) => total + result.items.length, 0) > MAX_FEED_ROWS) {
+    throw fileError(`A feed file can hold at most ${MAX_FEED_ROWS} entries.`);
+  }
+  return results;
 }

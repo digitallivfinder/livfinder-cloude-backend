@@ -9,7 +9,7 @@ import { publicListingUrl } from "./listingImport.service.js";
  * the admin screen; every read here is limited to the `livfinder_import` provider.
  */
 
-const IMPORT_TYPE_LABEL = { single: "single", api_push: "bulk", full: "feed" };
+const IMPORT_TYPE_LABEL = { single: "single", api_push: "bulk", full: "file" };
 
 function parseJson(value, fallback) {
   if (value === null || value === undefined) return fallback;
@@ -25,7 +25,7 @@ function parseJson(value, fallback) {
 /* Writing                                                                     */
 /* -------------------------------------------------------------------------- */
 
-export async function createImportRun({ client, ctx, type, total, status, ip, userAgent, feed = null }) {
+export async function createImportRun({ client, ctx, type, total, status, ip, userAgent, file = null }) {
   const publicId = ulid();
   const result = await execute(
     `INSERT INTO feed_imports
@@ -40,17 +40,17 @@ export async function createImportRun({ client, ctx, type, total, status, ip, us
       client.organizationId,
       client.accountId,
       client.id,
-      // A feed run (0063): which feed, which file, and that listings gone from it are withdrawn.
-      feed?.id ?? null,
-      feed?.url ? String(feed.url).slice(0, 500) : null,
-      feed?.checksum ?? null,
-      feed?.sizeBytes ?? null,
-      feed ? "unpublish" : "none",
-      feed?.maxRemovalPercent ?? 20,
+      null,
+      null,
+      // A pushed file: its fingerprint and size, for the import's record.
+      file?.checksum ?? null,
+      file?.sizeBytes ?? null,
+      "none",
+      20,
       ip || null,
       userAgent ? String(userAgent).slice(0, 300) : null,
       type,
-      feed?.entityType ?? "listing",
+      file?.entityType ?? "listing",
       status,
       total,
       status === "running" ? new Date() : null,
@@ -173,14 +173,12 @@ const IMPORT_COLUMNS = `
   INET6_NTOA(fi.source_ip) AS source_ip, fi.source_user_agent,
   o.public_id AS organization_public_id, o.name AS organization_name,
   ac.public_id AS api_client_public_id, ac.name AS api_client_name, ac.client_id AS api_client_client_id,
-  ac.status AS api_client_status,
-  fi.hold_reason, fsrc.public_id AS feed_public_id, fsrc.category AS feed_category, fi.source_url AS feed_url`;
+  ac.status AS api_client_status`;
 
 const IMPORT_FROM = `
   FROM feed_imports fi
   LEFT JOIN organizations o ON o.id = fi.organization_id
-  LEFT JOIN api_clients ac ON ac.id = fi.api_client_id
-  LEFT JOIN feed_sources fsrc ON fsrc.id = fi.feed_source_id`;
+  LEFT JOIN api_clients ac ON ac.id = fi.api_client_id`;
 
 export function serializeImport(row) {
   return {
@@ -197,10 +195,7 @@ export function serializeImport(row) {
     },
     images: { downloaded: Number(row.media_downloaded) || 0, failed: Number(row.media_failed) || 0 },
     message: row.error_message,
-    // A feed run (0063) held because too many listings left the file at once says why.
-    holdReason: row.hold_reason ?? null,
     source: {
-      feed: row.feed_public_id ? { id: row.feed_public_id, category: row.feed_category, url: row.feed_url } : null,
       ip: row.source_ip,
       userAgent: row.source_user_agent,
       apiKey: row.api_client_public_id

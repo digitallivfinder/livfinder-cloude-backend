@@ -2,6 +2,7 @@ import request from "supertest";
 import { createApp } from "../../src/app.js";
 import { query, queryOne, execute } from "../../src/db/query.js";
 import { hashPassword } from "../../src/modules/auth/passwords.js";
+import { createApiClient } from "../../src/modules/portal/organization.service.js";
 
 /**
  * Integration test harness.
@@ -247,6 +248,28 @@ export async function createDisposableStaffUser({ prefix = "disposable-staff", p
     );
   }
   return { id: insert.insertId, email };
+}
+
+/** A key for an account, as the portal creates it. Removed with the account's `api_clients` rows. */
+export async function createTestApiKey({ accountId, organizationId = null, userId = null, scopes = ["listings:write"] }) {
+  return createApiClient({ accountId, organizationId, name: `Test key ${Date.now()}`, scopes, userId });
+}
+
+/** Pushes a file to a client's link and waits for its imports to finish. */
+export async function pushFile(key, path, content, contentType = "application/xml") {
+  const response = await request(app).post(`/v1/partner${path}`).auth(key.clientId, key.secret).set("Content-Type", contentType).send(content);
+  const imports = response.body?.data?.imports ?? [];
+  for (const entry of imports) {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const row = await queryOne("SELECT status FROM feed_imports WHERE public_id = ?", [entry.id]);
+      if (["completed", "partial", "failed"].includes(row?.status)) {
+        entry.status = row.status;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  return { status: response.status, body: response.body, imports };
 }
 
 export { query, queryOne, execute };

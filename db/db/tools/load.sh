@@ -155,6 +155,9 @@ is_post_seed_migration() {
     # 0065 grants the seeded individual owners the integrations capability.
     0065_individual_integrations.sql)
       return 0 ;;
+    # 0066 adds the client funnel and a lost reason after the seeded rows, so their ids do not move.
+    0066_client_lead_workspace.sql)
+      return 0 ;;
     *)
       return 1 ;;
   esac

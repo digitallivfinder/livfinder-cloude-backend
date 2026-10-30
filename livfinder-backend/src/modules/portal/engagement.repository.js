@@ -1,5 +1,6 @@
 import { query, queryOne, queryValue } from "../../db/query.js";
 import { bool, int, isoDate, isoDay, num } from "../../serializers/primitives.js";
+import { funnelStepOf } from "../leads/leadFunnel.js";
 import { PORTAL_LISTING_COLUMNS, PORTAL_LISTING_JOINS, serializePortalListing, formatMoney, relativeTime, rootIdForFrontendCategory, titleize } from "./portal.repository.js";
 
 /**
@@ -85,6 +86,8 @@ export async function listInquiries({ accountId, organizationId, search = "", li
               i.status AS entity_status, i.priority, i.channel, i.inquiry_type,
               i.created_at AS entity_created_at, i.first_response_at,
               i.assigned_to_agent_id, i.budget_min, i.budget_max, i.currency_code AS entity_currency_code,
+              (SELECT ld.public_id FROM leads ld
+                WHERE ld.id = COALESCE(i.lead_id, (SELECT li.lead_id FROM lead_inquiries li WHERE li.inquiry_id = i.id LIMIT 1))) AS lead_public_id,
               pj.public_id AS project_public_id, pj.name AS project_name,
               pj.canonical_path AS project_path, pj.is_publicly_visible AS project_visible,
               ${PORTAL_LISTING_COLUMNS.replaceAll("l.", "l.")}
@@ -120,6 +123,7 @@ export async function listInquiries({ accountId, organizationId, search = "", li
     data: rows.map((row) => ({
       id: row.entity_public_id,
       reference: row.entity_reference,
+      leadId: row.lead_public_id,
       buyer: { name: row.name, email: row.email, phone: row.phone },
       message: row.message,
       subject: row.subject,
@@ -219,7 +223,7 @@ export async function listLeads({ accountId, organizationId, status = "all", sea
 
   const [rows, total] = await Promise.all([
     query(
-      `SELECT l.id, l.public_id, l.reference, l.status, l.stage_id, l.score, l.score_band,
+      `SELECT l.id, l.public_id, l.reference, l.status, l.stage_id, l.stage_type, l.score, l.score_band,
               l.priority, l.created_at, l.owner_agent_id, l.budget_min, l.budget_max,
               l.currency_code, l.intent, l.timeframe, l.last_activity_at, l.next_action_at,
               l.root_category_id AS lead_root_category_id,
@@ -264,7 +268,7 @@ export async function listLeads({ accountId, organizationId, status = "all", sea
       assignedAgentId: row.agent_public_id,
       source: row.source_name,
       stage: row.stage_name,
-      status: row.status,
+      status: funnelStepOf(row.status, row.stage_type),
       priority: row.priority,
       intent: row.intent,
       timeframe: row.timeframe,
@@ -405,7 +409,8 @@ export async function listBookings({ accountId, organizationId, search = "", cat
   if (category !== "all") {
     const rootId = rootIdForFrontendCategory(category);
     if (rootId) {
-      conditions.push("l.root_category_id = ?");
+      // A viewing on a manual lead may have no listing; the lead still has a category.
+      conditions.push("COALESCE(l.root_category_id, ld.root_category_id) = ?");
       params.push(rootId);
     }
   }
@@ -433,10 +438,11 @@ export async function listBookings({ accountId, organizationId, search = "", cat
               b.scheduled_end, b.timezone, b.guest_count, b.contact_name, b.contact_email,
               b.contact_phone, b.notes, b.meeting_location, b.meeting_url, b.total_amount,
               b.currency_code AS entity_currency_code, b.created_at AS entity_created_at,
-              ag.display_name AS agent_name, ag.public_id AS agent_public_id,
+              ag.display_name AS agent_name, ag.public_id AS agent_public_id, ld.public_id AS lead_public_id,
               ${PORTAL_LISTING_COLUMNS}
          FROM bookings b
          LEFT JOIN listings l ON l.id = b.listing_id
+         LEFT JOIN leads ld ON ld.id = b.lead_id
          LEFT JOIN categories cat ON cat.id = l.category_id
          LEFT JOIN locations ct ON ct.id = l.city_id
          LEFT JOIN locations co ON co.id = l.country_id
@@ -452,7 +458,7 @@ export async function listBookings({ accountId, organizationId, search = "", cat
         ORDER BY b.scheduled_start ASC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
-    queryValue(`SELECT COUNT(*) FROM bookings b LEFT JOIN listings l ON l.id = b.listing_id ${where}`, params),
+    queryValue(`SELECT COUNT(*) FROM bookings b LEFT JOIN listings l ON l.id = b.listing_id LEFT JOIN leads ld ON ld.id = b.lead_id ${where}`, params),
     bookingCounts({ accountId, organizationId }),
   ]);
 
@@ -460,6 +466,7 @@ export async function listBookings({ accountId, organizationId, search = "", cat
     data: rows.map((row) => ({
       id: row.entity_public_id,
       reference: row.entity_reference,
+      leadId: row.lead_public_id,
       bookingType: row.booking_type,
       status: row.entity_status,
       startsAt: isoDate(row.scheduled_start),

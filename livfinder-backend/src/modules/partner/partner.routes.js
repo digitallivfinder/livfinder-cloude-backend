@@ -9,7 +9,10 @@ import { AppError } from "../../utils/errors.js";
 import { detailResponse, listResponse } from "../../utils/http.js";
 import { ensureImportConnection } from "../imports/importConnection.js";
 import * as repo from "../imports/imports.repository.js";
-import { getAccountFeed, requestRun } from "../feeds/feedSources.repository.js";
+import { FEED_CATEGORIES } from "../feeds/feedFormats.js";
+import { MAX_FEED_BYTES } from "../feeds/feedParser.js";
+import { acceptPush, pushedInCategory, pushedSections } from "../feeds/listingPush.service.js";
+import { listingsCsv, listingsXml } from "../feeds/feedTemplates.js";
 import { mountPartnerLeads } from "../leads/leads.routes.js";
 import { MAX_BULK_LISTINGS, createBulkImport, runSingleImport, runWithdrawal } from "../imports/importRunner.js";
 import {
@@ -32,7 +35,16 @@ router.use(express.json({ limit: "10mb" }));
 router.use(generalLimiter);
 router.use(logPartnerRequest);
 
-const signedIn = (scope) => [requireApiClient(scope), apiClientLimiter];
+const signedIn = (scope, options) => [requireApiClient(scope, options), apiClientLimiter];
+// The XML and CSV links can carry the key themselves, for systems that only take a URL.
+const signedInByLink = (scope) => [
+  ...signedIn(scope, { allowLinkCredentials: true }),
+  // Signed in: no login box is needed, so nothing asks for one.
+  (req, res, next) => {
+    res.removeHeader("WWW-Authenticate");
+    next();
+  },
+];
 const perKeyIdempotency = idempotency({ scope: (req) => `partner:${req.apiClient?.id ?? "unknown"}` });
 
 const pageQuery = z.object({
@@ -44,8 +56,13 @@ async function connectionFor(req) {
   return ensureImportConnection({
     organizationId: req.apiClient.organizationId,
     accountId: req.apiClient.accountId,
-    name: `Listing API — ${req.apiClient.organizationName}`,
+    name: `Listing API — ${req.apiClient.organizationName ?? req.apiClient.name}`,
   });
+}
+
+/** A company's records by organization; an individual's key has only its account. */
+function ownerOf(req) {
+  return req.apiClient.organizationId ? { organizationId: req.apiClient.organizationId } : { accountId: req.apiClient.accountId };
 }
 
 function sourceOf(req) {
@@ -109,6 +126,67 @@ router.put(
   })
 );
 
+/**
+ * The client's own XML and CSV links (Scenario 2). A link that carries `client_id` and `secret`
+ * opens straight away; one that does not gets the login header, which makes a browser show its
+ * login box, where the two are typed.
+ */
+function askForLogin(req, res, next) {
+  res.setHeader("WWW-Authenticate", 'Basic realm="LivFinder listings", charset="UTF-8"');
+  next();
+}
+
+const fileBody = express.raw({ type: () => true, limit: MAX_FEED_BYTES });
+
+async function acceptFile(req, res, category) {
+  if (!Buffer.isBuffer(req.body) || !req.body.length) throw AppError.badRequest("Send the file as the request body.");
+  const { ip, userAgent } = sourceOf(req);
+  const result = await acceptPush({ client: req.apiClient, ctx: await connectionFor(req), category, content: req.body, ip, userAgent });
+  return res.status(202).json(detailResponse(result));
+}
+
+router.get(
+  "/listings.xml",
+  askForLogin,
+  ...signedInByLink("listings:read"),
+  asyncHandler(async (req, res) => {
+    const sections = await pushedSections({ accountId: req.apiClient.accountId, organizationId: req.apiClient.organizationId, ctx: await connectionFor(req) });
+    res.setHeader("Cache-Control", "no-store");
+    return res.type("application/xml").send(listingsXml(sections, `${req.protocol}://${req.get("host")}`));
+  })
+);
+
+router.post(
+  "/listings.xml",
+  askForLogin,
+  ...signedInByLink("listings:write"),
+  fileBody,
+  asyncHandler(async (req, res) => acceptFile(req, res, null))
+);
+
+// CSV stays one file per category: each has its own columns. Fixed paths, so they win over `:externalId`.
+for (const category of FEED_CATEGORIES) {
+  router.get(
+    `/listings/${category}.csv`,
+    askForLogin,
+    ...signedInByLink("listings:read"),
+    asyncHandler(async (req, res) => {
+      const entries = await pushedInCategory({ accountId: req.apiClient.accountId, organizationId: req.apiClient.organizationId, ctx: await connectionFor(req), category });
+      res.setHeader("Cache-Control", "no-store");
+      // A browser would download text/csv; as plain text the link opens like the XML one.
+      return res.type(req.accepts(["text/csv", "text/html"]) === "text/html" ? "text/plain" : "text/csv").send(listingsCsv(category, entries));
+    })
+  );
+
+  router.post(
+    `/listings/${category}.csv`,
+    askForLogin,
+    ...signedInByLink("listings:write"),
+    fileBody,
+    asyncHandler(async (req, res) => acceptFile(req, res, category))
+  );
+}
+
 /** Up to 100 listings at once; processed in the background, results per listing. */
 router.post(
   "/imports",
@@ -126,7 +204,7 @@ router.post(
     const ctx = await connectionFor(req);
     const { ip, userAgent } = sourceOf(req);
     const result = await createBulkImport({ client: req.apiClient, ctx, listings: req.body.listings, ip, userAgent });
-    const row = await repo.getImportRow(result.importRun.publicId, { organizationId: req.apiClient.organizationId });
+    const row = await repo.getImportRow(result.importRun.publicId, ownerOf(req));
     res.setHeader("X-Import-Id", result.importRun.publicId);
     res.setHeader("Location", `/v1/partner/imports/${result.importRun.publicId}`);
     return res.status(202).json(
@@ -145,13 +223,13 @@ router.get(
   validate({ query: pageQuery.extend({ status: z.enum(["queued", "running", "completed", "partial", "failed"]).optional() }) }),
   asyncHandler(async (req, res) => {
     const { page = 1, pageSize = 20, status } = q(req);
-    const result = await repo.listImports({ organizationId: req.apiClient.organizationId, status, page, pageSize });
+    const result = await repo.listImports({ ...ownerOf(req), status, page, pageSize });
     return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
   })
 );
 
 async function ownImport(req) {
-  const row = await repo.getImportRow(req.params.importId, { organizationId: req.apiClient.organizationId });
+  const row = await repo.getImportRow(req.params.importId, ownerOf(req));
   if (!row) throw AppError.notFound("That import was not found for this company.");
   return row;
 }
@@ -229,24 +307,6 @@ router.delete(
       withImportHeader(res, error);
       throw error;
     }
-  })
-);
-
-/**
- * "My feed changed": the company's system calls this after updating its file, and LivFinder
- * fetches it within a minute instead of waiting for the next scheduled run (0063).
- */
-router.post(
-  "/feeds/:category/refresh",
-  ...signedIn("listings:write"),
-  asyncHandler(async (req, res) => {
-    const feed = await getAccountFeed(req.apiClient.accountId, String(req.params.category));
-    if (!feed) throw AppError.notFound(`There is no ${req.params.category} feed on this account. Set one up in the portal first.`);
-    if (feed.status !== "active") throw AppError.conflict(`The ${feed.category} feed is ${feed.status}. Turn it back on in the portal first.`);
-    const { at } = await requestRun(feed.id);
-    return res.status(202).json(
-      detailResponse({ category: feed.category, queued: true, fetchAfter: at, message: "The feed will be fetched at the next opportunity (at most once every 2 minutes)." })
-    );
   })
 );
 

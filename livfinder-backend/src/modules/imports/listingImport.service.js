@@ -29,6 +29,9 @@ import { recordAudit } from "../system/audit.service.js";
 
 export const IMPORT_CATEGORIES = ["real-estate", "cars", "yachts", "jets", "helicopters", "watches"];
 export const MAX_IMAGES_PER_LISTING = 30;
+// The same number as `feeds/listingRequirements.js`, which cannot be imported here at load time.
+const MIN_IMAGES = 3;
+const MAX_IMAGE_REDIRECTS = 3;
 const IMAGE_TIMEOUT_MS = 20_000;
 const IMAGE_CONCURRENCY = 4;
 const CLOSED_STATUSES = new Set(["sold", "rented", "archived"]);
@@ -186,14 +189,74 @@ async function findCountry(value) {
   );
 }
 
+/** A place's own name and everything above it, for telling a client where it really is. */
+const PLACE_WITH_PARENTS = `
+  SELECT l.id, l.level, l.name, l.slug, co.id AS country_id, co.name AS country, st.name AS state, ci.name AS city, cm.name AS community
+    FROM locations l
+    LEFT JOIN locations co ON co.id = l.country_id
+    LEFT JOIN locations st ON st.id = l.state_id
+    LEFT JOIN locations ci ON ci.id = l.city_id
+    LEFT JOIN locations cm ON cm.id = l.community_id`;
+
+const whereItIs = (place) => [place.community, place.city, place.state, place.country].filter(Boolean).join(", ");
+
+const sameName = (value, name) => slugify(String(value)) === slugify(String(name ?? ""));
+
+/**
+ * A place the client named that exists, but not under the parent it gave: "Texas" in the United
+ * Arab Emirates. That is a mistake in the file, not a new place, so it is reported with where the
+ * place really is and stays out of the admin's mapping queue.
+ */
+async function wrongParent(step, value, parentName) {
+  const elsewhere = await query(
+    `${PLACE_WITH_PARENTS}
+      WHERE l.level IN (${step.levels.map(() => "?").join(", ")}) AND l.deleted_at IS NULL AND l.status = 'active'
+        AND (l.slug = ? OR LOWER(l.name) = LOWER(?))
+      ORDER BY l.active_listing_count DESC, l.id ASC LIMIT 3`,
+    [...step.levels, slugify(value), value]
+  );
+  if (!elsewhere.length) return null;
+  const places = elsewhere.map(whereItIs).filter(Boolean).join("; ");
+  return importValidationError(
+    { [`location.${step.key}`]: `The ${step.label} "${value}" is not in ${parentName}. LivFinder has it in: ${places}.` },
+    "This listing's location does not fit together."
+  );
+}
+
+/** Names sent beside a `location.id` must describe that same place; the id is never taken over them. */
+async function assertNamesMatchId(location, id) {
+  const place = await queryOne(`${PLACE_WITH_PARENTS} WHERE l.id = ?`, [id]);
+  const own = (level) => (place.level === level ? place.name : null);
+  const fields = {};
+  const given = {
+    state: place.state ?? own("state"),
+    city: place.city ?? own("city"),
+    community: place.community ?? own("community") ?? own("district"),
+    subCommunity: own("sub_community"),
+  };
+  if (location.country) {
+    const country = await findCountry(location.country);
+    if (country?.id !== (place.country_id ?? place.id)) {
+      fields["location.country"] = `The country "${location.country}" does not match location id ${id}, which is ${place.name}${whereItIs(place) ? `, ${whereItIs(place)}` : ""}.`;
+    }
+  }
+  for (const [key, actual] of Object.entries(given)) {
+    if (location[key] && !sameName(location[key], actual)) {
+      fields[`location.${key}`] = `"${location[key]}" does not match location id ${id}, which is ${place.name}${whereItIs(place) ? `, ${whereItIs(place)}` : ""}.`;
+    }
+  }
+  if (Object.keys(fields).length) throw importValidationError(fields, "This listing's location does not fit together.");
+}
+
 /** `location.id` (ours), or names walked down from the country. Returns our numeric location id. */
 export async function resolveImportLocation(location) {
   if (!location) {
-    throw importValidationError({ location: "Give the listing's location, at least its country and city." });
+    throw importValidationError({ location: "Give the listing's location, at least its country." });
   }
   if (location.id !== undefined && location.id !== null && location.id !== "") {
     const row = await resolveLocation(location.id);
     if (!row) throw importValidationError({ "location.id": "That location id was not found." });
+    await assertNamesMatchId(location, row.id);
     return row.id;
   }
   if (!location.country) throw importValidationError({ "location.country": "Give the country, as a 2-letter code or a name." });
@@ -233,6 +296,8 @@ export async function resolveImportLocation(location) {
     const mapped = row ? null : await findMapping({ type: "location", value, scope: current.id });
     const match = row || (mapped?.id ? await queryOne("SELECT id, level, name FROM locations WHERE id = ? AND deleted_at IS NULL", [mapped.id]) : null);
     if (!match) {
+      const misplaced = await wrongParent(step, value, current.name);
+      if (misplaced) throw misplaced;
       await recordUnmapped({ type: "location", value, scope: current.id, label: `${value} (${step.label} in ${current.name})` });
       throw new AppError("This listing uses a value LivFinder does not recognise.", {
         status: 422,
@@ -249,9 +314,14 @@ export async function resolveImportLocation(location) {
 }
 
 async function resolveAgent(organizationId, email, warnings) {
-  if (!email) return null;
   if (!organizationId) {
-    warnings.push("Agents belong to companies; agentEmail was ignored for this account.");
+    if (email) warnings.push("Agents belong to companies; agentEmail was ignored for this account.");
+    return null;
+  }
+  // A company with agents lists through one of them, as the portal form asks.
+  const hasAgents = await queryValue("SELECT 1 FROM agents WHERE organization_id = ? AND deleted_at IS NULL LIMIT 1", [organizationId]);
+  if (!email) {
+    if (hasAgents) throw importValidationError({ agentEmail: "Give the email of the agent for this listing." });
     return null;
   }
   const row = await queryOne(
@@ -260,10 +330,7 @@ async function resolveAgent(organizationId, email, warnings) {
       ORDER BY status = 'active' DESC, id ASC LIMIT 1`,
     [organizationId, email]
   );
-  if (!row) {
-    warnings.push(`No agent with the email ${email} is on this company, so the listing has no agent.`);
-    return null;
-  }
+  if (!row) throw importValidationError({ agentEmail: `No agent with the email ${email} is on this company.` });
   return row.id;
 }
 
@@ -271,8 +338,24 @@ async function resolveAgent(organizationId, email, warnings) {
 /* Images                                                                      */
 /* -------------------------------------------------------------------------- */
 
+// Stands in for the network in tests, as `setWebhookTransport` does for webhooks.
+let fetchImage = downloadImage;
+export function setImageFetcher(fn) {
+  fetchImage = fn ?? downloadImage;
+}
+
 async function downloadImage(url) {
-  const response = await safeFetch(url, { useAllowList: false, timeoutMs: IMAGE_TIMEOUT_MS, headers: { Accept: "image/*" } });
+  // CDNs redirect image links all the time. Each hop goes through `safeFetch`, so a redirect
+  // cannot lead to an address a client could not have sent directly.
+  let current = url;
+  let response;
+  for (let hop = 0; hop <= MAX_IMAGE_REDIRECTS; hop += 1) {
+    response = await safeFetch(current, { useAllowList: false, timeoutMs: IMAGE_TIMEOUT_MS, headers: { Accept: "image/*" }, redirect: "manual" });
+    const location = response.headers.get("location");
+    if (![301, 302, 303, 307, 308].includes(response.status) || !location) break;
+    if (hop === MAX_IMAGE_REDIRECTS) throw new Error("the image link redirected too many times");
+    current = new URL(location, current).href;
+  }
   if (!response.ok) throw new Error(`the image host answered ${response.status}`);
   const declared = Number(response.headers.get("content-length"));
   if (declared && declared > MAX_IMAGE_BYTES) throw new Error("the image is larger than 15 MB");
@@ -306,7 +389,7 @@ export async function importImages({ urls, ctx, accountId, userId }) {
           results[index] = { url, assetId: Number(cached.id), publicId: cached.public_id };
           continue;
         }
-        const buffer = await downloadImage(url);
+        const buffer = await fetchImage(url);
         let fileName = "image";
         try {
           fileName = path.basename(new URL(url).pathname) || "image";
@@ -394,8 +477,65 @@ export function serializeImportedListing(listing, extra = {}) {
 /* The import                                                                  */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * A place must be as deep as LivFinder's list goes, whether it came as names or as an id. Each
+ * level looks at what its own place has under it: a country with no cities passes as a country, a
+ * city with no communities as a city, a community with no sub-communities as a community. Where
+ * the list stops, so does the rule (owner's rule, 2026-10-30). Clients find the places in the
+ * location files (`/v1/public/feed-formats/locations/`).
+ */
+const LEVELS_BELOW = {
+  country: [
+    { column: "country_id", levels: ["city"], field: "city", label: "city" },
+    { column: "country_id", levels: ["state"], field: "state", label: "state" },
+  ],
+  state: [{ column: "state_id", levels: ["city"], field: "city", label: "city" }],
+  city: [{ column: "city_id", levels: ["community", "district"], field: "community", label: "community" }],
+  community: [{ column: "community_id", levels: ["sub_community"], field: "subCommunity", label: "sub-community" }],
+  district: [{ column: "community_id", levels: ["sub_community"], field: "subCommunity", label: "sub-community" }],
+};
+
+export async function assertLocationComplete(locationId) {
+  const place = await queryOne("SELECT id, level, name FROM locations WHERE id = ?", [locationId]);
+  for (const below of LEVELS_BELOW[place?.level] ?? []) {
+    const child = await queryValue(
+      `SELECT 1 FROM locations WHERE ${below.column} = ? AND level IN (${below.levels.map(() => "?").join(", ")})
+          AND deleted_at IS NULL AND status = 'active' LIMIT 1`,
+      [place.id, ...below.levels]
+    );
+    if (child) {
+      throw importValidationError({ [below.field]: `Give the ${below.label} in ${place.name}. See the LivFinder location files.` });
+    }
+  }
+}
+
+/**
+ * The listing's amenities by slug. One LivFinder does not have yet is added to its list, for this
+ * category, so the listing shows exactly what the client sent (owner's rule, 2026-10-30).
+ */
+async function ensureFeatures(rootId, names) {
+  const slugs = [];
+  for (const name of [...new Set((names || []).map((value) => String(value).trim()).filter(Boolean))]) {
+    const slug = slugify(name);
+    const lookup = () => queryOne("SELECT id, slug FROM features WHERE slug = ? OR code = ? OR LOWER(name) = LOWER(?) LIMIT 1", [slug, slug, name]);
+    let feature = await lookup();
+    if (!feature) {
+      await execute("INSERT IGNORE INTO features (code, slug, name, created_at) VALUES (?, ?, ?, NOW(3))", [slug, slug, name.slice(0, 120)]);
+      feature = await lookup();
+    }
+    await execute("INSERT IGNORE INTO category_features (category_id, feature_id, sort_order) VALUES (?, ?, 999)", [rootId, feature.id]);
+    slugs.push(feature.slug);
+  }
+  return slugs;
+}
+
 async function buildPayload({ record, definition, client }) {
   const warnings = [];
+  // Imported here, not at the top: the feed formats are built from this module's schema.
+  const { missingRequired } = await import("../feeds/listingRequirements.js");
+  const missing = missingRequired(record.category, record);
+  if (Object.keys(missing).length) throw importValidationError(missing);
+
   const purpose = record.purpose || undefined;
   const allowedPurposes = CATEGORY_PURPOSES[definition.listingType] || [];
   if (purpose && !allowedPurposes.includes(purpose)) {
@@ -411,7 +551,10 @@ async function buildPayload({ record, definition, client }) {
   // Settled together, so a listing with an unknown type and an unknown place reports both at once.
   const settled = await Promise.allSettled([
     resolvePropertyType(definition, record.propertyType),
-    resolveImportLocation(record.location),
+    resolveImportLocation(record.location).then(async (id) => {
+      await assertLocationComplete(id);
+      return id;
+    }),
     resolveAgent(client.organizationId, record.agentEmail, warnings),
   ]);
   const failures = settled.filter((result) => result.status === "rejected").map((result) => result.reason);
@@ -519,6 +662,18 @@ export async function importListing({ client, ctx, record, source = "api", impor
   return withAccountLock(client.accountId, async () => {
     let reference = await findReference(ctx, record.externalId);
     let listing = reference ? await loadListing(reference.listing_id) : null;
+    // A listing made in the portal shows on the link under its reference. Sent back with that id
+    // it is the same listing, from now on tied to this client's system, never a second copy.
+    if (!reference) {
+      const own = await queryOne(
+        "SELECT id FROM listings WHERE reference = ? AND (account_id = ? OR organization_id <=> ?) AND deleted_at IS NULL LIMIT 1",
+        [record.externalId, client.accountId, client.organizationId ?? -1]
+      );
+      if (own) {
+        listing = await loadListing(own.id);
+        reference = { reference_id: null, payload_hash: null, remote_status: null, listing_id: own.id };
+      }
+    }
     if (reference && !listing) {
       // The listing was deleted on LivFinder; the partner's id starts over as a new listing.
       await execute("DELETE FROM external_references WHERE id = ?", [reference.reference_id]);
@@ -560,7 +715,6 @@ export async function importListing({ client, ctx, record, source = "api", impor
       ? await importImages({ urls: imageUrls, ctx, accountId: client.accountId, userId: client.createdByUserId })
       : [];
     const failedImages = imageResults.filter((result) => result.error).map(({ url, error }) => ({ url, reason: error }));
-    for (const failure of failedImages) warnings.push(`Image not added (${failure.reason}): ${failure.url}`);
     // Two URLs can carry the same photograph; storage deduplicates the bytes, so attach it once.
     const seenAssets = new Set();
     const assets = imageResults.filter((result) => {
@@ -568,6 +722,17 @@ export async function importListing({ client, ctx, record, source = "api", impor
       seenAssets.add(result.assetId);
       return true;
     });
+    // Counted after downloading: three links are not three pictures if one is broken or a repeat.
+    if (assets.length < MIN_IMAGES) {
+      throw importValidationError({
+        images: [
+          `At least ${MIN_IMAGES} different images must load; ${assets.length} did.`,
+          ...failedImages.map((failure) => `${failure.url}: ${failure.reason}`),
+        ].join(" "),
+      });
+    }
+    for (const failure of failedImages) warnings.push(`Image not added (${failure.reason}): ${failure.url}`);
+    payload.features = await ensureFeatures(definition.rootId, record.features);
 
     let operation;
     if (!listing) {
@@ -651,7 +816,7 @@ export async function importListing({ client, ctx, record, source = "api", impor
       userId: client.createdByUserId,
       actorType: "api",
       actorLabel: actorLabel(client),
-      metadata: { externalId: record.externalId, importId, apiClientId: client.publicId, feedId: client.feedPublicId, organizationId: client.organizationPublicId, sourceIp: client.ip },
+      metadata: { externalId: record.externalId, importId, apiClientId: client.publicId, organizationId: client.organizationPublicId, sourceIp: client.ip },
       ip,
       requestId,
     });
@@ -668,10 +833,9 @@ export async function importListing({ client, ctx, record, source = "api", impor
 const actorLabel = (client) => (client.feedPublicId ? `Listing feed "${client.name}"` : `API key "${client.name}" (${client.clientId})`);
 
 /**
- * Withdraws (or archives a draft of) a listing this company pushed. `removedFromFeed` marks it as
- * gone from a feed file, so the listing returns to the queue if a later file has it again.
+ * Withdraws (or archives a draft of) a listing this company pushed.
  */
-export async function withdrawImportedListing({ client, ctx, externalId, importId = null, ip = null, requestId = null, removedFromFeed = false }) {
+export async function withdrawImportedListing({ client, ctx, externalId, importId = null, ip = null, requestId = null }) {
   return withAccountLock(client.accountId, async () => {
     const reference = await findReference(ctx, externalId);
     const listing = reference ? await loadListing(reference.listing_id) : null;
@@ -687,14 +851,14 @@ export async function withdrawImportedListing({ client, ctx, externalId, importI
       const result = await listingsService.changeListingStatus({
         listing,
         toStatus: target,
-        reason: removedFromFeed ? "No longer in the listing feed" : "Withdrawn through the listing API",
+        reason: "Withdrawn through the listing API",
         userId: client.createdByUserId,
       });
       changed = result.changed;
     }
     // Forget the last payload, so pushing the listing again resubmits it rather than reading as unchanged.
     await execute(
-      `UPDATE external_references SET payload_hash = NULL, last_synced_at = NOW(3)${removedFromFeed ? ", remote_status = 'removed'" : ""} WHERE id = ?`,
+      "UPDATE external_references SET payload_hash = NULL, last_synced_at = NOW(3) WHERE id = ?",
       [reference.reference_id]
     );
     if (changed) {
@@ -706,7 +870,7 @@ export async function withdrawImportedListing({ client, ctx, externalId, importI
         userId: client.createdByUserId,
         actorType: "api",
         actorLabel: actorLabel(client),
-        metadata: { externalId, importId, apiClientId: client.publicId, feedId: client.feedPublicId, sourceIp: client.ip },
+        metadata: { externalId, importId, apiClientId: client.publicId, sourceIp: client.ip },
         ip,
         requestId,
       });

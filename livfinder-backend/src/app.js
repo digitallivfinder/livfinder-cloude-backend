@@ -23,6 +23,7 @@ import webhooksRouter from "./modules/system/webhooks.routes.js";
 import partnerRouter from "./modules/partner/partner.routes.js";
 import { adminFeedMappingsRouter, portalFeedFormatsRouter, publicFeedFormatsRouter } from "./modules/feeds/feeds.routes.js";
 import { leadFeedRouter, portalLeadsRouter } from "./modules/leads/leads.routes.js";
+import { withoutSecret } from "./utils/redactUrl.js";
 import importsAdminRouter from "./modules/imports/imports.admin.routes.js";
 import { legacyMediaRewrite } from "./middleware/legacyMedia.js";
 
@@ -42,7 +43,7 @@ export function createApp() {
       autoLogging: { ignore: (req) => req.url.startsWith("/health") },
       customLogLevel: (req, res, error) => (error || res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info"),
       serializers: {
-        req: (req) => ({ method: req.method, url: req.url }),
+        req: (req) => ({ method: req.method, url: withoutSecret(req.url) }),
         res: (res) => ({ statusCode: res.statusCode }),
       },
     })

@@ -2,52 +2,30 @@ import { Router } from "express";
 import multer from "multer";
 import { z } from "zod";
 import { asyncHandler } from "../../middleware/errors.js";
-import { requireAccountCapability, requireAdmin, requireAuth, requirePermission } from "../../middleware/auth.js";
+import { requireAdmin, requireAuth, requirePermission } from "../../middleware/auth.js";
 import { uploadLimiter, writeLimiter } from "../../middleware/rateLimit.js";
-import { queryValue } from "../../db/query.js";
-import { assertSafeUrl } from "../../utils/safeFetch.js";
-import { resolveCategory } from "../../utils/categories.js";
-import { assertAddonActive, isAddonActive } from "../accounts/addons.service.js";
+import { query } from "../../db/query.js";
 import { auditFromRequest } from "../system/audit.service.js";
-import { requireAccountId } from "../portal/authorization.js";
-import {
-  deleteAccountFeed,
-  feedIdForPublicId,
-  getAccountFeed,
-  listAccountFeeds,
-  listAllFeeds,
-  requestRun,
-  saveAccountFeed,
-  serializeFeed,
-  setFeedStatus,
-} from "./feedSources.repository.js";
-import { testFeed } from "./feedRunner.js";
 import { MAPPING_TYPES, dismissMapping, listMappings, mappingCandidates, setMapping } from "./valueMappings.js";
 import { validate } from "../../middleware/validation.js";
 import { AppError } from "../../utils/errors.js";
 import { detailResponse, listResponse } from "../../utils/http.js";
 import { FEED_CATEGORIES, feedFormat, feedFormatIndex } from "./feedFormats.js";
 import { MAX_FEED_BYTES, parseFeed } from "./feedParser.js";
-import { csvTemplate, sampleXml, xmlSchema } from "./feedTemplates.js";
+import { csvTemplate, sampleAllXml, sampleXml, xmlSchema } from "./feedTemplates.js";
 
 /**
  * The feed formats (Phase 3 of feeds): what a company's file must look like, per category, and a
- * way to check a file against it before connecting a feed.
+ * way to check a file against it before pushing it.
  *
  *   GET  /v1/public/feed-formats                          every category, version and downloads
+ *   GET  /v1/public/feed-formats/all/sample.xml           a sample of the all-categories file
+ *   GET  /v1/public/feed-formats/locations/:file.csv      countries, states, cities, communities, sub-communities
  *   GET  /v1/public/feed-formats/:category                the field-by-field specification
  *   GET  /v1/public/feed-formats/:category/template.csv   a CSV template with an example row
  *   GET  /v1/public/feed-formats/:category/schema.xsd     the XML schema
  *   GET  /v1/public/feed-formats/:category/sample.xml     a sample XML file
  *   POST /v1/portal/feed-formats/:category/check          parse an uploaded file; nothing is saved
- *
- * And the account's own feeds (Phase 4, 0063), one URL per category:
- *
- *   GET    /v1/portal/feeds                   every category: its feed, if any, and whether it is open
- *   PUT    /v1/portal/feeds/:category         set the URL, format, schedule, change watch, on/off
- *   DELETE /v1/portal/feeds/:category         stop and forget the feed (listings stay)
- *   POST   /v1/portal/feeds/:category/run     fetch within a minute
- *   POST   /v1/portal/feeds/:category/test    fetch and read now, without saving anything
  */
 
 export const publicFeedFormatsRouter = Router();
@@ -61,10 +39,56 @@ publicFeedFormatsRouter.get(
   asyncHandler(async (req, res) => res.json({ data: feedFormatIndex() }))
 );
 
+const COUNTRY = { label: "country", column: "country_id" };
+const STATE = { label: "state", column: "state_id" };
+const CITY = { label: "city", column: "city_id" };
+const COMMUNITY = { label: "community", column: "community_id" };
+
+const LOCATION_FILES = {
+  countries: { levels: ["country"], parents: [] },
+  states: { levels: ["state"], parents: [COUNTRY] },
+  cities: { levels: ["city"], parents: [COUNTRY, STATE] },
+  communities: { levels: ["community", "district"], parents: [COUNTRY, STATE, CITY] },
+  "sub-communities": { levels: ["sub_community"], parents: [COUNTRY, STATE, CITY, COMMUNITY] },
+};
+
+/**
+ * Every place listings can be filed under, one file per level, built from the live table, so a
+ * place LivFinder adds is in the next download.
+ */
+for (const file of Object.keys(LOCATION_FILES)) {
+  publicFeedFormatsRouter.get(
+    `/feed-formats/locations/${file}.csv`,
+    asyncHandler(async (req, res) => {
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="livfinder-${file}.csv"`);
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      await writeLocationFile(res, LOCATION_FILES[file]);
+      return res.end();
+    })
+  );
+}
+
+publicFeedFormatsRouter.get(
+  "/feed-formats/all/sample.xml",
+  asyncHandler(async (req, res) => {
+    res.setHeader("Content-Type", "application/xml; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="livfinder-all-categories.xml"');
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    return res.send(sampleAllXml());
+  })
+);
+
 publicFeedFormatsRouter.get(
   "/feed-formats/:category",
   validate({ params: categoryParam }),
-  asyncHandler(async (req, res) => res.json(detailResponse(feedFormat(req.params.category))))
+  asyncHandler(async (req, res) => {
+    const format = feedFormat(req.params.category);
+    const keysOf = (requirement) => format.fields.filter((field) => field.requirement === requirement).map((field) => field.key);
+    // The answer at a glance: `required: false` alone cannot tell "never" from "sometimes".
+    const summary = { required: keysOf("required"), conditional: keysOf("conditional"), optional: keysOf("optional") };
+    return res.json(detailResponse({ ...format, summary }));
+  })
 );
 
 const download = (contentType, extension, build) =>
@@ -93,10 +117,39 @@ publicFeedFormatsRouter.get(
   download("application/xml", "xml", sampleXml)
 );
 
+const csvText = (value) => {
+  const text = String(value ?? "");
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+};
+
+async function writeLocationFile(res, { levels, parents }) {
+  const headers = parents.flatMap(({ label }) => [`${label}Id`, label]);
+  res.write(`${["locationId", "name", ...headers].join(",")}\r\n`);
+  const joins = parents.map(({ label, column }) => `LEFT JOIN locations ${label} ON ${label}.id = l.${column}`).join("\n         ");
+  const columns = parents.map(({ label }) => `, ${label}.id AS ${label}_id, ${label}.name AS ${label}_name`).join("");
+  let after = 0;
+  for (;;) {
+    const rows = await query(
+      `SELECT l.id, l.name${columns}
+         FROM locations l
+         ${joins}
+        WHERE l.id > ? AND l.deleted_at IS NULL AND l.status = 'active' AND l.level IN (${levels.map(() => "?").join(", ")})
+        ORDER BY l.id ASC LIMIT 5000`,
+      [after, ...levels]
+    );
+    if (!rows.length) return;
+    const lines = rows.map((row) =>
+      [row.id, row.name, ...parents.flatMap(({ label }) => [row[`${label}_id`], row[`${label}_name`]])].map(csvText).join(",")
+    );
+    res.write(`${lines.join("\r\n")}\r\n`);
+    after = rows[rows.length - 1].id;
+  }
+}
+
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_FEED_BYTES, files: 1 } });
 
 /**
- * Checks a file the way a feed run would read it and reports every row, without saving
+ * Checks a file the way a push would read it and reports every row, without saving
  * anything. Matching values to LivFinder's own (property types, locations, agents) and fetching
  * images happen on a real run.
  */
@@ -125,141 +178,6 @@ portalFeedFormatsRouter.post(
         rows: failed.slice(0, 500).map((item) => ({ row: item.row, externalId: item.externalId, errors: item.errors })),
       })
     );
-  })
-);
-
-/* -------------------------------------------------------------------------- */
-/* The account's feeds                                                         */
-/* -------------------------------------------------------------------------- */
-
-async function hasCategoryAccess(accountId, category) {
-  const rootId = category === "developments" ? 7 : resolveCategory(category)?.rootId;
-  if (!rootId) return false;
-  return Boolean(
-    await queryValue(
-      `SELECT aca.id FROM account_category_access aca JOIN categories c ON c.id = aca.category_id
-        WHERE aca.account_id = ? AND COALESCE(c.root_category_id, c.id) = ? AND aca.status = 'approved' LIMIT 1`,
-      [accountId, rootId]
-    )
-  );
-}
-
-const feedBody = z
-  .object({
-    url: z.string().trim().url("Give the full address of the file, starting with https://.").max(1000).optional(),
-    format: z.enum(["auto", "xml", "csv"]).optional(),
-    schedule: z.enum(["hourly", "every_6_hours", "daily"]).optional(),
-    watchChanges: z.boolean().optional(),
-    status: z.enum(["active", "paused"]).optional(),
-  })
-  .refine((body) => Object.keys(body).length > 0, { message: "Nothing to change." });
-
-portalFeedFormatsRouter.get(
-  "/feeds",
-  requireAuth,
-  requireAccountCapability("can_view_integrations"),
-  asyncHandler(async (req, res) => {
-    const accountId = requireAccountId(req);
-    const [feeds, addonActive] = await Promise.all([listAccountFeeds(accountId), isAddonActive(accountId, "integrations")]);
-    const categories = [];
-    for (const category of FEED_CATEGORIES) {
-      categories.push({
-        category,
-        label: feedFormat(category).label,
-        version: feedFormat(category).version,
-        hasAccess: await hasCategoryAccess(accountId, category),
-        feed: serializeFeed(feeds.find((feed) => feed.category === category)),
-      });
-    }
-    return res.json({ data: { addonActive, categories } });
-  })
-);
-
-portalFeedFormatsRouter.put(
-  "/feeds/:category",
-  writeLimiter,
-  requireAuth,
-  requireAccountCapability("can_view_integrations"),
-  validate({ params: categoryParam, body: feedBody }),
-  asyncHandler(async (req, res) => {
-    const accountId = requireAccountId(req);
-    const { category } = req.params;
-    await assertAddonActive(accountId, "integrations");
-    if (!(await hasCategoryAccess(accountId, category))) {
-      throw AppError.forbidden(`This account is not approved for ${feedFormat(category).label}, so it cannot have a feed for it.`);
-    }
-    if (category === "developments" && !req.auth.activeMembership?.organization_id) {
-      throw AppError.forbidden("Development feeds belong to developer companies.");
-    }
-    const existing = await getAccountFeed(accountId, category);
-    if (!existing && !req.body.url) throw AppError.validation("Some information is invalid.", { url: "Give the feed's address." });
-    if (req.body.url) {
-      try {
-        await assertSafeUrl(req.body.url, { useAllowList: false });
-      } catch (error) {
-        throw AppError.validation("Some information is invalid.", { url: error.message });
-      }
-    }
-    const feed = await saveAccountFeed({
-      accountId,
-      organizationId: req.auth.activeMembership?.organization_id ?? null,
-      category,
-      ...req.body,
-      userId: req.auth.user.id,
-    });
-    await auditFromRequest(req, { action: existing ? "feed.updated" : "feed.created", subjectType: "feed_source", subjectId: feed.id, changes: req.body });
-    return res.status(existing ? 200 : 201).json(detailResponse(serializeFeed(feed)));
-  })
-);
-
-portalFeedFormatsRouter.delete(
-  "/feeds/:category",
-  writeLimiter,
-  requireAuth,
-  requireAccountCapability("can_view_integrations"),
-  validate({ params: categoryParam }),
-  asyncHandler(async (req, res) => {
-    const accountId = requireAccountId(req);
-    await deleteAccountFeed(accountId, req.params.category);
-    await auditFromRequest(req, { action: "feed.deleted", subjectType: "feed_source", subjectLabel: req.params.category });
-    return res.json(detailResponse({ deleted: true }));
-  })
-);
-
-async function ownFeed(req) {
-  const feed = await getAccountFeed(requireAccountId(req), req.params.category);
-  if (!feed) throw AppError.notFound("There is no feed for that category yet.");
-  return feed;
-}
-
-portalFeedFormatsRouter.post(
-  "/feeds/:category/run",
-  writeLimiter,
-  requireAuth,
-  requireAccountCapability("can_view_integrations"),
-  validate({ params: categoryParam }),
-  asyncHandler(async (req, res) => {
-    const feed = await ownFeed(req);
-    await assertAddonActive(feed.account_id, "integrations");
-    if (feed.status !== "active") throw AppError.conflict("Turn the feed on before running it.");
-    const { at } = await requestRun(feed.id);
-    return res.status(202).json(detailResponse({ queued: true, fetchAfter: at, message: "The feed will be fetched shortly (at most once every 2 minutes)." }));
-  })
-);
-
-portalFeedFormatsRouter.post(
-  "/feeds/:category/test",
-  writeLimiter,
-  requireAuth,
-  requireAccountCapability("can_view_integrations"),
-  validate({ params: categoryParam, body: z.object({ url: z.string().trim().url().max(1000).optional() }).partial() }),
-  asyncHandler(async (req, res) => {
-    const accountId = requireAccountId(req);
-    const saved = await getAccountFeed(accountId, req.params.category);
-    const url = req.body?.url || saved?.url;
-    if (!url) throw AppError.validation("Some information is invalid.", { url: "Give the feed's address." });
-    const report = await testFeed({ url, category: req.params.category, format: saved?.format ?? "auto" });
-    return res.json(detailResponse(report));
   })
 );
 
@@ -327,65 +245,5 @@ adminFeedMappingsRouter.delete(
     await dismissMapping(Number(req.params.id));
     await auditFromRequest(req, { action: "feed_mapping.dismissed", subjectType: "feed_value_mapping", subjectLabel: req.params.id });
     return res.json(detailResponse({ dismissed: true }));
-  })
-);
-
-/* -------------------------------------------------------------------------- */
-/* Admin: the feed monitor (Phase 7)                                           */
-/* -------------------------------------------------------------------------- */
-/*
- *   GET   /v1/admin/feeds                 every company's feeds; ?problem=1 for the ones needing a look
- *   PATCH /v1/admin/feeds/:id             pause a feed, or turn it back on
- *   POST  /v1/admin/feeds/:id/run         fetch it within a minute
- */
-
-const feedMonitor = [requireAuth, requireAdmin, requirePermission("api.view")];
-
-adminFeedMappingsRouter.get(
-  "/feeds",
-  ...feedMonitor,
-  validate({
-    query: z.object({
-      status: z.enum(["active", "paused", "error"]).optional(),
-      category: z.enum(FEED_CATEGORIES).optional(),
-      problem: z.enum(["0", "1"]).optional(),
-      search: z.string().trim().max(120).optional(),
-      page: z.coerce.number().int().min(1).max(10_000).optional(),
-      pageSize: z.coerce.number().int().min(1).max(100).optional(),
-    }),
-  }),
-  asyncHandler(async (req, res) => {
-    const { status, category, problem, search, page = 1, pageSize = 50 } = req.validatedQuery || {};
-    const result = await listAllFeeds({ status, category, problem: problem === "1", search, page, pageSize });
-    return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
-  })
-);
-
-adminFeedMappingsRouter.patch(
-  "/feeds/:id",
-  writeLimiter,
-  requireAuth,
-  requireAdmin,
-  requirePermission("listings.moderate"),
-  validate({ body: z.object({ status: z.enum(["active", "paused"]) }) }),
-  asyncHandler(async (req, res) => {
-    const result = await setFeedStatus(req.params.id, req.body.status);
-    await auditFromRequest(req, { action: `feed.${req.body.status === "active" ? "resumed" : "paused"}_by_admin`, subjectType: "feed_source", subjectLabel: req.params.id });
-    return res.json(detailResponse(result));
-  })
-);
-
-adminFeedMappingsRouter.post(
-  "/feeds/:id/run",
-  writeLimiter,
-  requireAuth,
-  requireAdmin,
-  requirePermission("listings.moderate"),
-  asyncHandler(async (req, res) => {
-    const feed = await feedIdForPublicId(req.params.id);
-    if (feed.status !== "active") throw AppError.conflict("Turn the feed on before running it.");
-    await requestRun(feed.id);
-    await auditFromRequest(req, { action: "feed.run_by_admin", subjectType: "feed_source", subjectLabel: req.params.id });
-    return res.status(202).json(detailResponse({ queued: true }));
   })
 );

@@ -154,8 +154,7 @@ export async function mappingCandidates(id, q = "") {
 }
 
 /**
- * Saves an admin's mapping. Feeds whose last run had failures are fetched again soon, so their
- * listings go through without waiting for the file to change.
+ * Saves an admin's mapping. It applies from the company's next push of those listings.
  */
 export async function setMapping(id, { locationId = null, categoryCode = null }) {
   const row = await loadMapping(id);
@@ -174,11 +173,6 @@ export async function setMapping(id, { locationId = null, categoryCode = null })
     if (!category) throw AppError.validation("Some information is invalid.", { categoryCode: "Choose one of this category's types." });
     await execute("UPDATE feed_value_mappings SET internal_id = NULL, internal_value = ?, is_unmapped = 0 WHERE id = ?", [category.code, row.id]);
   }
-  await execute(
-    `UPDATE feed_sources fs JOIN feed_imports fi ON fi.id = fs.last_import_id
-        SET fs.last_checksum = NULL, fs.next_run_at = NOW(3)
-      WHERE fs.status = 'active' AND fi.status IN ('partial', 'failed')`
-  );
   return serialize({ ...(await loadMapping(id)) });
 }
 

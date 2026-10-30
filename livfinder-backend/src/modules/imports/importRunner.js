@@ -2,9 +2,9 @@ import logger from "../../config/logger.js";
 import env from "../../config/env.js";
 import { execute, query, queryOne } from "../../db/query.js";
 import { AppError } from "../../utils/errors.js";
-import { notifyAccount } from "../system/notifications.service.js";
+import { notifyRejectedListings } from "./rejectionNotice.service.js";
 import { importProviderId } from "./importConnection.js";
-import { feedClientFor } from "../feeds/feedSources.repository.js";
+import { importDevelopmentsRun } from "../feeds/developmentImport.service.js";
 import { assertAddonActive } from "../accounts/addons.service.js";
 import * as repo from "./imports.repository.js";
 import { importListing, parseListingRecord, withdrawImportedListing } from "./listingImport.service.js";
@@ -96,6 +96,7 @@ export async function createBulkImport({ client, ctx, listings, ip, userAgent })
     setImmediate(() => processImport(importRun.id).catch((error) => logger.error({ err: error }, "bulk import failed")));
   } else {
     await repo.finalizeImport(importRun.id);
+    await notifyRejectedListings(importRun.id).catch((error) => logger.error({ err: error }, "rejection notice failed"));
   }
 
   return {
@@ -112,7 +113,7 @@ async function clientForRun(run) {
     `SELECT ac.id, ac.public_id, ac.name, ac.client_id, ac.status, ac.created_by_user_id, ac.organization_id,
             COALESCE(ac.account_id, o.account_id) AS account_id, o.public_id AS organization_public_id,
             o.status AS organization_status
-       FROM api_clients ac JOIN organizations o ON o.id = ac.organization_id
+       FROM api_clients ac LEFT JOIN organizations o ON o.id = ac.organization_id
       WHERE ac.id = ?`,
     [run.api_client_id]
   );
@@ -123,7 +124,8 @@ async function clientForRun(run) {
     name: row.name,
     clientId: row.client_id,
     status: row.status,
-    organizationStatus: row.organization_status,
+    // An individual's key has no organization to be suspended.
+    organizationStatus: row.organization_id ? row.organization_status : "active",
     organizationId: row.organization_id,
     organizationPublicId: row.organization_public_id,
     accountId: row.account_id,
@@ -141,33 +143,38 @@ export async function processImport(importId) {
   if (!claim.affectedRows) return null;
 
   const run = await queryOne(
-    `SELECT id, public_id, connection_id, provider_id, api_client_id, feed_source_id, organization_id, account_id,
+    `SELECT id, public_id, connection_id, provider_id, api_client_id, import_type, entity_type, organization_id, account_id,
             INET6_NTOA(source_ip) AS source_ip
        FROM feed_imports WHERE id = ?`,
     [importId]
   );
   const ctx = { providerId: Number(run.provider_id), connectionId: Number(run.connection_id) };
-  // A feed run (0063) imports as its feed; everything else as the API key that pushed it.
-  const client = run.feed_source_id ? await feedClientFor(run.feed_source_id) : run.api_client_id ? await clientForRun(run) : null;
-  const source = run.feed_source_id ? "feed" : "api";
+  const client = run.api_client_id ? await clientForRun(run) : null;
+  // A pushed XML or CSV file is a `full` import; its listings are marked as coming from a feed.
+  const source = run.import_type === "full" ? "feed" : "api";
   const items = await query(
     "SELECT id, raw_payload FROM feed_import_items WHERE import_id = ? AND status = 'queued' ORDER BY source_row ASC, id ASC",
     [importId]
   );
 
-  for (const item of items) {
+  // Developments have their own import; a revoked key or suspended company still stops them.
+  const developments = run.entity_type === "project" && client?.status === "active" && client.organizationStatus === "active";
+  if (developments) await importDevelopmentsRun({ run, client, ctx });
+
+  for (const item of developments ? [] : items) {
     try {
       // A key revoked, or a company suspended, after the batch was accepted stops the rest of it.
       if (!client || client.status !== "active" || client.organizationStatus !== "active") {
-        throw new AppError(`The ${source === "feed" ? "feed" : "API key"} or account was disabled before this listing was processed.`, {
+        throw new AppError("The API key or account was disabled before this listing was processed.", {
           status: 401,
           code: "API_KEY_INVALID",
         });
       }
       await assertAddonActive(client.accountId, "integrations");
       const raw = typeof item.raw_payload === "string" ? JSON.parse(item.raw_payload) : item.raw_payload;
-      const record = parseListingRecord(raw);
-      const outcome = await importListing({ client, ctx, record, source, importId: run.public_id, ip: run.source_ip });
+      const outcome = raw.withdraw
+        ? await withdrawImportedListing({ client, ctx, externalId: raw.externalId, importId: run.public_id, ip: run.source_ip })
+        : await importListing({ client, ctx, record: parseListingRecord(raw), source, importId: run.public_id, ip: run.source_ip });
       await repo.recordItemSuccess(item.id, importId, outcome);
     } catch (error) {
       if (!(error instanceof AppError) || error.status >= 500) {
@@ -178,22 +185,7 @@ export async function processImport(importId) {
   }
 
   const status = await repo.finalizeImport(importId);
-  if (status === "partial" || status === "failed") {
-    const failed = await queryOne("SELECT failed_count, total_rows FROM feed_imports WHERE id = ?", [importId]);
-    await notifyAccount(
-      { accountId: run.account_id, organizationId: run.organization_id },
-      {
-        type: "listing_import.failed_items",
-        title: `${failed.failed_count} of ${failed.total_rows} listings in an API import failed`,
-        body: "Open API & Integrations to see what needs fixing.",
-        actionUrl: "/portal/integrations",
-        icon: "alert",
-        subjectType: "feed_import",
-        subjectId: importId,
-        data: { importId: run.public_id },
-      }
-    ).catch(() => {});
-  }
+  if (status === "partial" || status === "failed") await notifyRejectedListings(importId).catch((error) => logger.error({ err: error }, "rejection notice failed"));
   return status;
 }
 
