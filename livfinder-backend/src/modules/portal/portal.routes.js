@@ -1,3 +1,4 @@
+import { publishBookingChange } from "../calendar/calendar.service.js";
 import { Router } from "express";
 import { z } from "zod";
 import { asyncHandler } from "../../middleware/errors.js";
@@ -14,6 +15,7 @@ import * as engagement from "./engagement.repository.js";
 import * as listingsService from "../listings/listings.service.js";
 import * as listingsRepo from "../listings/listings.repository.js";
 import * as profileService from "./profile.service.js";
+import * as teamInvitations from "../accounts/teamInvitation.service.js";
 import * as organizationService from "./organization.service.js";
 import * as settingsService from "./settings.service.js";
 import { createListingSchema, updateListingSchema, listingStatusSchema } from "../listings/listings.schemas.js";
@@ -144,10 +146,8 @@ router.post(
     // The plan's storage and live limits are enforced by `createListing`; the form's own count
     // is advisory.
 
-    // Organizations may only list in a category they have been approved for.
-    if (organizationId) {
-      await organizationService.assertCategoryAccess({ organizationId, category: req.body.category });
-    }
+    // Companies and individuals alike list only in a category they have been approved for.
+    await organizationService.assertCategoryAccess({ organizationId, accountId, category: req.body.category });
 
     const created = await listingsService.createListing({
       payload: req.body,
@@ -479,7 +479,7 @@ router.patch(
   asyncHandler(async (req, res) => {
     const { accountId, organizationId } = scope(req);
     const booking = await queryOne(
-      `SELECT id, public_id, status FROM bookings
+      `SELECT id, public_id, status, scheduled_start FROM bookings
         WHERE public_id = ? AND (account_id = ? OR organization_id = ?) AND deleted_at IS NULL`,
       [req.params.id, accountId, organizationId]
     );
@@ -524,6 +524,7 @@ router.patch(
     });
 
     await emitLeadEvent("booking", booking.id, "lead.updated");
+    await publishBookingChange(booking.id, { previousStatus: booking.status, previousStart: booking.scheduled_start });
     await auditFromRequest(req, { action: "booking.updated", subjectType: "booking", subjectId: booking.id, changes: req.body });
     return res.json(detailResponse({ id: booking.public_id, updated: true }));
   })
@@ -746,6 +747,47 @@ router.patch(
     const agent = await organizationService.updateAgent({ organizationId, agentPublicId: req.params.id, payload: req.body, req });
     await auditFromRequest(req, { action: "agent.updated", subjectType: "agent", subjectId: agent.agentId, changes: req.body });
     return res.json(detailResponse(agent));
+  })
+);
+
+router.get(
+  "/organization/invitations",
+  requireAccountCapability("can_manage_members"),
+  asyncHandler(async (req, res) => res.json(listResponse(await teamInvitations.listInvitations(requireOrganizationId(req)))))
+);
+
+router.post(
+  "/organization/invitations",
+  writeLimiter,
+  requireAccountCapability("can_manage_members"),
+  validate({ body: teamInvitations.invitationCreateSchema }),
+  asyncHandler(async (req, res) => {
+    const organizationId = requireOrganizationId(req);
+    const invitation = await teamInvitations.createInvitation({ organizationId, payload: req.body, userId: req.auth.user.id });
+    await auditFromRequest(req, { action: "team.invited", subjectType: "organization", subjectId: organizationId, subjectLabel: req.body.email, changes: { role: req.body.role } });
+    return res.status(201).json(detailResponse(invitation));
+  })
+);
+
+router.post(
+  "/organization/invitations/:id/resend",
+  writeLimiter,
+  requireAccountCapability("can_manage_members"),
+  asyncHandler(async (req, res) => {
+    const invitation = await teamInvitations.resendInvitation({ organizationId: requireOrganizationId(req), publicId: req.params.id, userId: req.auth.user.id });
+    return res.json(detailResponse(invitation));
+  })
+);
+
+router.delete(
+  "/organization/invitations/:id",
+  writeLimiter,
+  requireAccountCapability("can_manage_members"),
+  asyncHandler(async (req, res) => {
+    const organizationId = requireOrganizationId(req);
+    const result = await teamInvitations.revokeInvitation({ organizationId, publicId: req.params.id });
+    await auditFromRequest(req, { action: "team.invitation_revoked", subjectType: "organization", subjectId: organizationId, subjectLabel: req.params.id });
+    return res.json(detailResponse(result));
   })
 );
 

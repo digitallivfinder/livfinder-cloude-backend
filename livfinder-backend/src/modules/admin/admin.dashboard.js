@@ -121,7 +121,9 @@ async function dashboardKpis() {
          FROM listings WHERE deleted_at IS NULL`
     ),
     queryOne(
-      `SELECT COUNT(*) AS total, SUM(verification_status = 'pending') AS pending
+      `SELECT COUNT(*) AS total,
+              (SELECT COUNT(*) FROM verification_requests WHERE subject_type IN ('organization', 'account')
+                AND status IN ('pending', 'in_review')) AS pending
          FROM organizations WHERE deleted_at IS NULL`
     ),
     queryOne("SELECT COUNT(*) AS total FROM agents WHERE deleted_at IS NULL"),
@@ -168,7 +170,7 @@ async function dashboardKpis() {
       value: int(organizations?.total) ?? 0,
       trend: null,
       tone: "default",
-      detail: `${int(organizations?.pending) ?? 0} pending verification`,
+      detail: `${int(organizations?.pending) ?? 0} applications to review`,
     },
     { id: "agents", label: "Agents", value: int(agents?.total) ?? 0, trend: null, tone: "default", detail: null },
     {

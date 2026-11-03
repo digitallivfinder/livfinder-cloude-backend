@@ -241,15 +241,17 @@ router.get(
   asyncHandler(async (req, res) => {
     const result = await orgRepo.getPublicOrganization(req.params.slug);
     if (!result) throw AppError.notFound("That company page is not available.");
-    const [listings, agents] = await Promise.all([
+    const [listings, agents, reviews] = await Promise.all([
       searchRepo.searchListings({ organizationId: result.raw.id }, { limit: 24 }),
       orgRepo.listPublicAgents({ organizationId: result.raw.id, limit: 50 }),
+      orgRepo.listPublicReviews({ organizationId: result.raw.id }),
     ]);
     return res.json(
       detailResponse({
         agency: { ...result.company, activeListingCount: listings.total, publicAgentCount: agents.total },
         listings: listings.rows,
         agents: agents.rows,
+        reviews,
       })
     );
   })
@@ -277,15 +279,17 @@ router.get(
   asyncHandler(async (req, res) => {
     const result = await orgRepo.getPublicAgent(req.params.slug);
     if (!result) throw AppError.notFound("That profile is not available.");
-    const [listings, organization] = await Promise.all([
+    const [listings, organization, reviews] = await Promise.all([
       searchRepo.searchListings({ agentId: result.raw.id }, { limit: 24 }),
       result.raw.organization_id ? orgRepo.getPublicOrganization(String(result.raw.organization_id)) : null,
+      orgRepo.listPublicReviews({ agentId: result.raw.id }),
     ]);
     return res.json(
       detailResponse({
         agent: { ...result.agent, activeListingCount: listings.total },
         agency: organization?.company || null,
         listings: listings.rows,
+        reviews,
       })
     );
   })
@@ -399,6 +403,24 @@ router.get(
 );
 
 router.get(
+  "/country-codes",
+  asyncHandler(async (req, res) => {
+    const rows = await locationsRepo.listCountryCodes();
+    return res.json(
+      detailResponse(
+        rows.map((row) => ({
+          id: `country:${row.id}`,
+          slug: row.slug,
+          name: row.name,
+          iso2: row.iso2,
+          phoneCode: row.phone_code,
+        }))
+      )
+    );
+  })
+);
+
+router.get(
   "/countries/:slug",
   validate({ params: slugParam }),
   asyncHandler(async (req, res) => {
@@ -478,7 +500,12 @@ router.get(
     // A prefix match is the right first answer; fall back to contains so
     // "Jumeirah" still finds "Palm Jumeirah".
     if (params.q && options.length < 5) {
-      const extra = await locationsRepo.searchLocationsContains({ q: params.q, types, limit: params.limit || 20 });
+      const extra = await locationsRepo.searchLocationsContains({
+        q: params.q,
+        types,
+        countryId: countryRow?.id || params.countryId || null,
+        limit: params.limit || 20,
+      });
       const seen = new Set(options.map((option) => option.id));
       options = [...options, ...extra.filter((option) => !seen.has(option.id))].slice(0, params.limit || 20);
     }

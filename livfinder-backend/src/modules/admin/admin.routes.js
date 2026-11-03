@@ -7,7 +7,7 @@ import { requireAuth, requireAdmin, requirePermission, requireCategoryScope, req
 import { assertRootCategoryScope, scopedRootCategoryIds, scopeListingParam, scopeDevelopmentParam } from "./admin.shared.js";
 import { detailResponse, listResponse } from "../../utils/http.js";
 import { AppError } from "../../utils/errors.js";
-import { queryOne } from "../../db/query.js";
+import { queryOne, queryValue } from "../../db/query.js";
 import { revisionForReview } from "../listings/listingRevisions.service.js";
 import { projectRevisionForReview } from "../projects/projectRevisions.service.js";
 import { auditFromRequest } from "../system/audit.service.js";
@@ -18,7 +18,13 @@ import * as content from "./admin.content.js";
 import * as settings from "./admin.settings.js";
 import * as mutations from "./admin.mutations.js";
 import { documentFile } from "../leads/portalLeads.service.js";
+import { API_SCOPES } from "../../middleware/apiClient.js";
+import { assertAddonActive } from "../accounts/addons.service.js";
+import { createFeedToken, revokeFeedToken } from "../leads/leadFeedTokens.service.js";
+import { WEBHOOK_EVENTS, createWebhook, deleteWebhook, listDeliveries, rotateWebhookSecret, sendTestEvent, updateWebhook } from "../leads/webhooks.service.js";
+import { createApiClient, revokeApiClient, updateApiClient } from "../portal/organization.service.js";
 import { sendLeadDocument } from "../leads/leads.routes.js";
+import * as teamInvitations from "../accounts/teamInvitation.service.js";
 import { adminPermissionUniverse } from "../auth/adminPermissions.js";
 import { toAdminPermissions } from "../auth/adminPermissions.js";
 import { allPermissionCodes } from "../auth/rbac.js";
@@ -472,15 +478,260 @@ router.patch(
   })
 );
 
+/*
+ * Team invitations on a company's behalf: the same emailed 7-day link the portal's Agents / Team
+ * screen sends, so a profile an admin added can be given a login. Writes need step-up and are
+ * audited; the email names LivFinder as the sender.
+ */
+async function companyOrganizationId(identifier) {
+  const id = await queryValue("SELECT id FROM organizations WHERE (public_id = ? OR slug = ?) AND deleted_at IS NULL LIMIT 1", [identifier, identifier]);
+  if (!id) throw AppError.notFound("That company was not found.");
+  return Number(id);
+}
+const ADMIN_INVITER = "The LivFinder team";
+
+router.get(
+  "/companies/:id/invitations",
+  requirePermission("companies.view"),
+  asyncHandler(async (req, res) => res.json(listResponse(await teamInvitations.listInvitations(await companyOrganizationId(req.params.id)))))
+);
+
+router.post(
+  "/companies/:id/invitations",
+  writeLimiter,
+  requirePermission("companies.edit"),
+  requireStepUp(),
+  validate({ body: teamInvitations.invitationCreateSchema }),
+  asyncHandler(async (req, res) => {
+    const organizationId = await companyOrganizationId(req.params.id);
+    const invitation = await teamInvitations.createInvitation({ organizationId, payload: req.body, userId: req.auth.user.id, inviterLabel: ADMIN_INVITER });
+    await auditFromRequest(req, { action: "team.invited", subjectType: "organization", subjectId: organizationId, subjectLabel: req.body.email, changes: { role: req.body.role, byAdmin: true } });
+    return res.status(201).json(detailResponse(invitation));
+  })
+);
+
+router.post(
+  "/companies/:id/invitations/:invitationId/resend",
+  writeLimiter,
+  requirePermission("companies.edit"),
+  requireStepUp(),
+  asyncHandler(async (req, res) => {
+    const organizationId = await companyOrganizationId(req.params.id);
+    const invitation = await teamInvitations.resendInvitation({ organizationId, publicId: req.params.invitationId, userId: req.auth.user.id, inviterLabel: ADMIN_INVITER });
+    return res.json(detailResponse(invitation));
+  })
+);
+
+router.delete(
+  "/companies/:id/invitations/:invitationId",
+  writeLimiter,
+  requirePermission("companies.edit"),
+  requireStepUp(),
+  asyncHandler(async (req, res) => {
+    const organizationId = await companyOrganizationId(req.params.id);
+    const result = await teamInvitations.revokeInvitation({ organizationId, publicId: req.params.invitationId });
+    await auditFromRequest(req, { action: "team.invitation_revoked", subjectType: "organization", subjectId: organizationId, subjectLabel: req.params.invitationId });
+    return res.json(detailResponse(result));
+  })
+);
+
+router.post(
+  "/companies/:id/password-reset",
+  writeLimiter,
+  requirePermission("companies.edit"),
+  requireStepUp(),
+  validate({ body: mutations.companyPasswordResetSchema }),
+  asyncHandler(async (req, res) => {
+    const { userId, ...result } = await mutations.resetCompanyPassword({ identifier: req.params.id, ...req.body, ip: req.ip });
+    await auditFromRequest(req, {
+      action: "company.password_reset",
+      subjectType: "user",
+      subjectId: userId,
+      subjectLabel: req.params.id,
+      changes: { method: req.body.method, sentTo: result.sentTo },
+    });
+    res.setHeader("Cache-Control", "no-store");
+    return res.json(detailResponse(result));
+  })
+);
+
 router.patch(
   "/companies/:id/package",
   writeLimiter,
   requirePermission("companies.edit", "finance.plans"),
   validate({ body: mutations.packageChangeSchema }),
   asyncHandler(async (req, res) => {
-    const result = await mutations.changeAccountPackage({ identifier: req.params.id, payload: req.body });
-    await auditFromRequest(req, { action: "account.package_changed", subjectType: "account", subjectLabel: req.params.id, changes: req.body });
+    const result = await mutations.changeAccountPackage({ identifier: req.params.id, payload: req.body, userId: req.auth.user.id });
+    await auditFromRequest(req, {
+      action: result.scheduled ? "account.package_change_scheduled" : "account.package_changed",
+      subjectType: "account",
+      subjectLabel: req.params.id,
+      changes: req.body,
+    });
     return res.json(detailResponse(result));
+  })
+);
+
+router.delete(
+  "/companies/:id/package/scheduled",
+  writeLimiter,
+  requirePermission("companies.edit", "finance.plans"),
+  asyncHandler(async (req, res) => {
+    const result = await mutations.cancelAccountPackageChange({ identifier: req.params.id });
+    await auditFromRequest(req, { action: "account.package_change_cancelled", subjectType: "account", subjectLabel: req.params.id });
+    return res.json(detailResponse(result));
+  })
+);
+
+router.get(
+  "/companies/:id/integration",
+  requirePermission("companies.view"),
+  asyncHandler(async (req, res) => res.json(detailResponse(await catalog.getCompanyIntegration(req.params.id))))
+);
+
+/* The company's integration, managed on its behalf: the same services and rules as its portal. */
+
+const integrationWrite = [writeLimiter, requirePermission("companies.edit"), requireStepUp()];
+const owningAccount = async (req) => catalog.integrationAccount(req.params.id);
+const allowedIps = z.array(z.string().trim().max(64)).max(20);
+const webhookBody = z.object({
+  name: z.string().trim().min(1).max(160),
+  url: z.string().trim().url("Give the full https:// address of the endpoint.").max(700),
+  events: z.array(z.enum(WEBHOOK_EVENTS)).min(1, "Choose at least one event.").max(WEBHOOK_EVENTS.length),
+});
+const auditIntegration = (req, action, subjectLabel, changes) =>
+  auditFromRequest(req, { action, subjectType: "organization", subjectLabel, changes, metadata: { company: req.params.id } });
+
+router.post(
+  "/companies/:id/integration/keys",
+  ...integrationWrite,
+  validate({
+    body: z.object({
+      name: z.string().trim().min(1).max(120),
+      scopes: z.array(z.enum(API_SCOPES)).min(1, "Choose at least one scope.").max(API_SCOPES.length),
+      allowedIps: allowedIps.optional(),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const { accountId, organizationId } = await owningAccount(req);
+    await assertAddonActive(accountId, "integrations");
+    const created = await createApiClient({
+      accountId, organizationId, name: req.body.name, scopes: [...new Set(req.body.scopes)], allowedIps: req.body.allowedIps || [], userId: req.auth.user.id,
+    });
+    await auditIntegration(req, "api_client.created", req.body.name, { scopes: created.scopes });
+    return res.status(201).json(detailResponse(created));
+  })
+);
+
+router.patch(
+  "/companies/:id/integration/keys/:keyId",
+  ...integrationWrite,
+  validate({ body: z.object({ name: z.string().trim().min(1).max(120).optional(), allowedIps: allowedIps.optional() }) }),
+  asyncHandler(async (req, res) => {
+    const { accountId } = await owningAccount(req);
+    await updateApiClient({ accountId, publicId: req.params.keyId, ...req.body });
+    await auditIntegration(req, "api_client.updated", req.params.keyId, req.body);
+    return res.json(detailResponse({ updated: true }));
+  })
+);
+
+router.delete(
+  "/companies/:id/integration/keys/:keyId",
+  ...integrationWrite,
+  asyncHandler(async (req, res) => {
+    const { accountId } = await owningAccount(req);
+    await revokeApiClient({ accountId, publicId: req.params.keyId });
+    await auditIntegration(req, "api_client.revoked", req.params.keyId);
+    return res.json(detailResponse({ revoked: true }));
+  })
+);
+
+router.post(
+  "/companies/:id/integration/webhooks",
+  ...integrationWrite,
+  validate({ body: webhookBody }),
+  asyncHandler(async (req, res) => {
+    const { accountId } = await owningAccount(req);
+    await assertAddonActive(accountId, "integrations");
+    const created = await createWebhook({ accountId, ...req.body, userId: req.auth.user.id });
+    await auditIntegration(req, "webhook.created", created.id, { url: req.body.url, events: req.body.events });
+    return res.status(201).json(detailResponse(created));
+  })
+);
+
+router.patch(
+  "/companies/:id/integration/webhooks/:hookId",
+  ...integrationWrite,
+  validate({ body: webhookBody.partial().extend({ status: z.enum(["active", "paused"]).optional() }) }),
+  asyncHandler(async (req, res) => {
+    const { accountId } = await owningAccount(req);
+    const result = await updateWebhook({ accountId, publicId: req.params.hookId, ...req.body });
+    await auditIntegration(req, "webhook.updated", req.params.hookId, req.body);
+    return res.json(detailResponse(result));
+  })
+);
+
+router.delete(
+  "/companies/:id/integration/webhooks/:hookId",
+  ...integrationWrite,
+  asyncHandler(async (req, res) => {
+    const { accountId } = await owningAccount(req);
+    await deleteWebhook({ accountId, publicId: req.params.hookId });
+    await auditIntegration(req, "webhook.deleted", req.params.hookId);
+    return res.json(detailResponse({ deleted: true }));
+  })
+);
+
+router.post(
+  "/companies/:id/integration/webhooks/:hookId/rotate-secret",
+  ...integrationWrite,
+  asyncHandler(async (req, res) => {
+    const { accountId } = await owningAccount(req);
+    const result = await rotateWebhookSecret({ accountId, publicId: req.params.hookId });
+    await auditIntegration(req, "webhook.secret_rotated", req.params.hookId);
+    return res.json(detailResponse(result));
+  })
+);
+
+router.post(
+  "/companies/:id/integration/webhooks/:hookId/test",
+  ...integrationWrite,
+  asyncHandler(async (req, res) => {
+    const { accountId } = await owningAccount(req);
+    return res.json(detailResponse(await sendTestEvent({ accountId, publicId: req.params.hookId })));
+  })
+);
+
+router.get(
+  "/companies/:id/integration/webhooks/:hookId/deliveries",
+  requirePermission("companies.view"),
+  asyncHandler(async (req, res) => {
+    const { accountId } = await owningAccount(req);
+    return res.json({ data: await listDeliveries({ accountId, publicId: req.params.hookId }) });
+  })
+);
+
+router.post(
+  "/companies/:id/integration/lead-feeds",
+  ...integrationWrite,
+  validate({ body: z.object({ name: z.string().trim().min(1).max(120) }) }),
+  asyncHandler(async (req, res) => {
+    const { accountId } = await owningAccount(req);
+    await assertAddonActive(accountId, "integrations");
+    const created = await createFeedToken({ accountId, name: req.body.name, userId: req.auth.user.id });
+    await auditIntegration(req, "lead_feed_token.created", created.id);
+    return res.status(201).json(detailResponse(created));
+  })
+);
+
+router.delete(
+  "/companies/:id/integration/lead-feeds/:feedId",
+  ...integrationWrite,
+  asyncHandler(async (req, res) => {
+    const { accountId } = await owningAccount(req);
+    await revokeFeedToken({ accountId, publicId: req.params.feedId });
+    await auditIntegration(req, "lead_feed_token.revoked", req.params.feedId);
+    return res.json(detailResponse({ revoked: true }));
   })
 );
 
@@ -1346,7 +1597,9 @@ router.post(
 router.patch(
   "/access-users/:id",
   writeLimiter,
-  requirePermission("users.edit"),
+  // Changing a staff account (and its role) is admin management, not a user-support action, so
+  // it needs the access-management grant rather than `users.edit`, which Support holds (0072).
+  requirePermission("accessManagement.manageUsers"),
   // SEC-IAM-011: high-risk, so the session must have re-proved itself recently.
   requireStepUp(),
   validate({ body: mutations.internalUserSchema.partial().extend({ firstName: z.string().trim().min(1).max(120), lastName: z.string().trim().min(1).max(120), email: z.string().trim().toLowerCase().email().max(255) }) }),

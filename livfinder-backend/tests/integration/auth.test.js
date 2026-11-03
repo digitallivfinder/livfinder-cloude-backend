@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { client, ensureTestPassword, createDisposablePortalOwner, adminEmail, cleanupUsers, queryOne, query, execute } from "../helpers/testApp.js";
+import { getStorage } from "../../src/config/storage.js";
+import { sweepAbandonedSignupUploads } from "../../src/modules/accounts/verification.service.js";
+import { client, organizationSignup, personalSignup, ensureTestPassword, createDisposablePortalOwner, adminEmail, cleanupUsers, queryOne, query, execute } from "../helpers/testApp.js";
 import { closePool } from "../../src/db/pool.js";
 import { sentMessages, clearSentMessages } from "../../src/modules/system/mail.service.js";
 
@@ -182,6 +184,7 @@ describe("signup", () => {
     clearSentMessages();
 
     const response = await client().send("post", "/v1/accounts/personal/signup", {
+      ...personalSignup(),
       firstName: "Test",
       lastName: "Person",
       email,
@@ -214,11 +217,293 @@ describe("signup", () => {
     expect(sentMessages().some((message) => message.to === email)).toBe(true);
   });
 
+  it("stores the picked location and a sanitised company profile", async () => {
+    const email = `org-picked-${suffix}@example.test`;
+    createdEmails.push(email);
+    const city = await queryOne(
+      "SELECT id, country_id FROM locations WHERE level = 'city' AND slug = 'dubai' AND deleted_at IS NULL LIMIT 1"
+    );
+
+    const response = await client().send("post", "/v1/accounts/organization/signup", {
+      ...organizationSignup(),
+      firstName: "Owner",
+      lastName: "Person",
+      email,
+      phone: "+971501234567",
+      password: "Reasonable42",
+      confirmPassword: "Reasonable42",
+      agreements: true,
+      countryId: `country:${city.country_id}`,
+      cityId: `city:${city.id}`,
+      legalName: `Picked Agency ${suffix} LLC`,
+      publicName: `Picked Agency ${suffix}`,
+      organizationType: "agency",
+      registrationNumber: `REG-P-${suffix}`,
+      website: "https://picked.example.test",
+      organizationEmail: email,
+      organizationPhone: "+971501234567",
+      address: "Office 12, Marina Plaza, Dubai",
+      description: '<p><b>Waterfront</b> specialists</p><script>alert(1)</script>',
+      categoryId: "realEstate",
+    });
+    expect(response.status).toBe(201);
+
+    const user = await queryOne("SELECT country_id, city_id, default_account_id FROM users WHERE email_normalized = ?", [email]);
+    expect(String(user.country_id)).toBe(String(city.country_id));
+    expect(String(user.city_id)).toBe(String(city.id));
+    const organization = await queryOne("SELECT description FROM organizations WHERE account_id = ?", [user.default_account_id]);
+    expect(organization.description).toBe("<p><b>Waterfront</b> specialists</p>");
+  });
+
+  it("attaches documents uploaded before the account existed", async () => {
+    const email = `doc-${suffix}@example.test`;
+    createdEmails.push(email);
+    const presigned = await client().send("post", "/v1/accounts/verification/uploads/signup-presign", {
+      fileName: "passport.png",
+      mimeType: "image/png",
+      fileSizeBytes: 3,
+      documentType: "identity",
+    });
+    expect(presigned.status).toBe(200);
+    const { uploadId } = presigned.body.data;
+    expect(uploadId).toMatch(/^verification\/signup\//);
+    await getStorage().put(uploadId, Buffer.from("png"), { contentType: "image/png", visibility: "private" });
+
+    const response = await client().send("post", "/v1/accounts/personal/signup", {
+      ...personalSignup(),
+      firstName: "Owner",
+      lastName: "Person",
+      email,
+      password: "Reasonable42",
+      confirmPassword: "Reasonable42",
+      agreements: true,
+      documents: [{ uploadId, documentType: "identity" }],
+    });
+    expect(response.status).toBe(201);
+    await getStorage().delete?.(uploadId, { visibility: "private" });
+  });
+
+  it("refuses a signup document outside the signup folder", async () => {
+    const email = `doc-escape-${suffix}@example.test`;
+    createdEmails.push(email);
+    const response = await client().send("post", "/v1/accounts/personal/signup", {
+      ...personalSignup(),
+      firstName: "Owner",
+      lastName: "Person",
+      email,
+      password: "Reasonable42",
+      confirmPassword: "Reasonable42",
+      agreements: true,
+      documents: [{ uploadId: "verification/accounts/1/1-abc.png", documentType: "identity" }],
+    });
+    expect(response.status).toBe(403);
+  });
+
+  it("refuses a phone number already on another account", async () => {
+    const first = `phone-a-${suffix}@example.test`;
+    const second = `phone-b-${suffix}@example.test`;
+    createdEmails.push(first, second);
+    const phone = `+97150${String(suffix).replace(/\D/g, "").slice(-7).padStart(7, "1")}`;
+    const signup = (email) =>
+      client().send("post", "/v1/accounts/personal/signup", {
+        ...personalSignup(),
+        firstName: "Owner",
+        lastName: "Person",
+        email,
+        phone,
+        password: "Reasonable42",
+        confirmPassword: "Reasonable42",
+        agreements: true,
+      });
+
+    expect((await signup(first)).status).toBe(201);
+    const repeat = await signup(second);
+    expect(repeat.status).toBe(409);
+    expect(repeat.body.error.fields.phone).toBeTruthy();
+  });
+
+  it("creates no account when a signup document is missing", async () => {
+    const email = `doc-missing-${suffix}@example.test`;
+    createdEmails.push(email);
+    const response = await client().send("post", "/v1/accounts/personal/signup", {
+      ...personalSignup(),
+      firstName: "Owner",
+      lastName: "Person",
+      email,
+      password: "Reasonable42",
+      confirmPassword: "Reasonable42",
+      agreements: true,
+      documents: [{ uploadId: `verification/signup/1-${"a".repeat(32)}.png`, documentType: "identity" }],
+    });
+    expect(response.status).toBe(400);
+    expect(await queryOne("SELECT id FROM users WHERE email_normalized = ?", [email])).toBeFalsy();
+  });
+
+  it("requires the application details from every caller", async () => {
+    const email = `org-bare-${suffix}@example.test`;
+    createdEmails.push(email);
+    const response = await client().send("post", "/v1/accounts/organization/signup", {
+      firstName: "Owner",
+      lastName: "Person",
+      email,
+      password: "Reasonable42",
+      confirmPassword: "Reasonable42",
+      agreements: true,
+      legalName: "Bare Holdings",
+      categoryId: "realEstate",
+    });
+    expect(response.status).toBe(422);
+    expect(Object.keys(response.body.error.fields).sort()).toEqual([
+      "address",
+      "description",
+      "organizationEmail",
+      "organizationPhone",
+      "organizationType",
+      "phone",
+      "publicName",
+      "registrationNumber",
+    ]);
+  });
+
+  it("refuses a common password dressed up with digits", async () => {
+    const email = `weak-${suffix}@example.test`;
+    createdEmails.push(email);
+    const response = await client().send("post", "/v1/accounts/personal/signup", {
+      ...personalSignup(),
+      firstName: "Owner",
+      lastName: "Person",
+      email,
+      password: "Password1234!",
+      confirmPassword: "Password1234!",
+      agreements: true,
+    });
+    expect(response.status).toBe(422);
+    expect(response.body.error.fields.password).toMatch(/common/);
+  });
+
+  it("sends a new confirmation link without a session and reveals nothing", async () => {
+    const email = `resend-${suffix}@example.test`;
+    createdEmails.push(email);
+    await client().send("post", "/v1/accounts/personal/signup", {
+      ...personalSignup(),
+      firstName: "Owner",
+      lastName: "Person",
+      email,
+      password: "Reasonable42",
+      confirmPassword: "Reasonable42",
+      agreements: true,
+    });
+    const before = sentMessages().filter((message) => message.to === email).length;
+    const known = await client().send("post", "/v1/auth/email/resend", { email });
+    const unknown = await client().send("post", "/v1/auth/email/resend", { email: `nobody-${suffix}@example.test` });
+    expect(known.status).toBe(200);
+    expect(unknown.status).toBe(200);
+    expect(unknown.body).toEqual(known.body);
+    expect(sentMessages().filter((message) => message.to === email).length).toBe(before + 1);
+  });
+
+  it("sweeps abandoned signup uploads but not attached documents", async () => {
+    const { uploadId } = (
+      await client().send("post", "/v1/accounts/verification/uploads/signup-presign", {
+        fileName: "abandoned.png",
+        mimeType: "image/png",
+        fileSizeBytes: 3,
+        documentType: "identity",
+      })
+    ).body.data;
+    await getStorage().put(uploadId, Buffer.from("png"), { contentType: "image/png", visibility: "private" });
+
+    await sweepAbandonedSignupUploads();
+    expect(await getStorage().exists(uploadId, { visibility: "private" })).toBe(true);
+    await sweepAbandonedSignupUploads({ now: Date.now() + 25 * 60 * 60 * 1000 });
+    expect(await getStorage().exists(uploadId, { visibility: "private" })).toBe(false);
+  });
+
+  it("holds a personal account out of the portal until it is approved", async () => {
+    const email = `held-${suffix}@example.test`;
+    createdEmails.push(email);
+    await client().send("post", "/v1/accounts/personal/signup", {
+      ...personalSignup(),
+      firstName: "Owner",
+      lastName: "Person",
+      email,
+      password: "Reasonable42",
+      confirmPassword: "Reasonable42",
+      agreements: true,
+    });
+    const user = await queryOne("SELECT id, default_account_id FROM users WHERE email_normalized = ?", [email]);
+    await execute("UPDATE users SET status = 'active', email_verified_at = NOW(3) WHERE id = ?", [user.id]);
+
+    const applicant = client();
+    await applicant.login(email, "Reasonable42");
+    const session = await applicant.send("get", "/v1/auth/session");
+    expect(session.body.data.account.state).toBe("pending_verification");
+    expect((await applicant.send("get", "/v1/portal/dashboard")).status).toBe(403);
+    expect((await applicant.send("post", "/v1/portal/listings", {})).status).toBe(403);
+    expect((await applicant.send("get", "/v1/portal/leads")).status).toBe(403);
+
+    await execute("UPDATE accounts SET status = 'active', verification_status = 'verified' WHERE id = ?", [user.default_account_id]);
+    expect((await applicant.send("get", "/v1/portal/dashboard")).status).toBe(200);
+  });
+
+  it("refuses a city outside the chosen country", async () => {
+    const email = `org-mismatch-${suffix}@example.test`;
+    createdEmails.push(email);
+    const city = await queryOne(
+      "SELECT id, country_id FROM locations WHERE level = 'city' AND slug = 'dubai' AND deleted_at IS NULL LIMIT 1"
+    );
+    const other = await queryOne("SELECT id FROM locations WHERE level = 'country' AND id <> ? LIMIT 1", [city.country_id]);
+
+    const response = await client().send("post", "/v1/accounts/personal/signup", {
+      ...personalSignup(),
+      firstName: "Owner",
+      lastName: "Person",
+      email,
+      password: "Reasonable42",
+      confirmPassword: "Reasonable42",
+      agreements: true,
+      countryId: `country:${other.id}`,
+      cityId: `city:${city.id}`,
+    });
+    expect(response.status).toBe(422);
+    expect(response.body.error.fields.city).toBeTruthy();
+  });
+
+  it("refuses placeholder organization details", async () => {
+    const email = `org-junk-${suffix}@example.test`;
+    createdEmails.push(email);
+
+    const response = await client().send("post", "/v1/accounts/organization/signup", {
+      ...organizationSignup(),
+      firstName: "Owner",
+      lastName: "Person",
+      email,
+      password: "Reasonable42",
+      confirmPassword: "Reasonable42",
+      agreements: true,
+      legalName: "Junk Holdings",
+      organizationType: "sdf",
+      registrationNumber: "sdf",
+      website: "sdfs",
+      organizationEmail: "df",
+      organizationPhone: "sdf",
+      categoryId: "realEstate",
+    });
+    expect(Object.keys(response.body.error.fields).sort()).toEqual([
+      "organizationEmail",
+      "organizationPhone",
+      "organizationType",
+      "registrationNumber",
+      "website",
+    ]);
+  });
+
   it("creates the organization, licence and category request together", async () => {
     const email = `org-${suffix}@example.test`;
     createdEmails.push(email);
 
     const response = await client().send("post", "/v1/accounts/organization/signup", {
+      ...organizationSignup(),
       firstName: "Owner",
       lastName: "Person",
       email,
@@ -257,6 +542,7 @@ describe("signup", () => {
     const email = `personal-${suffix}@example.test`;
     const before = await queryOne("SELECT COUNT(*) AS total FROM users");
     const response = await client().send("post", "/v1/accounts/personal/signup", {
+      ...personalSignup(),
       firstName: "Another",
       lastName: "Person",
       email,
@@ -271,12 +557,14 @@ describe("signup", () => {
 
   it("rejects a weak password and a missing agreement", async () => {
     const weak = await client().send("post", "/v1/accounts/personal/signup", {
+      ...personalSignup(),
       firstName: "A", lastName: "B", email: `weak-${suffix}@example.test`,
       password: "short", confirmPassword: "short", agreements: true,
     });
     expect(weak.status).toBe(422);
 
     const noAgreement = await client().send("post", "/v1/accounts/personal/signup", {
+      ...personalSignup(),
       firstName: "A", lastName: "B", email: `noagree-${suffix}@example.test`,
       password: "Reasonable42", confirmPassword: "Reasonable42", agreements: false,
     });

@@ -6,7 +6,8 @@ import { AppError } from "../../utils/errors.js";
  * Leads, as a company's own systems receive them (Phase 6, 0064).
  *
  * A lead is anything a visitor filled in and LivFinder stored for the company: an enquiry, a
- * viewing request (or charter booking), or an offer. All three come out in one shape, the same in
+ * viewing request (or charter booking), or an offer — or a lead the company added by hand in the
+ * portal (a phone call, a walk-in, a referral). All of them come out in one shape, the same in
  * the webhook payload, the lead feed (JSON, XML, CSV) and the portal's CSV download, and carry the
  * company's own listing id (`externalId`) when the listing came from its feed or API.
  *
@@ -19,7 +20,14 @@ import { AppError } from "../../utils/errors.js";
 export const LEAD_FEED_VERSION = 1;
 const MAX_PAGE = 200;
 const DEVELOPMENTS_ROOT_ID = 7;
-const TYPES = { inquiry: "enquiry", booking: "viewing_request", offer: "offer" };
+const TYPES = { inquiry: "enquiry", booking: "viewing_request", offer: "offer", lead: "manual_lead" };
+
+// A lead someone typed into the portal: a manual channel and no enquiry behind it. A website lead
+// always has its enquiry, and it already goes out as that enquiry, so it is not sent twice.
+const MANUAL_LEAD = `ld.channel IN ('phone','walk_in','referral','other')
+     AND ld.deleted_at IS NULL
+     AND NOT EXISTS (SELECT 1 FROM inquiries mi WHERE mi.lead_id = ld.id)
+     AND NOT EXISTS (SELECT 1 FROM lead_inquiries mli WHERE mli.lead_id = ld.id)`;
 
 /* -------------------------------------------------------------------------- */
 /* The cursor                                                                  */
@@ -59,7 +67,11 @@ const SOURCES = `
   UNION ALL
   SELECT 'offer', o.id, o.account_id, o.created_at, o.updated_at, l.root_category_id
     FROM offers o LEFT JOIN listings l ON l.id = o.listing_id
-   WHERE o.account_id = ? AND o.deleted_at IS NULL`;
+   WHERE o.account_id = ? AND o.deleted_at IS NULL
+  UNION ALL
+  SELECT 'lead', ld.id, ld.account_id, ld.created_at, ld.updated_at, ld.root_category_id
+    FROM leads ld
+   WHERE ld.account_id = ? AND ${MANUAL_LEAD}`;
 
 // Not a lead that arrived after the account lost the category it is in.
 const CATEGORY_RULE = `
@@ -72,7 +84,7 @@ const CATEGORY_RULE = `
 export async function listLeadsSince({ accountId, cursor = null, limit = 100 }) {
   const after = decodeCursor(cursor);
   const size = Math.min(MAX_PAGE, Math.max(1, Number(limit) || 100));
-  const params = [accountId, accountId, accountId];
+  const params = [accountId, accountId, accountId, accountId];
   let where = CATEGORY_RULE;
   if (after) {
     where += " AND (x.updated_at > ? OR (x.updated_at = ? AND (x.kind > ? OR (x.kind = ? AND x.id > ?))))";
@@ -100,6 +112,7 @@ const ONE_LEAD = {
               FROM bookings b LEFT JOIN listings l ON l.id = b.listing_id WHERE b.id = ?`,
   offer: `SELECT o.account_id, o.created_at, l.root_category_id
             FROM offers o LEFT JOIN listings l ON l.id = o.listing_id WHERE o.id = ?`,
+  lead: `SELECT ld.account_id, ld.created_at, ld.root_category_id FROM leads ld WHERE ld.id = ? AND ${MANUAL_LEAD}`,
 };
 
 /** The account a lead belongs to, or null when it may not go out (its category was taken away first). */
@@ -149,6 +162,21 @@ async function loadKind(kind, ids) {
          LEFT JOIN listings l ON l.id = b.listing_id
          LEFT JOIN agents ag ON ag.id = b.agent_id
         WHERE b.id IN (${marks})`,
+      ids
+    );
+  }
+  if (kind === "lead") {
+    return query(
+      `SELECT 'lead' AS kind, ld.id, ld.public_id, ld.reference, ld.status, 0 AS is_spam, ld.channel,
+              ld.name, ld.email, ld.phone_e164 AS phone, ld.notes AS message, ld.created_at, ld.updated_at,
+              ${LISTING_COLUMNS}, ${AGENT_COLUMNS},
+              p.public_id AS project_public_id, p.name AS project_name, p.canonical_path AS project_path,
+              NULL AS project_external_id
+         FROM leads ld
+         LEFT JOIN listings l ON l.id = ld.primary_listing_id
+         LEFT JOIN projects p ON p.id = ld.project_id
+         LEFT JOIN agents ag ON ag.id = ld.owner_agent_id
+        WHERE ld.id IN (${marks})`,
       ids
     );
   }
@@ -222,7 +250,7 @@ export function serializeLead(row) {
 
 /** Loads and shapes `[{ kind, id }]`, in the order given. */
 export async function loadLeads(refs) {
-  const byKind = { inquiry: [], booking: [], offer: [] };
+  const byKind = { inquiry: [], booking: [], offer: [], lead: [] };
   for (const ref of refs) byKind[ref.kind].push(Number(ref.id));
   const rows = (await Promise.all(Object.entries(byKind).map(([kind, ids]) => loadKind(kind, ids)))).flat();
   const index = new Map(rows.map((row) => [`${row.kind}:${row.id}`, row]));

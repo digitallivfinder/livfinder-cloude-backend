@@ -80,6 +80,24 @@ export class LocalStorageAdapter extends StorageAdapter {
     }
   }
 
+  async list(prefix, { visibility = "public" } = {}) {
+    const folder = prefix.replace(/\/+$/, "");
+    let names;
+    try {
+      names = await fs.readdir(this.resolve(folder, visibility));
+    } catch (error) {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    }
+    const objects = [];
+    for (const name of names) {
+      const key = `${folder}/${name}`;
+      const stats = await this.stat(key, { visibility });
+      if (stats) objects.push({ key, modifiedAt: stats.modifiedAt });
+    }
+    return objects;
+  }
+
   async exists(key, { visibility = "public" } = {}) {
     return (await this.stat(key, { visibility })) !== null;
   }

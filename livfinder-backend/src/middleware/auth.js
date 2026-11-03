@@ -213,7 +213,20 @@ export function requireAccount(req, res, next) {
   if (!req.auth.activeMembership) {
     return next(AppError.forbidden("This account cannot use the client portal."));
   }
+  // The website sends a pending account to its status page, but that is only a redirect.
+  if (req.auth.activeMembership.account_status === "pending") {
+    return next(AppError.forbidden("This account is waiting for approval."));
+  }
   return next();
+}
+
+const MEMBER_PORTAL_PATHS = ["/calendar", "/dashboard", "/favourites", "/messages", "/my-enquiries", "/my-viewings", "/profile", "/saved-searches", "/settings"];
+
+/** A Member is not a seller: everything else under `/v1/portal` is seller tooling. */
+export function requireSellerTools(req, res, next) {
+  if (req.auth?.activeMembership?.account_type_code !== "personal") return next();
+  const allowed = MEMBER_PORTAL_PATHS.some((path) => req.path === path || req.path.startsWith(`${path}/`));
+  return allowed ? next() : next(AppError.forbidden("This is available to seller accounts."));
 }
 
 /** Portal capability gate, e.g. requireAccountCapability("can_manage_listings"). */

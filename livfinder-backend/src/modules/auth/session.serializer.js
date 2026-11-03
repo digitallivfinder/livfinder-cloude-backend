@@ -3,6 +3,7 @@ import { loadPlatformAccess, loadAccountMemberships, loadAgentProfile } from "./
 import { toAdminPermissions, loadPermissionUniverse } from "./adminPermissions.js";
 import { frontendCategoryId } from "../../utils/categories.js";
 import { isoDate } from "../../serializers/primitives.js";
+import { sellerProfileRequired } from "../accounts/sellerApplication.service.js";
 
 /**
  * The session payload the frontend auth guards already read.
@@ -93,7 +94,7 @@ export async function serializeSession(userId, { sessionId = null, activeAccount
 
   if (membership) {
     const accountRow = await queryOne(
-      `SELECT a.id, a.public_id, a.name, a.status, a.verification_status, a.created_at, a.updated_at,
+      `SELECT a.id, a.public_id, a.name, a.status, a.verification_status, a.created_at, a.updated_at, a.seller_intent,
               at.code AS account_type_code
          FROM accounts a JOIN account_types at ON at.id = a.account_type_id
         WHERE a.id = ?`,
@@ -198,6 +199,18 @@ export async function serializeSession(userId, { sessionId = null, activeAccount
       name: accountRow?.name ?? null,
       accountType,
       accountTypeCode: membership.account_type_code,
+      // What the portal is for this person. A `personal` account is a Member, who cannot list.
+      memberType:
+        membership.account_type_code === "personal"
+          ? "member"
+          : accountType === "organization"
+            ? "organization"
+            : "personal_seller",
+      // Came in through Sell with us by a social button and has not asked for approval yet.
+      sellerProfileRequired:
+        membership.account_type_code === "personal" && Boolean(accountRow?.seller_intent)
+          ? await sellerProfileRequired(membership.account_id)
+          : false,
       state: accountState({
         account_status: accountRow?.status,
         verification_status: accountRow?.verification_status,

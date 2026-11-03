@@ -723,8 +723,16 @@ export async function updateSettingsDocument({ groupKey, patch, userId }) {
 
 /** Selects above the User Accesses table. */
 async function accessUserOptions() {
+  // The Change Role drawer draws an access summary for the role picked, so each option carries
+  // the same permission ids the Roles screen shows for it. Without them every role read "No Access".
+  const [roles, catalog] = await Promise.all([options.roleOptions(), listAdminRoles({ pageSize: 100 })]);
+  const byId = new Map(catalog.items.map((role) => [role.id, role]));
   return {
-    roles: await options.roleOptions(),
+    roles: roles.map((role) => ({
+      ...role,
+      permissionIds: byId.get(String(role.id))?.permissions ?? [],
+      permissionCount: byId.get(String(role.id))?.permissionCount ?? 0,
+    })),
     statuses: options.staticOptions(["active", "suspended", "pending_verification", "banned"]),
   };
 }

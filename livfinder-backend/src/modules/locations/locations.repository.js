@@ -218,7 +218,7 @@ export async function searchLocations({ q, types = [], parentId = null, countryI
 }
 
 /** Wider search used when a prefix match returns too little. */
-export async function searchLocationsContains({ q, types = [], limit = 20 }) {
+export async function searchLocationsContains({ q, types = [], countryId = null, limit = 20 }) {
   if (!q) return [];
   const levels = types.flatMap((type) => TYPE_TO_LEVELS[type] || [type]);
   const params = [`%${q}%`, `%${q}%`];
@@ -227,11 +227,16 @@ export async function searchLocationsContains({ q, types = [], limit = 20 }) {
     levelFilter = ` AND l.level IN (${levels.map(() => "?").join(", ")})`;
     params.push(...levels);
   }
+  let countryFilter = "";
+  if (countryId) {
+    countryFilter = " AND l.country_id = ?";
+    params.push(Number(countryId));
+  }
   const safeLimit = Math.min(50, Math.max(1, Number(limit) || 20));
   const rows = await query(
     `SELECT ${SELECT_COLUMNS} ${FROM_CLAUSE}
       WHERE l.deleted_at IS NULL AND l.status = 'active' AND l.is_searchable = 1
-        AND (l.name LIKE ? OR l.name_ascii LIKE ?)${levelFilter}
+        AND (l.name LIKE ? OR l.name_ascii LIKE ?)${levelFilter}${countryFilter}
       ORDER BY l.active_listing_count DESC, l.is_core_market DESC, CHAR_LENGTH(l.name) ASC
       LIMIT ${safeLimit}`,
     params
@@ -284,6 +289,19 @@ export async function listCountries({ onlyWithListings = true, limit = 250 } = {
         ${onlyWithListings ? "AND l.active_listing_count > 0" : ""}
       ORDER BY l.active_listing_count DESC, l.name ASC
       LIMIT ${safeLimit}`,
+    []
+  );
+}
+
+/** Every country with what a phone or address field needs, in alphabetical order. */
+export async function listCountryCodes() {
+  return query(
+    `SELECT l.id, l.slug, l.name, p.iso2, p.phone_code
+       FROM locations l
+       JOIN location_country_profiles p ON p.location_id = l.id
+      WHERE l.level = 'country' AND l.deleted_at IS NULL AND l.status = 'active'
+        AND p.phone_code IS NOT NULL
+      ORDER BY l.name ASC`,
     []
   );
 }

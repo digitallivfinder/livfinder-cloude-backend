@@ -1,6 +1,7 @@
 import { getPool } from "./pool.js";
 import logger from "../config/logger.js";
 import { AppError } from "../utils/errors.js";
+import { noteProcedure, noteStatement } from "../cache/invalidation.js";
 
 // Every value reaching MySQL goes through a placeholder. Nothing in this module
 // interpolates a caller-supplied value into SQL text.
@@ -32,6 +33,7 @@ export async function query(sql, params = [], executor) {
   const runner = executor || getPool();
   try {
     const [rows] = await runner.execute(sql, params);
+    noteStatement(sql, executor);
     return rows;
   } catch (error) {
     if (error.code === "ER_UNSUPPORTED_PS") {
@@ -39,6 +41,7 @@ export async function query(sql, params = [], executor) {
       // text protocol with the same escaping guarantees.
       try {
         const [rows] = await runner.query(sql, params);
+        noteStatement(sql, executor);
         return rows;
       } catch (fallbackError) {
         throw wrapDbError(fallbackError, sql);
@@ -64,6 +67,7 @@ export async function execute(sql, params = [], executor) {
   const runner = executor || getPool();
   try {
     const [result] = await runner.execute(sql, params);
+    noteStatement(sql, executor);
     return result;
   } catch (error) {
     throw wrapDbError(error, sql);
@@ -80,6 +84,7 @@ export async function callProcedure(name, params = [], executor) {
   const runner = executor || getPool();
   try {
     await runner.query(`CALL \`${name}\`(${placeholders})`, params);
+    noteProcedure(name, executor);
   } catch (error) {
     throw wrapDbError(error, `CALL ${name}`);
   }

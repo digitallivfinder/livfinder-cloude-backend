@@ -90,6 +90,8 @@ export async function listInquiries({ accountId, organizationId, search = "", li
                 WHERE ld.id = COALESCE(i.lead_id, (SELECT li.lead_id FROM lead_inquiries li WHERE li.inquiry_id = i.id LIMIT 1))) AS lead_public_id,
               pj.public_id AS project_public_id, pj.name AS project_name,
               pj.canonical_path AS project_path, pj.is_publicly_visible AS project_visible,
+              (SELECT c.public_id FROM conversations c WHERE c.inquiry_id = i.id
+                ORDER BY c.last_message_at DESC LIMIT 1) AS conversation_public_id,
               ${PORTAL_LISTING_COLUMNS.replaceAll("l.", "l.")}
          FROM inquiries i
          LEFT JOIN listings l ON l.id = i.listing_id
@@ -124,6 +126,8 @@ export async function listInquiries({ accountId, organizationId, search = "", li
       id: row.entity_public_id,
       reference: row.entity_reference,
       leadId: row.lead_public_id,
+      // Reply / Respond deep-link into this thread; without it they opened an unselected inbox.
+      conversationId: row.conversation_public_id ?? null,
       buyer: { name: row.name, email: row.email, phone: row.phone },
       message: row.message,
       subject: row.subject,
@@ -297,10 +301,12 @@ function require_frontendCategoryId(rootId) {
 /* -------------------------------------------------------------------------- */
 
 export async function listConversations({ userId, organizationId, filter = "all", conversationId = null }) {
-  const conditions = ["cp.user_id = ?"];
+  // Only the caller's own participant row is joined. Matching every participant of an
+  // organisation's thread listed each conversation once per participant (F12).
+  const conditions = ["cp.user_id IS NOT NULL"];
   const params = [userId];
   if (organizationId) {
-    conditions[0] = "(cp.user_id = ? OR c.organization_id = ?)";
+    conditions[0] = "(cp.user_id IS NOT NULL OR c.organization_id = ?)";
     params.push(organizationId);
   }
   if (filter === "unread") conditions.push("cp.unread_count > 0");
@@ -308,14 +314,14 @@ export async function listConversations({ userId, organizationId, filter = "all"
   else conditions.push("cp.left_at IS NULL");
 
   const rows = await query(
-    `SELECT DISTINCT c.id, c.public_id, c.subject, c.listing_id, c.status,
+    `SELECT c.id, c.public_id, c.subject, c.listing_id, c.status,
             c.last_message_at, c.last_message_preview, c.message_count,
             cp.unread_count, cp.last_read_at, cp.left_at,
             l.title AS listing_title, l.public_id AS listing_public_id,
             l.cover_image_url, l.reference AS listing_reference,
             l.root_category_id
        FROM conversations c
-       JOIN conversation_participants cp ON cp.conversation_id = c.id
+       LEFT JOIN conversation_participants cp ON cp.conversation_id = c.id AND cp.user_id = ?
        LEFT JOIN listings l ON l.id = c.listing_id
       WHERE ${conditions.join(" AND ")}
       ORDER BY c.last_message_at DESC
@@ -396,6 +402,8 @@ export async function listConversations({ userId, organizationId, filter = "all"
 /* Bookings                                                                    */
 /* -------------------------------------------------------------------------- */
 
+const BOOKING_STATUS_BUCKETS = { pending: "requested", reschedule: "rescheduled" };
+
 export async function listBookings({ accountId, organizationId, search = "", category = "all", status = "upcoming", from, to, view = "list", page = 1, pageSize = 10 }) {
   const scope = scopeClause("b", { accountId, organizationId });
   const conditions = [scope.sql, "b.deleted_at IS NULL"];
@@ -403,8 +411,10 @@ export async function listBookings({ accountId, organizationId, search = "", cat
 
   if (status === "upcoming") conditions.push("b.status IN ('requested','confirmed','rescheduled') AND b.scheduled_start >= NOW(3)");
   else if (status !== "all") {
+    // The tabs speak in buckets ("pending"), the table in its enum ("requested"); the counts
+    // below already translated, the list did not, so the Pending tab counted 2 and listed none.
     conditions.push("b.status = ?");
-    params.push(status);
+    params.push(BOOKING_STATUS_BUCKETS[status] ?? status);
   }
   if (category !== "all") {
     const rootId = rootIdForFrontendCategory(category);
@@ -488,7 +498,7 @@ export async function listBookings({ accountId, organizationId, search = "", cat
     pageSize: safeSize,
     counts,
     summary: {
-      total: counts.upcoming,
+      total: counts.all,
       confirmed: counts.confirmed,
       pending: counts.pending,
       reschedule: counts.rescheduled,
@@ -507,7 +517,8 @@ function bookingActions(status) {
 export async function bookingCounts({ accountId, organizationId }) {
   const scope = scopeClause("b", { accountId, organizationId });
   const row = await queryOne(
-    `SELECT SUM(b.status IN ('requested','confirmed','rescheduled') AND b.scheduled_start >= NOW(3)) AS upcoming,
+    `SELECT COUNT(*) AS all_count,
+            SUM(b.status IN ('requested','confirmed','rescheduled') AND b.scheduled_start >= NOW(3)) AS upcoming,
             SUM(b.status = 'requested') AS pending,
             SUM(b.status = 'confirmed') AS confirmed,
             SUM(b.status = 'rescheduled') AS rescheduled,
@@ -517,6 +528,7 @@ export async function bookingCounts({ accountId, organizationId }) {
     scope.params
   );
   return {
+    all: int(row?.all_count) ?? 0,
     upcoming: int(row?.upcoming) ?? 0,
     pending: int(row?.pending) ?? 0,
     confirmed: int(row?.confirmed) ?? 0,
@@ -530,14 +542,18 @@ export async function bookingCounts({ accountId, organizationId }) {
 /* Offers                                                                      */
 /* -------------------------------------------------------------------------- */
 
+const OFFER_STATUS_BUCKETS = { new: ["submitted"], negotiating: ["countered", "under_review"], declined: ["declined", "rejected"] };
+
 export async function listOffers({ accountId, organizationId, search = "", category = "all", listing = "all", status = "all", sort = "newest", view = "list", page = 1, pageSize = 10 }) {
   const scope = scopeClause("o", { accountId, organizationId });
   const conditions = [scope.sql, "o.deleted_at IS NULL"];
   const params = [...scope.params];
 
   if (status !== "all") {
-    conditions.push("o.status = ?");
-    params.push(status);
+    // Tab buckets, matching `offerCounts`; any other value is taken as an enum value.
+    const bucket = OFFER_STATUS_BUCKETS[status] ?? [status];
+    conditions.push(`o.status IN (${bucket.map(() => "?").join(",")})`);
+    params.push(...bucket);
   }
   if (listing !== "all") {
     conditions.push("(l.public_id = ? OR l.reference = ?)");
@@ -570,6 +586,11 @@ export async function listOffers({ accountId, organizationId, search = "", categ
               o.message, o.conditions,
               o.is_subject_to_finance, o.is_subject_to_survey, o.expires_at AS entity_expires_at,
               o.responded_at, o.response_note, o.created_at AS entity_created_at,
+              (SELECT c.public_id FROM conversations c
+                WHERE (o.inquiry_id IS NOT NULL AND c.inquiry_id = o.inquiry_id)
+                   OR (o.buyer_user_id IS NOT NULL AND c.listing_id = o.listing_id
+                       AND EXISTS (SELECT 1 FROM conversation_participants p WHERE p.conversation_id = c.id AND p.user_id = o.buyer_user_id))
+                ORDER BY c.last_message_at DESC LIMIT 1) AS conversation_public_id,
               ${PORTAL_LISTING_COLUMNS}
          FROM offers o
          LEFT JOIN listings l ON l.id = o.listing_id
@@ -604,6 +625,7 @@ export async function listOffers({ accountId, organizationId, search = "", categ
       return {
         id: row.entity_public_id,
         reference: row.entity_reference,
+        conversationId: row.conversation_public_id ?? null,
         buyer: { name: row.buyer_name, email: row.buyer_email, phone: row.buyer_phone },
         offerAmount,
         currency: row.entity_currency_code,
@@ -698,7 +720,12 @@ export async function listReviews({ organizationId, agentId, status = "all", pag
               r.is_verified_transaction, r.helpful_count, r.published_at, r.created_at,
               rr.body AS response_body, rr.created_at AS response_created_at,
               l.title AS listing_title, l.public_id AS listing_public_id, l.cover_image_url,
-              l.root_category_id
+              l.root_category_id,
+              (SELECT c.public_id FROM conversations c
+                 JOIN conversation_participants p ON p.conversation_id = c.id AND p.user_id = r.author_user_id
+                WHERE r.author_user_id IS NOT NULL
+                  AND (c.listing_id = l.id OR (l.id IS NULL AND c.organization_id <=> r.organization_id))
+                ORDER BY c.last_message_at DESC LIMIT 1) AS conversation_public_id
          FROM reviews r
          LEFT JOIN review_responses rr ON rr.review_id = r.id
          LEFT JOIN bookings b ON b.id = r.booking_id
@@ -727,6 +754,7 @@ export async function listReviews({ organizationId, agentId, status = "all", pag
   return {
     data: rows.map((row) => ({
       id: row.public_id,
+      conversationId: row.conversation_public_id ?? null,
       reviewer: { name: row.author_name },
       rating: num(row.rating),
       title: row.title,

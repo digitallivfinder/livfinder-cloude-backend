@@ -257,6 +257,10 @@ export function serializeListingDetail({ listing, detail, media = [], features =
     .map((item) => ({
       id: item.public_id || String(item.id),
       mediaId: String(item.id),
+      // The media asset behind the row, or null for a URL-only image. `id` falls back to the
+      // `listing_media` row id, which is a different id space: sent back as an asset id it could
+      // match another account's file and block the save (F4).
+      assetId: item.public_id || null,
       url: item.url,
       thumbnailUrl: item.thumbnail_url || item.url,
       alt: item.alt_text || listing.title,

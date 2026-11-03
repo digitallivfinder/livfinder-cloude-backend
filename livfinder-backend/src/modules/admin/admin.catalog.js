@@ -1,3 +1,10 @@
+import { scheduledPlanChange } from "../accounts/accounts.service.js";
+import { verificationReview } from "../accounts/verification.service.js";
+import { API_SCOPES } from "../../middleware/apiClient.js";
+import { listImports } from "../imports/imports.repository.js";
+import { listFeedTokens } from "../leads/leadFeedTokens.service.js";
+import { WEBHOOK_EVENTS, listWebhooks } from "../leads/webhooks.service.js";
+import { descriptionToHtml } from "../../utils/richText.js";
 import {
   query, queryOne, queryValue, adminPagination, adminList, int, num, bool, isoDate, isoDay,
   frontendCategoryId, categoryIdsFor, rootIdFor,
@@ -6,7 +13,7 @@ import { adminListingStatus, initialsOf } from "./admin.dashboard.js";
 import * as options from "./admin.options.js";
 import { CATEGORY_DEFINITIONS } from "../../utils/categories.js";
 import { AppError } from "../../utils/errors.js";
-import { planAddonsByPlan, serializePlanAddons } from "../accounts/addons.service.js";
+import { isAddonActive, listAccountAddons, planAddonsByPlan, serializePlanAddons } from "../accounts/addons.service.js";
 import {
   LAUNCH_STATUSES,
   OWNERSHIP_TYPES,
@@ -951,10 +958,24 @@ export async function getDeveloper(identifier) {
 /* Companies, individuals and agents                                           */
 /* -------------------------------------------------------------------------- */
 
+// What a reviewer still has to decide: an open application, or a signup from before they were
+// recorded. A Member's account is active while they wait, so its status alone would hide them.
+const companyOpen = `EXISTS (SELECT 1 FROM verification_requests vr
+    WHERE vr.subject_type = 'organization' AND vr.subject_id = o.id AND vr.status IN ('pending', 'in_review'))`;
+const companyWaiting = `(${companyOpen} OR (o.status = 'pending' AND o.verification_status <> 'rejected'))`;
+const integrationsOn = `EXISTS (SELECT 1 FROM account_addons aa
+    WHERE aa.account_id = o.account_id AND aa.addon_code = 'integrations' AND aa.status = 'active'
+      AND (aa.ends_at IS NULL OR aa.ends_at > NOW(3)))`;
+const accountOpen = `EXISTS (SELECT 1 FROM verification_requests vr
+    WHERE vr.subject_type = 'account' AND vr.subject_id = a.id AND vr.status IN ('pending', 'in_review'))`;
+const accountWaiting = `(${accountOpen} OR (a.status = 'pending' AND a.verification_status <> 'rejected'))`;
+
 export async function listAdminCompanies({ status = "all", search = "", category = "", country = "", packageId = "", page = 1, pageSize = 10 } = {}) {
   const conditions = ["o.deleted_at IS NULL"];
   const params = [];
-  if (status !== "all") {
+  if (status === "pending") {
+    conditions.push(companyWaiting);
+  } else if (status !== "all") {
     conditions.push("o.status = ?");
     params.push(status);
   }
@@ -988,6 +1009,8 @@ export async function listAdminCompanies({ status = "all", search = "", category
   const [rows, total, summary] = await Promise.all([
     query(
       `SELECT o.id, o.public_id, o.name, o.legal_name, o.slug, o.kind, o.status,
+              ${companyOpen} AS application_open,
+              ${integrationsOn} AS integrations_on,
               o.verification_status, o.email, o.phone, o.whatsapp, o.website_url,
               o.address_line1, o.logo_url, o.listing_count, o.active_listing_count,
               o.agent_count, o.created_at, o.updated_at,
@@ -1020,12 +1043,10 @@ export async function listAdminCompanies({ status = "all", search = "", category
       params
     ),
     queryOne(
-      `SELECT COUNT(*) AS total, SUM(o.status = 'active') AS active, SUM(o.status = 'pending') AS pending,
+      `SELECT COUNT(*) AS total, SUM(o.status = 'active') AS active, SUM(${companyWaiting}) AS pending,
               SUM(o.status = 'suspended') AS suspended,
               SUM(o.verification_status = 'pending') AS awaitingVerification,
-              SUM(EXISTS (SELECT 1 FROM api_clients ac
-                           WHERE ac.organization_id = o.id AND ac.revoked_at IS NULL
-                             AND ac.status = 'active')) AS apiEnabled,
+              SUM(${integrationsOn}) AS apiEnabled,
               SUM((SELECT COUNT(*) FROM account_category_access aca
                     WHERE aca.account_id = o.account_id AND aca.status = 'approved') > 1) AS multiCategory
          FROM organizations o WHERE o.deleted_at IS NULL`
@@ -1061,7 +1082,9 @@ export async function listAdminCompanies({ status = "all", search = "", category
         slug: row.slug,
         businessType: row.kind,
         type: "company",
-        status: row.status,
+        status: row.status === "pending" && row.verification_status === "rejected" ? "rejected" : row.status,
+        applicationOpen: Boolean(row.application_open),
+        api: { enabled: Boolean(row.integrations_on) },
         verificationStatus: row.verification_status,
         email: row.email,
         phone: row.phone,
@@ -1110,7 +1133,7 @@ export async function listAdminCompanies({ status = "all", search = "", category
 export async function getAdminCompany(identifier) {
   const list = await listAdminCompanies({ pageSize: 1, page: 1 });
   const row = await queryOne(
-    `SELECT o.id FROM organizations o WHERE o.public_id = ? OR o.slug = ? LIMIT 1`,
+    `SELECT o.id, o.account_id FROM organizations o WHERE o.public_id = ? OR o.slug = ? LIMIT 1`,
     [identifier, identifier]
   );
   if (!row) return null;
@@ -1118,6 +1141,7 @@ export async function getAdminCompany(identifier) {
   const company = result.items.find((item) => item.organizationId === String(row.id));
   if (!company) return null;
 
+  const scheduledPackage = await scheduledPlanChange(row.account_id);
   const [agents, listings, activity, subscription, inquiryCount, invoices] = await Promise.all([
     query(
       `SELECT public_id, display_name, email, phone, status, created_at
@@ -1165,8 +1189,42 @@ export async function getAdminCompany(identifier) {
     ),
   ]);
 
+  const [profile, licenses, verification] = await Promise.all([
+    queryOne(
+      `SELECT o.description, u.display_name AS owner_name, u.email AS owner_email, u.phone_e164 AS owner_phone,
+              u.email_verified_at
+         FROM organizations o
+         LEFT JOIN accounts a ON a.id = o.account_id
+         LEFT JOIN users u ON u.id = a.owner_user_id
+        WHERE o.id = ?`,
+      [row.id]
+    ),
+    query(
+      `SELECT license_type, license_number, issuing_authority, status FROM organization_licenses
+        WHERE organization_id = ? ORDER BY id`,
+      [row.id]
+    ),
+    verificationReview("organization", row.id),
+  ]);
+
   return {
     ...company,
+    primaryCategory: company.primaryCategory ?? company.requestedCategories[0] ?? null,
+    description: descriptionToHtml(profile?.description),
+    primaryContactName: profile?.owner_name ?? null,
+    owner: {
+      name: profile?.owner_name ?? null,
+      email: profile?.owner_email ?? null,
+      phone: profile?.owner_phone ?? null,
+      emailConfirmed: Boolean(profile?.email_verified_at),
+    },
+    licenses: licenses.map((license) => ({
+      type: license.license_type,
+      number: license.license_number,
+      issuingAuthority: license.issuing_authority,
+      status: license.status,
+    })),
+    verification,
     agentList: agents.map((agent) => ({
       id: agent.public_id,
       name: agent.display_name,
@@ -1189,7 +1247,9 @@ export async function getAdminCompany(identifier) {
       type: entry.action,
       detail: entry.subject_label,
     })),
+    api: { enabled: await isAddonActive(row.account_id, "integrations") },
     packageId: subscription?.plan_public_id ?? null,
+    scheduledPackage,
     packageBilling: subscription
       ? {
           planName: subscription.plan_name,
@@ -1246,7 +1306,9 @@ export async function listAdminIndividuals({ status = "all", search = "", packag
   // not backed by an organization.
   const conditions = ["u.deleted_at IS NULL", "a.deleted_at IS NULL", "at.requires_organization = 0"];
   const params = [];
-  if (status !== "all") {
+  if (status === "pending") {
+    conditions.push(accountWaiting);
+  } else if (status !== "all") {
     conditions.push("a.status = ?");
     params.push(status);
   }
@@ -1269,7 +1331,7 @@ export async function listAdminIndividuals({ status = "all", search = "", packag
   const [rows, total, summary] = await Promise.all([
     query(
       `SELECT u.id, u.public_id, u.first_name, u.last_name, u.display_name, u.email, u.phone_e164,
-              u.avatar_url, u.created_at, u.last_seen_at,
+              u.avatar_url, u.created_at, u.last_seen_at, ${accountOpen} AS application_open,
               a.id AS account_id, a.public_id AS account_public_id, a.status AS account_status,
               a.verification_status, at.code AS account_type_code,
               co.id AS country_id, co.name AS country_name,
@@ -1301,7 +1363,7 @@ export async function listAdminIndividuals({ status = "all", search = "", packag
       params
     ),
     queryOne(
-      `SELECT COUNT(*) AS total, SUM(a.status = 'active') AS active, SUM(a.status = 'pending') AS pending,
+      `SELECT COUNT(*) AS total, SUM(a.status = 'active') AS active, SUM(${accountWaiting}) AS pending,
               COALESCE(SUM(a.listing_used), 0) AS totalListings,
               SUM(a.listing_used > 1) AS multiCategory
          FROM accounts a JOIN account_types at ON at.id = a.account_type_id
@@ -1342,9 +1404,10 @@ export async function listAdminIndividuals({ status = "all", search = "", packag
       secondaryPhone: null,
       avatar: row.avatar_url,
       profession: row.title,
-      bio: row.bio,
+      bio: descriptionToHtml(row.bio),
       type: "individual",
-      status: row.account_status,
+      status: row.account_status === "pending" && row.verification_status === "rejected" ? "rejected" : row.account_status,
+      applicationOpen: Boolean(row.application_open),
       verificationStatus: row.verification_status,
       accountType: row.account_type_code,
       countryId: row.country_id ? String(row.country_id) : null,
@@ -1382,12 +1445,12 @@ export async function getAdminIndividual(identifier) {
   // filtering in memory for the one whose public_id matched.
   const row = await queryOne(
     `SELECT u.id, u.public_id, u.first_name, u.last_name, u.display_name, u.email, u.phone_e164,
-            u.avatar_url, u.created_at, u.last_seen_at,
+            u.avatar_url, u.created_at, u.last_seen_at, u.email_verified_at,
             a.id AS account_id, a.public_id AS account_public_id, a.status AS account_status,
             a.verification_status, at.code AS account_type_code,
             co.id AS country_id, co.name AS country_name,
             ct.id AS city_id, ct.name AS city_name,
-            ag.public_id AS agent_public_id, ag.bio, ag.title,
+            ag.public_id AS agent_public_id, ag.bio, ag.title, ag.license_number,
             (SELECT COUNT(*) FROM listings l WHERE l.account_id = a.id AND l.deleted_at IS NULL) AS listing_count
        FROM users u
        JOIN account_members am ON am.user_id = u.id AND am.role = 'owner' AND am.status = 'active'
@@ -1452,7 +1515,10 @@ export async function getAdminIndividual(identifier) {
     secondaryPhone: null,
     avatar: row.avatar_url,
     profession: row.title,
-    bio: row.bio,
+    bio: descriptionToHtml(row.bio),
+    licenseNumber: row.license_number,
+    emailConfirmed: Boolean(row.email_verified_at),
+    verification: await verificationReview("account", row.account_id),
     type: "individual",
     status: row.account_status,
     verificationStatus: row.verification_status,
@@ -2058,4 +2124,56 @@ export async function listOwnerListings({ ownerType, ownerId, page = 1, pageSize
     ),
   ]);
   return adminList({ items: rows.map(serializeAdminListingRow), total, page: safePage, pageSize: safeSize });
+}
+
+/** The account behind a company, for the integration routes. */
+export async function integrationAccount(identifier) {
+  const company = await queryOne(
+    "SELECT id, account_id FROM organizations WHERE (public_id = ? OR slug = ?) AND deleted_at IS NULL LIMIT 1",
+    [identifier, identifier]
+  );
+  if (!company) throw AppError.notFound("That company was not found.");
+  return { accountId: company.account_id, organizationId: company.id };
+}
+
+/** What a company has connected, as its portal shows it. Secrets exist only as their last characters. */
+export async function getCompanyIntegration(identifier) {
+  const { accountId, organizationId } = await integrationAccount(identifier);
+  const [addons, keys, webhooks, leadFeeds, imports] = await Promise.all([
+    listAccountAddons(accountId),
+    query(
+      `SELECT public_id, name, client_id, secret_hint, status, scopes, allowed_ips, rate_limit_per_minute, last_used_at, created_at
+         FROM api_clients WHERE account_id = ? ORDER BY status = 'active' DESC, created_at DESC`,
+      [accountId]
+    ),
+    listWebhooks(accountId),
+    listFeedTokens(accountId),
+    listImports({ organizationId, page: 1, pageSize: 10 }),
+  ]);
+  const addon = addons.find((entry) => entry.code === "integrations");
+  const json = (value) => (typeof value === "string" ? JSON.parse(value || "[]") : value || []);
+  return {
+    enabled: Boolean(addon?.isActive),
+    availableOnPlan: Boolean(addon?.availableOnPlan),
+    price: addon?.price ?? addon?.planPrice ?? null,
+    startedAt: isoDate(addon?.startedAt),
+    apiScopes: API_SCOPES,
+    webhookEvents: WEBHOOK_EVENTS,
+    keys: keys.map((key) => ({
+      id: key.public_id,
+      name: key.name,
+      clientId: key.client_id,
+      secretHint: key.secret_hint ? `••••${key.secret_hint}` : null,
+      status: key.status,
+      scopes: json(key.scopes),
+      allowedIps: json(key.allowed_ips),
+      rateLimitPerMinute: key.rate_limit_per_minute,
+      lastUsedAt: isoDate(key.last_used_at),
+      createdAt: isoDate(key.created_at),
+    })),
+    webhooks,
+    leadFeeds,
+    imports: imports.rows,
+    importTotal: imports.total,
+  };
 }

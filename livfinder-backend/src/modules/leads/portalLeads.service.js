@@ -1,3 +1,4 @@
+import { publishBookingChange } from "../calendar/calendar.service.js";
 import { execute, query, queryOne, queryValue } from "../../db/query.js";
 import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
@@ -142,7 +143,10 @@ async function moveToStep(lead, step, { lostReason = null, lostNote = null, user
 
 /** The company's own systems hear about it through the linked enquiry, as they do for an inquiry edit. */
 async function emitLeadUpdated(leadId) {
-  for (const inquiryId of await linkedInquiryIds(leadId)) await emitLeadEvent("inquiry", inquiryId, "lead.updated");
+  const inquiryIds = await linkedInquiryIds(leadId);
+  for (const inquiryId of inquiryIds) await emitLeadEvent("inquiry", inquiryId, "lead.updated");
+  // A lead added by hand has no enquiry; it goes out as itself (and is skipped if it is not manual).
+  if (!inquiryIds.length) await emitLeadEvent("lead", leadId, "lead.updated");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -490,6 +494,7 @@ export async function addViewing({ scope, publicId, payload, userId }) {
   });
 
   await emitLeadEvent("booking", outcome.bookingId, "lead.updated");
+  await publishBookingChange(outcome.bookingId);
   return { id: publicBookingId, reference: outcome.reference, leadId: outcome.leadId };
 }
 
@@ -569,6 +574,10 @@ export async function createManualLead({ scope, payload, userId }) {
     await logActivity(lead, { type: "other", title: "Lead added manually", userId }, connection);
     if (payload.note) await logActivity(lead, { type: "note", title: "Note added", body: payload.note, userId }, connection);
     return { id: publicId, reference, categoryId: frontendCategoryIdFor(rootId), leadId: result.insertId };
+  }).then(async (created) => {
+    // After the commit, so the event reads the lead it describes.
+    await emitLeadEvent("lead", created.leadId, "lead.created");
+    return created;
   });
 }
 

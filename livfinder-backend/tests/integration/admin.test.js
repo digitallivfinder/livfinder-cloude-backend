@@ -204,32 +204,45 @@ describe("moderation writes history", () => {
 });
 
 describe("verification decisions", () => {
+  // Its own company. This suite once took the first unverified company in the database, which
+  // on a shared dev database is a real applicant: it approved them and restored only half of it.
   let organizationId = null;
-  let before = null;
+  let ownerEmail = null;
 
   beforeAll(async () => {
-    const row = await queryOne(
-      `SELECT public_id, status, verification_status, is_publicly_visible
-         FROM organizations WHERE deleted_at IS NULL AND verification_status <> 'verified' LIMIT 1`
+    const owner = await createDisposablePortalOwner({ prefix: "admin-verification" });
+    ownerEmail = owner.email;
+    const account = await queryOne("SELECT id FROM accounts WHERE owner_user_id = ?", [owner.id]);
+    await execute(
+      "UPDATE accounts a JOIN account_types t ON t.code = 'company' SET a.account_type_id = t.id, a.status = 'pending', a.verification_status = 'pending' WHERE a.id = ?",
+      [account.id]
     );
-    organizationId = row?.public_id ?? null;
-    before = row;
+    organizationId = `adm${Date.now()}`;
+    await execute(
+      `INSERT INTO organizations (public_id, account_id, kind, name, legal_name, slug, status, verification_status, is_publicly_visible, created_at)
+       VALUES (?, ?, 'agency', 'Admin Verification Co', 'Admin Verification Co LLC', ?, 'pending', 'pending', 0, NOW(3))`,
+      [organizationId, account.id, organizationId]
+    );
   });
 
   afterAll(async () => {
-    if (!organizationId) return;
-    await execute(
-      "UPDATE organizations SET status = ?, verification_status = ?, is_publicly_visible = ?, verified_at = NULL WHERE public_id = ?",
-      [before.status, before.verification_status, before.is_publicly_visible, organizationId]
-    );
+    await execute("DELETE FROM organizations WHERE public_id = ?", [organizationId]);
+    await cleanupUsers([ownerEmail]);
   });
 
   it("verifying an organization makes it publicly visible and moves its account", async () => {
-    if (!organizationId) return;
+    const subject = await queryOne("SELECT id FROM organizations WHERE public_id = ?", [organizationId]);
+    const reference = `adm${Date.now()}`;
+    await execute(
+      `INSERT INTO verification_requests (public_id, subject_type, subject_id, status, submitted_at, created_at)
+       VALUES (?, 'organization', ?, 'pending', NOW(3), NOW(3))`,
+      [reference, subject.id]
+    );
     const response = await superAdmin.send("patch", `/v1/admin/companies/${organizationId}/verification`, {
       decision: "approve",
       note: "integration",
     });
+    await execute("DELETE FROM verification_requests WHERE public_id = ?", [reference]);
     expect(response.status).toBe(200);
 
     const row = await queryOne(
@@ -243,7 +256,6 @@ describe("verification decisions", () => {
   });
 
   it("suspending a company takes its live listings off the marketplace", async () => {
-    if (!organizationId) return;
     const row = await queryOne("SELECT id FROM organizations WHERE public_id = ?", [organizationId]);
     const activeBefore = await query(
       "SELECT id FROM listings WHERE organization_id = ? AND status = 'active'",

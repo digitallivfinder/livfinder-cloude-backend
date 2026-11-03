@@ -76,6 +76,7 @@ const DETAIL_COLUMNS = {
     engineProgram: "engine_program", avionicsSuite: "avionics_suite",
     interiorConfiguration: "interior_configuration", baseAirportCode: "base_airport_code",
     isCharterAvailable: "is_charter_available", charterHourlyRate: "charter_hourly_rate",
+    nextInspectionDue: "next_inspection_due", serialNumber: "serial_number",
   },
   watches: {
     referenceNumber: "reference_number", yearOfProduction: "year_of_production",
@@ -700,7 +701,7 @@ export async function createListing({ payload, accountId, userId, organizationId
       if (asset.account_id && String(asset.account_id) !== String(accountId)) {
         throw AppError.forbidden("One of the selected images belongs to another account.");
       }
-      await attachAssetToListing({ listingId, assetId: asset.id, altText: asset.alt_text }, connection);
+      await attachAssetToListing({ listingId, assetId: asset.id, altText: payload.mediaAltText?.[assetPublicId] || asset.alt_text }, connection);
     }
     await syncListingMediaCounters(listingId, connection);
 
@@ -830,7 +831,7 @@ export async function updateListing({ listing, payload, userId, accountId, organ
           connection
         );
         if (!alreadyLinked) {
-          await attachAssetToListing({ listingId: listing.id, assetId: asset.id, altText: asset.alt_text }, connection);
+          await attachAssetToListing({ listingId: listing.id, assetId: asset.id, altText: payload.mediaAltText?.[assetPublicId] || asset.alt_text }, connection);
         }
       }
       await syncListingMediaCounters(listing.id, connection);

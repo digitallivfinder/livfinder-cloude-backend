@@ -1,3 +1,4 @@
+import { descriptionToHtml, descriptionToText } from "../utils/richText.js";
 import { bool, int, isoDay, jsonField, num } from "./primitives.js";
 import { frontendCategoryId } from "../utils/categories.js";
 
@@ -24,7 +25,8 @@ export function serializeCompany(row, { serviceAreas = [], languages = [], categ
     city: row.city_name || null,
     logo: row.logo_url || null,
     coverImage: row.cover_image_url || null,
-    description: row.description || "",
+    description: descriptionToText(row.description),
+    descriptionHtml: descriptionToHtml(row.description),
     tagline: row.tagline || null,
     address: [row.address_line1, row.address_line2, row.city_name, row.country_name].filter(Boolean).join(", ") || null,
     serviceAreas,
@@ -88,7 +90,8 @@ export function serializeAgent(row, { languages = [], specialties = [], serviceA
     role: row.title || "Advisor",
     tagline: row.seo_description || row.title || null,
     photo: row.photo_url || "",
-    biography: row.bio || "",
+    biography: descriptionToText(row.bio),
+    biographyHtml: descriptionToHtml(row.bio),
     yearsOfExperience: int(row.experience_years),
     languages,
     specialties,

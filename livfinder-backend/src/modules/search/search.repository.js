@@ -346,6 +346,10 @@ export async function facetCounts(rawFilters, column) {
     `SELECT ls.${column} AS value, COUNT(*) AS count
        FROM listing_search ls ${built.joinSql} ${built.where}
       ${built.where ? "AND" : "WHERE"} ls.${column} IS NOT NULL
+      ${column === "category_slug"
+        ? // An inactive sub-category is gone from the filter dropdown; its chip goes too (F5).
+          `AND NOT EXISTS (SELECT 1 FROM categories cs WHERE cs.id = ls.category_id AND cs.parent_id IS NOT NULL AND cs.status <> 'active')`
+        : ""}
       GROUP BY ls.${column}
       ORDER BY count DESC
       LIMIT 60`,

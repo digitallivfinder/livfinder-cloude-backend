@@ -75,7 +75,8 @@ function describe(schema) {
   }
   const type = node?.def?.type;
   const field = { required: !optional };
-  if (type === "string") Object.assign(field, { type: "string", maxLength: node.maxLength ?? undefined });
+  if (type === "string" && node.def?.format === "date") field.type = "date";
+  else if (type === "string") Object.assign(field, { type: "string", maxLength: node.maxLength ?? undefined });
   else if (type === "number") {
     Object.assign(field, {
       type: node.isInt ? "integer" : "number",

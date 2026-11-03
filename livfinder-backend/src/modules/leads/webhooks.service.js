@@ -217,7 +217,7 @@ export async function emitLeadEvent(kind, id, event) {
 
 /** The same, for a lead known by its public id (bookings and offers are answered by it). */
 export async function emitLeadEventByPublicId(kind, publicId, event) {
-  const table = { inquiry: "inquiries", booking: "bookings", offer: "offers" }[kind];
+  const table = { inquiry: "inquiries", booking: "bookings", offer: "offers", lead: "leads" }[kind];
   const row = table ? await queryOne(`SELECT id FROM ${table} WHERE public_id = ?`, [publicId]).catch(() => null) : null;
   return row ? emitLeadEvent(kind, Number(row.id), event) : null;
 }

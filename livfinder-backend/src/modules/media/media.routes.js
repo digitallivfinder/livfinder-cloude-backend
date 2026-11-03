@@ -190,7 +190,8 @@ router.get(
   asyncHandler(async (req, res) => {
     const document = await readVerificationDocument({ documentId: req.params.id, req });
     res.setHeader("Cache-Control", "private, no-store");
-    res.setHeader("Content-Disposition", `inline; filename="${document.fileName.replace(/"/g, "")}"`);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Disposition", `inline; filename="${document.fileName.replace(/[^\w. -]/g, "_")}"`);
     res.type(document.mimeType);
     return res.send(document.body);
   })

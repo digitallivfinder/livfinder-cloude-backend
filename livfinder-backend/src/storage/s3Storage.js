@@ -5,6 +5,7 @@ import {
   GetObjectCommand,
   DeleteObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import env from "../config/env.js";
@@ -98,6 +99,26 @@ export class S3StorageAdapter extends StorageAdapter {
     } catch {
       return false;
     }
+  }
+
+  async list(prefix, { visibility = "public" } = {}) {
+    const root = `${PREFIX[visibility]}/`;
+    const objects = [];
+    let token;
+    do {
+      const page = await this.client.send(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: this.objectKey(`${prefix.replace(/\/+$/, "")}/`, visibility),
+          ContinuationToken: token,
+        })
+      );
+      for (const item of page.Contents ?? []) {
+        objects.push({ key: item.Key.slice(root.length), modifiedAt: item.LastModified });
+      }
+      token = page.NextContinuationToken;
+    } while (token);
+    return objects;
   }
 
   publicUrl(key) {

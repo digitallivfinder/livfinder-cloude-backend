@@ -125,6 +125,21 @@ is_post_seed_migration() {
     # so on a fresh `all` load it must run after the identity seeds.
     0040_account_category_access.sql)
       return 0 ;;
+    # 0068 grants categories from seeded listings, so it runs after those are loaded.
+    0068_individual_listing_categories.sql)
+      return 0 ;;
+    # 0071 switches on what the seeded plans include for the seeded subscriptions.
+    0071_plan_included_addons.sql)
+      return 0 ;;
+    # 0073 grants the support-chat permissions to the platform roles the seeds create.
+    0073_live_chat.sql)
+      return 0 ;;
+    # 0072 trims the Support role's grants, which 0031 derives after the seeds.
+    0072_support_role_scope.sql)
+      return 0 ;;
+    # 0069 publishes the profiles of individuals the seeds already approved.
+    0069_seller_intent_and_public_individuals.sql)
+      return 0 ;;
     # 0041's category_features rows reference the categories seeded in 030.
     0041_car_watch_features.sql)
       return 0 ;;

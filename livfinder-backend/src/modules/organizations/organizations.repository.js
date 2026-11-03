@@ -286,4 +286,56 @@ export async function getPublicAgent(slugOrId) {
   return { raw: row, agent };
 }
 
+/**
+ * Published reviews for a public profile, newest first, with the owner's reply.
+ *
+ * Admin moderation says a published review becomes "publicly visible on the related LivFinder
+ * profile", but no public page read reviews at all (F8). An agent's are the reviews of that
+ * agent; a company's are its own plus those of its agents. The summary is counted from the same
+ * rows rather than the denormalised counters, so it always agrees with the list beneath it.
+ */
+export async function listPublicReviews({ agentId = null, organizationId = null, limit = 10 }) {
+  const scope = agentId
+    ? { sql: "r.subject_type = 'agent' AND r.subject_id = ?", params: [agentId] }
+    : {
+        sql: "((r.subject_type = 'organization' AND r.subject_id = ?) OR (r.subject_type = 'agent' AND r.organization_id = ?))",
+        params: [organizationId, organizationId],
+      };
+  const where = `WHERE r.status = 'published' AND r.deleted_at IS NULL AND ${scope.sql}`;
+  const [rows, summary] = await Promise.all([
+    query(
+      `SELECT r.public_id, r.author_name, r.rating, r.title, r.body, r.is_verified_transaction,
+              r.published_at, r.created_at, rr.body AS response_body, rr.created_at AS response_at
+         FROM reviews r
+         LEFT JOIN review_responses rr ON rr.review_id = r.id AND rr.status = 'published'
+         ${where}
+        ORDER BY COALESCE(r.published_at, r.created_at) DESC
+        LIMIT ${Math.min(Math.max(Number(limit) || 10, 1), 50)}`,
+      scope.params
+    ),
+    queryOne(`SELECT COUNT(*) AS total, AVG(r.rating) AS average FROM reviews r ${where}`, scope.params),
+  ]);
+  return {
+    total: Number(summary?.total || 0),
+    average: summary?.average === null || summary?.average === undefined ? null : Math.round(Number(summary.average) * 10) / 10,
+    items: rows.map((row) => ({
+      id: row.public_id,
+      // A first name and initial, as the portal shows reviewers; never an email.
+      author: shortName(row.author_name),
+      rating: Number(row.rating),
+      title: row.title || null,
+      body: row.body || "",
+      verified: Boolean(row.is_verified_transaction),
+      publishedAt: (row.published_at || row.created_at)?.toISOString?.() ?? null,
+      response: row.response_body ? { body: row.response_body, at: row.response_at?.toISOString?.() ?? null } : null,
+    })),
+  };
+}
+
+function shortName(name) {
+  const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return "Verified client";
+  return parts.length > 1 ? `${parts[0]} ${parts[parts.length - 1][0]}.` : parts[0];
+}
+
 export { ORG_COLUMNS, ORG_JOINS, AGENT_COLUMNS, decorateAgents, decorateOrganizations };

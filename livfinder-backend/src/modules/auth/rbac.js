@@ -93,7 +93,7 @@ export async function allPermissionCodes() {
  * v_account_permissions. One indexed read, no role join at request time.
  */
 export async function loadAccountMemberships(userId) {
-  return query(
+  const memberships = await query(
     `SELECT vp.account_id,
             vp.role,
             vp.membership_status,
@@ -120,6 +120,11 @@ export async function loadAccountMemberships(userId) {
       WHERE vp.user_id = ?
       ORDER BY (vp.role = 'owner') DESC, a.id ASC`,
     [userId]
+  );
+  // An applicant's company exists before it is approved. Until the account becomes a company
+  // type it is not theirs to act as, and nothing they do may be filed under it.
+  return memberships.map((membership) =>
+    ["personal", "lister"].includes(membership.account_type_code) ? { ...membership, organization_id: null } : membership
   );
 }
 

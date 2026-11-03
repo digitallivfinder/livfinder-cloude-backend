@@ -36,6 +36,12 @@ export class StorageAdapter {
     throw new Error("not implemented");
   }
 
+  /** Objects directly under a prefix, as `{ key, modifiedAt }`. */
+  // eslint-disable-next-line no-unused-vars
+  async list(prefix, { visibility = "public" } = {}) {
+    throw new Error("not implemented");
+  }
+
   /** Absolute URL for a public object. Throws for private ones. */
   // eslint-disable-next-line no-unused-vars
   publicUrl(key) {

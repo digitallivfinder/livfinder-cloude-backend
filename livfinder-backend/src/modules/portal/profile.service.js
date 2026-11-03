@@ -1,3 +1,4 @@
+import { descriptionToHtml, descriptionToText, sanitizeDescription } from "../../utils/richText.js";
 import { z } from "zod";
 import { query, queryOne, execute } from "../../db/query.js";
 import { withTransaction } from "../../db/transaction.js";
@@ -5,13 +6,13 @@ import { isoDate, int, num, bool } from "../../serializers/primitives.js";
 import { resolveLocation } from "../locations/locations.repository.js";
 import { AppError } from "../../utils/errors.js";
 import { getAssetByPublicId } from "../media/media.service.js";
-import { splitPhone } from "../../utils/phone.js";
+import { optionalPhone, splitPhone } from "../../utils/phone.js";
 
 export const profileUpdateSchema = z.object({
   firstName: z.string().trim().min(1).max(120).optional(),
   lastName: z.string().trim().min(1).max(120).optional(),
   displayName: z.string().trim().min(1).max(200).optional(),
-  phone: z.string().trim().max(40).optional().or(z.literal("")),
+  phone: optionalPhone,
   jobTitle: z.string().trim().max(120).optional().or(z.literal("")),
   bio: z.string().trim().max(8000).optional().or(z.literal("")),
   country: z.string().trim().max(120).optional().or(z.literal("")),
@@ -90,7 +91,7 @@ export async function getProfile(req) {
     languages: languages.map((row) => row.name).join(", "),
     languageList: languages.map((row) => row.name),
     avatar: user.avatar_url || agent?.photo_url || null,
-    bio: agent?.bio || "",
+    bio: descriptionToHtml(agent?.bio),
     licenseNumber: agent?.license_number || "",
     yearsExperience: agent?.experience_years ? `${agent.experience_years}+ Years` : "",
     yearsExperienceValue: int(agent?.experience_years),
@@ -118,7 +119,7 @@ function completionFor(profile, agent) {
   const items = [
     { id: "photo", label: "Profile photo", complete: Boolean(profile.avatar) },
     { id: "contact", label: "Contact information", complete: Boolean(profile.phone && profile.email) },
-    { id: "bio", label: "Bio", complete: Boolean(profile.bio && profile.bio.length > 40) },
+    { id: "bio", label: "Bio", complete: descriptionToText(profile.bio).length > 40 },
     { id: "areas", label: "Service areas", complete: profile.serviceAreas.length > 0 },
     { id: "verification", label: "Identity verification", complete: agent?.verification_status === "verified" },
   ];
@@ -188,7 +189,7 @@ export async function updateProfile(req, payload) {
     if (payload.displayName !== undefined) setAgent("display_name", payload.displayName);
     if (payload.phone !== undefined) setAgent("phone", payload.phone || null);
     if (payload.jobTitle !== undefined) setAgent("title", payload.jobTitle || null);
-    if (payload.bio !== undefined) setAgent("bio", payload.bio || null);
+    if (payload.bio !== undefined) setAgent("bio", sanitizeDescription(payload.bio) || null);
     if (payload.licenseNumber !== undefined) setAgent("license_number", payload.licenseNumber || null);
     if (payload.yearsExperience !== undefined) setAgent("experience_years", payload.yearsExperience);
     if (payload.avatarAssetId !== undefined && payload.avatarAssetId) {

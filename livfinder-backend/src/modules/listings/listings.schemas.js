@@ -39,6 +39,8 @@ const commonListing = {
   features: z.array(z.string().max(120)).max(200).optional(),
   attributes: z.record(z.string().max(60), z.union([z.string().max(500), z.number(), z.boolean(), z.null()])).optional(),
   mediaAssetIds: z.array(z.string().max(40)).max(60).optional(),
+  // Alt text typed before the listing existed, keyed by the asset id it belongs to (F10).
+  mediaAltText: z.record(z.string().max(40), z.string().trim().max(255)).optional(),
   seoTitle: optionalText(255),
   seoDescription: optionalText(500),
 };
@@ -167,6 +169,9 @@ export const aviationDetail = z.object({
   baseAirportCode: optionalText(10),
   isCharterAvailable: z.boolean().optional(),
   charterHourlyRate: optionalNumber(0, 1e9),
+  // Both were collected by the wizard and dropped here, so they never reached listing_aviation (F38).
+  nextInspectionDue: z.iso.date("Use a date such as 2026-10-15.").optional().nullable().or(z.literal("").transform(() => null)),
+  serialNumber: optionalText(60),
 });
 
 export const timepieceDetail = z.object({

@@ -17,8 +17,10 @@ const OPTIONAL_DETAILS = {
   "real-estate": ["floorNumber", "totalFloors", "unitNumber", "buildingName", "plotAreaSqft", "plotAreaSqm"],
   // Not every yacht or aircraft has been refitted.
   yachts: ["refitYear"],
-  jets: ["yearRefurbished"],
-  helicopters: ["yearRefurbished"],
+  // A new aircraft has no inspection due yet, and the serial is a controlled disclosure the
+  // seller may keep back.
+  jets: ["yearRefurbished", "nextInspectionDue", "serialNumber"],
+  helicopters: ["yearRefurbished", "nextInspectionDue", "serialNumber"],
   // The portal works this one out from the box and the papers.
   watches: ["isFullSet"],
 };

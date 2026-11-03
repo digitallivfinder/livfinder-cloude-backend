@@ -16,6 +16,8 @@
 import { query, queryValue, execute, callProcedure } from "../src/db/query.js";
 import { closePool } from "../src/db/pool.js";
 import logger from "../src/config/logger.js";
+import { closeCache, connectCache } from "../src/cache/redis.js";
+import { flushInvalidations } from "../src/cache/invalidation.js";
 
 const VISIBILITY_TIMEOUT_MINUTES = 5;
 
@@ -273,15 +275,19 @@ export async function runMaintenance({ only } = {}) {
 const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop());
 if (isMain) {
   const index = process.argv.indexOf("--only");
-  runMaintenance({ only: index >= 0 ? process.argv[index + 1] : undefined })
+  // Connected so the expiry and projection writes below invalidate the API's public cache.
+  connectCache()
+    .then(() => runMaintenance({ only: index >= 0 ? process.argv[index + 1] : undefined }))
     .then(async (summary) => {
       logger.info(summary, "maintenance pass complete");
-      await closePool();
+      await flushInvalidations();
+      await Promise.allSettled([closePool(), closeCache()]);
       process.exit(0);
     })
     .catch(async (error) => {
       logger.error({ err: error }, "maintenance pass failed");
-      await closePool();
+      await flushInvalidations();
+      await Promise.allSettled([closePool(), closeCache()]);
       process.exit(1);
     });
 }

@@ -162,6 +162,10 @@ describe("step-up", () => {
     expect((await admin.send("post", "/v1/auth/step-up", { code: "000000" })).status).toBe(403);
   });
 
+  it("will not take a password in place of an enrolled authenticator", async () => {
+    expect((await admin.send("post", "/v1/auth/step-up", { password: "LivFinder!2026" })).status).toBe(400);
+  });
+
   it("accepts a valid code, and the action then goes through", async () => {
     expect((await admin.send("post", "/v1/auth/step-up", { code: currentCode() })).status).toBe(200);
 

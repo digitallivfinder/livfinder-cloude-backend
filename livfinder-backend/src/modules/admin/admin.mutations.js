@@ -1,20 +1,28 @@
 import { z } from "zod";
+import env from "../../config/env.js";
+import logger from "../../config/logger.js";
+import { sendMail } from "../system/mail.service.js";
 import { query, queryOne, queryValue, execute } from "../../db/query.js";
 import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
-import { ulid } from "../../utils/ids.js";
+import { randomToken, ulid } from "../../utils/ids.js";
 import { slugify } from "../../utils/slug.js";
 import { resolveCategory } from "../../utils/categories.js";
 import { changeListingStatus, softDeleteListing, syncAccountListingUsageForListing } from "../listings/listings.service.js";
 import { refreshListingSearch, recordStatusChange } from "../listings/listings.repository.js";
 import { htmlToBlocks } from "../../serializers/editorial.js";
 import { callProcedure } from "../../db/query.js";
-import { splitPhone } from "../../utils/phone.js";
+import { optionalPhone, splitPhone } from "../../utils/phone.js";
+import { sanitizeDescription } from "../../utils/richText.js";
+import { issueToken } from "../auth/auth.service.js";
+import { hashPassword } from "../auth/passwords.js";
+import { revokeAllSessions } from "../auth/sessions.js";
+import { publishApplicationImages } from "../accounts/verification.service.js";
 import { notifyListingModeration, notifyVerificationDecision } from "../system/notifications.service.js";
-import { assignPlanToAccount } from "../accounts/accounts.service.js";
+import { assignPlanToAccount, cancelScheduledPlanChange, schedulePlanChange } from "../accounts/accounts.service.js";
 import { approveRevision, closeOpenRevision, rejectRevision } from "../listings/listingRevisions.service.js";
 import { approveProjectRevision, closeOpenProjectRevision, rejectProjectRevision } from "../projects/projectRevisions.service.js";
-import { ADDON_CODES, disableAddon, enableAddon, listAccountAddons, upsertPlanAddons } from "../accounts/addons.service.js";
+import { ADDON_CODES, disableAddon, enableAddon, listAccountAddons, syncPlanSubscribers, upsertPlanAddons } from "../accounts/addons.service.js";
 
 /**
  * Admin write operations.
@@ -152,18 +160,39 @@ export async function deleteAdminListing({ identifier, userId }) {
 /* Verification and account state                                              */
 /* -------------------------------------------------------------------------- */
 
-export const verificationDecisionSchema = z.object({
-  decision: z.enum(["approve", "reject", "request_changes"]),
-  note: z.string().trim().max(1000).optional(),
-  reason: z.string().trim().max(500).optional(),
-});
+export const verificationDecisionSchema = z
+  .object({
+    decision: z.enum(["approve", "reject", "request_changes"]),
+    note: z.string().trim().max(1000).optional(),
+    reason: z.string().trim().max(500).optional(),
+  })
+  // The applicant is emailed this text, so a refusal without it tells them nothing.
+  .superRefine((body, context) => {
+    if (body.decision === "reject" && !body.reason) {
+      context.addIssue({ code: "custom", path: ["reason"], message: "Give the reason for rejecting." });
+    }
+    if (body.decision === "request_changes" && !body.note) {
+      context.addIssue({ code: "custom", path: ["note"], message: "Say what needs to change." });
+    }
+  });
 
 export async function decideVerification({ subjectType, identifier, decision, note, reason, userId }) {
   const table = subjectType === "organization" ? "organizations" : subjectType === "agent" ? "agents" : "accounts";
-  const subject = await queryOne(`SELECT id, public_id FROM ${table} WHERE public_id = ? LIMIT 1`, [identifier]);
+  const subject = await queryOne(`SELECT id, public_id, verification_status FROM ${table} WHERE public_id = ? LIMIT 1`, [identifier]);
   if (!subject) throw AppError.notFound("That record was not found.");
 
   const status = decision === "approve" ? "approved" : decision === "reject" ? "rejected" : "in_review";
+  const request = await queryOne(
+    `SELECT id, payload FROM verification_requests
+      WHERE subject_type = ? AND subject_id = ? AND status IN ('pending','in_review') ORDER BY id DESC LIMIT 1`,
+    [subjectType, subject.id]
+  );
+  if (!request) throw AppError.conflict("This application has already been decided.");
+  const payload = typeof request.payload === "string" ? JSON.parse(request.payload) : request.payload;
+  // A Member applying to sell stays a working Member until approval, whatever the decision.
+  const memberApplication = payload?.application ?? null;
+  // A later review of someone already approved settles the request. It does not take them down.
+  const staysLive = subject.verification_status === "verified" && decision !== "approve";
 
   await withTransaction(async (connection) => {
     await execute(
@@ -175,7 +204,9 @@ export async function decideVerification({ subjectType, identifier, decision, no
       connection
     );
 
-    if (subjectType === "organization") {
+    if (staysLive) {
+      // The request above carries the decision.
+    } else if (subjectType === "organization") {
       await execute(
         `UPDATE organizations
             SET verification_status = ?, verified_at = ?, status = ?, is_publicly_visible = ?
@@ -190,18 +221,20 @@ export async function decideVerification({ subjectType, identifier, decision, no
         connection
       );
       // The account behind the organisation moves with it.
-      await execute(
-        `UPDATE accounts a JOIN organizations o ON o.account_id = a.id
-            SET a.verification_status = ?, a.status = ?, a.verified_at = ?
-          WHERE o.id = ?`,
-        [
-          decision === "approve" ? "verified" : decision === "reject" ? "rejected" : "pending",
-          decision === "approve" ? "active" : "pending",
-          decision === "approve" ? new Date() : null,
-          subject.id,
-        ],
-        connection
-      );
+      if (!memberApplication || decision === "approve") {
+        await execute(
+          `UPDATE accounts a JOIN organizations o ON o.account_id = a.id
+              SET a.verification_status = ?, a.status = ?, a.verified_at = ?
+            WHERE o.id = ?`,
+          [
+            decision === "approve" ? "verified" : decision === "reject" ? "rejected" : "pending",
+            decision === "approve" ? "active" : "pending",
+            decision === "approve" ? new Date() : null,
+            subject.id,
+          ],
+          connection
+        );
+      }
     } else if (subjectType === "agent") {
       await execute(
         "UPDATE agents SET verification_status = ?, verified_at = ?, status = ? WHERE id = ?",
@@ -213,6 +246,8 @@ export async function decideVerification({ subjectType, identifier, decision, no
         ],
         connection
       );
+    } else if (memberApplication && decision !== "approve") {
+      // Nothing to change on the account; the request above carries the decision.
     } else {
       await execute(
         "UPDATE accounts SET verification_status = ?, verified_at = ?, status = ? WHERE id = ?",
@@ -227,13 +262,171 @@ export async function decideVerification({ subjectType, identifier, decision, no
     }
   });
 
+  if (decision === "approve" && subjectType !== "agent") {
+    await applyApproval({ subjectType, subjectId: subject.id, requestId: request.id, payload, memberApplication, userId });
+  }
+  await tellApplicant({ subjectType, subjectId: subject.id, decision, note, reason });
   return { id: subject.public_id, decision, status };
+}
+
+/** An individual's work follows them into the company: listings, profile, leads and bookings. */
+async function moveAccountToOrganization({ accountId, organizationId }) {
+  for (const table of ["inquiries", "bookings", "leads"]) {
+    await execute(`UPDATE ${table} SET organization_id = ? WHERE account_id = ? AND organization_id IS NULL`, [organizationId, accountId]);
+  }
+  await execute(
+    `UPDATE agents ag JOIN accounts a ON a.owner_user_id = ag.user_id
+        SET ag.organization_id = ? WHERE a.id = ? AND ag.organization_id IS NULL`,
+    [organizationId, accountId]
+  );
+  const listings = await query("SELECT id FROM listings WHERE account_id = ? AND organization_id IS NULL AND deleted_at IS NULL", [accountId]);
+  await execute("UPDATE listings SET organization_id = ? WHERE account_id = ? AND organization_id IS NULL", [organizationId, accountId]);
+  for (const listing of listings) await refreshListingSearch(listing.id);
+  await execute(
+    `UPDATE organizations o
+        SET o.listing_count = (SELECT COUNT(*) FROM listings l WHERE l.organization_id = o.id AND l.deleted_at IS NULL),
+            o.active_listing_count = (SELECT COUNT(*) FROM listings l WHERE l.organization_id = o.id AND l.deleted_at IS NULL AND l.status = 'active'),
+            o.agent_count = (SELECT COUNT(*) FROM agents ag WHERE ag.organization_id = o.id AND ag.deleted_at IS NULL)
+      WHERE o.id = ?`,
+    [organizationId]
+  );
+}
+
+/** What approval unlocks: the chosen category, and for a Member the seller account itself. */
+async function applyApproval({ subjectType, subjectId, requestId, payload, memberApplication, userId }) {
+  const accountId =
+    subjectType === "organization"
+      ? await queryValue("SELECT account_id FROM organizations WHERE id = ?", [subjectId])
+      : subjectId;
+  if (memberApplication) {
+    const typeCode = memberApplication === "organization" ? "company" : "lister";
+    await execute(
+      `UPDATE accounts a JOIN account_types t ON t.code = ?
+          SET a.account_type_id = t.id, a.listing_quota = GREATEST(COALESCE(a.listing_quota, 0), t.default_listing_quota)
+        WHERE a.id = ?`,
+      [typeCode, accountId]
+    );
+    if (subjectType === "organization") await moveAccountToOrganization({ accountId, organizationId: subjectId });
+  }
+  // The advisor profile was drafted hidden until this decision; approval is what publishes it.
+  if (subjectType === "account") {
+    await execute(
+      `UPDATE agents ag JOIN accounts a ON a.owner_user_id = ag.user_id
+          SET ag.status = 'active', ag.verification_status = 'verified', ag.verified_at = NOW(3), ag.is_publicly_visible = 1
+        WHERE a.id = ? AND ag.deleted_at IS NULL`,
+      [accountId]
+    );
+  }
+  await publishApplicationImages({ requestId, accountId, organizationId: subjectType === "organization" ? subjectId : null });
+  const category = resolveCategory(payload?.categoryId);
+  if (!category) return;
+  await execute(
+    `INSERT INTO account_category_access (account_id, category_id, status, listing_used, requested_at, reviewed_at, reviewed_by_user_id, created_at)
+     VALUES (?, ?, 'approved', 0, NOW(3), NOW(3), ?, NOW(3))
+     ON DUPLICATE KEY UPDATE status = 'approved', reviewed_at = NOW(3), reviewed_by_user_id = VALUES(reviewed_by_user_id)`,
+    [accountId, category.rootId, userId]
+  );
+}
+
+const DECISION_EMAILS = {
+  approve: { subject: "Your LivFinder account is verified", body: "Your application has been approved." },
+  reject: { subject: "Your LivFinder application was not approved", body: "Your application could not be approved." },
+  request_changes: { subject: "Your LivFinder application needs changes", body: "A reviewer needs something changed." },
+};
+
+/** The verification page promises an email. A failure here must not undo the decision. */
+async function tellApplicant({ subjectType, subjectId, decision, note, reason }) {
+  if (subjectType === "agent") return;
+  try {
+    const applicant = await queryOne(
+      subjectType === "organization"
+        ? `SELECT u.email, a.id AS account_id FROM organizations o
+             JOIN accounts a ON a.id = o.account_id JOIN users u ON u.id = a.owner_user_id WHERE o.id = ?`
+        : `SELECT u.email, a.id AS account_id FROM accounts a JOIN users u ON u.id = a.owner_user_id WHERE a.id = ?`,
+      [subjectId]
+    );
+    if (!applicant) return;
+    const message = DECISION_EMAILS[decision];
+    const detail = decision === "reject" ? reason : decision === "request_changes" ? note : null;
+    await sendMail({
+      to: applicant.email,
+      subject: message.subject,
+      text: [message.body, detail, `Sign in to see the details: ${env.FRONTEND_URL}/login`].filter(Boolean).join("\n\n"),
+    });
+    await notifyVerificationDecision({
+      accountId: applicant.account_id,
+      organizationId: subjectType === "organization" ? subjectId : null,
+      decision,
+      reason: detail,
+    });
+  } catch (error) {
+    logger.error({ err: error, subjectType, subjectId }, "verification decision could not be sent");
+  }
 }
 
 export const accountStateSchema = z.object({
   status: z.enum(["active", "pending", "suspended", "archived", "closed", "inactive", "draft"]),
   reason: z.string().trim().max(500).optional(),
 });
+
+export const companyPasswordResetSchema = z.object({
+  method: z.enum(["link", "temporary"]),
+  recipient: z.enum(["owner", "company"]).default("owner"),
+});
+
+/**
+ * A company owner who cannot get in. A stored password is a one-way hash, so nobody can read it:
+ * the owner gets a link, or the admin is shown a new password once. That one is never stored or
+ * logged, and the owner is told it happened. Staff logins are out of reach of this screen.
+ */
+export async function resetCompanyPassword({ identifier, method, recipient, ip }) {
+  const owner = await queryOne(
+    `SELECT u.id, u.email, u.status, o.public_id, o.name AS company_name, o.email AS company_email,
+            (SELECT COUNT(*) FROM user_roles ur JOIN roles r ON r.id = ur.role_id AND r.scope = 'platform'
+              WHERE ur.user_id = u.id) AS staff_roles
+       FROM organizations o
+       JOIN accounts a ON a.id = o.account_id
+       JOIN users u ON u.id = a.owner_user_id AND u.deleted_at IS NULL
+      WHERE (o.public_id = ? OR o.slug = ?) AND o.deleted_at IS NULL LIMIT 1`,
+    [identifier, identifier]
+  );
+  if (!owner) throw AppError.notFound("That company has no owner login.");
+  if (Number(owner.staff_roles) > 0) throw AppError.forbidden("This owner is LivFinder staff. Use their own password reset.");
+  if (owner.status === "banned") throw AppError.conflict("This owner's login is banned.");
+
+  if (method === "link") {
+    const sentTo = recipient === "company" ? owner.company_email : owner.email;
+    if (!sentTo) throw AppError.validation("Some information is invalid.", { recipient: "This company has no email address." });
+    const token = await issueToken({ userId: owner.id, purpose: "password_reset", target: owner.email, ip });
+    await sendMail({
+      to: sentTo,
+      subject: "Reset your LivFinder password",
+      text: `LivFinder support sent this link for ${owner.company_name}. Use it within the hour to choose a new password:\n\n${env.FRONTEND_URL}/reset-password?token=${encodeURIComponent(token)}\n\nIf you did not ask for this, nothing has changed.`,
+    });
+    return { method, sentTo, userId: owner.id };
+  }
+
+  const temporaryPassword = `Lf-${randomToken(12).replace(/[^a-zA-Z0-9]/g, "")}-7a`;
+  await withTransaction(async (connection) => {
+    await execute(
+      "UPDATE users SET password_hash = ?, password_updated_at = NOW(3), failed_login_count = 0, locked_until = NULL WHERE id = ?",
+      [await hashPassword(temporaryPassword), owner.id],
+      connection
+    );
+    await execute(
+      "UPDATE user_tokens SET consumed_at = NOW(3) WHERE user_id = ? AND purpose = 'password_reset' AND consumed_at IS NULL",
+      [owner.id],
+      connection
+    );
+    await revokeAllSessions(owner.id, connection);
+  });
+  await sendMail({
+    to: owner.email,
+    subject: "Your LivFinder password was reset",
+    text: "LivFinder support reset your password. Sign in with the password they give you, then change it in Account Settings. If you did not ask for this, contact support.",
+  }).catch((error) => logger.error({ err: error, userId: owner.id }, "password reset notice could not be sent"));
+  return { method, temporaryPassword, sentTo: null, userId: owner.id };
+}
 
 export async function setOrganizationState({ identifier, status, reason, userId }) {
   const organization = await queryOne("SELECT id, public_id, account_id FROM organizations WHERE public_id = ? LIMIT 1", [identifier]);
@@ -916,6 +1109,8 @@ export async function deleteArticle({ identifier }) {
 /* -------------------------------------------------------------------------- */
 
 export const mediaUpdateSchema = z.object({
+  // The library shows the original file name as the title, so that is what a title edit renames.
+  title: z.string().trim().min(1).max(255).optional(),
   altText: z.string().trim().max(255).optional(),
   caption: z.string().trim().max(500).optional(),
   credit: z.string().trim().max(255).optional(),
@@ -930,10 +1125,11 @@ export async function updateMediaAsset({ identifier, payload }) {
     : null;
   await execute(
     `UPDATE media_assets
-        SET alt_text = COALESCE(?, alt_text), caption = COALESCE(?, caption),
+        SET original_file_name = COALESCE(?, original_file_name),
+            alt_text = COALESCE(?, alt_text), caption = COALESCE(?, caption),
             credit = COALESCE(?, credit), folder_id = COALESCE(?, folder_id)
       WHERE id = ?`,
-    [payload.altText ?? null, payload.caption ?? null, payload.credit ?? null, folder?.id ?? null, asset.id]
+    [payload.title ?? null, payload.altText ?? null, payload.caption ?? null, payload.credit ?? null, folder?.id ?? null, asset.id]
   );
   return { id: asset.public_id, updated: true };
 }
@@ -1271,7 +1467,7 @@ export const internalUserSchema = z.object({
   firstName: z.string().trim().min(1).max(120),
   lastName: z.string().trim().min(1).max(120),
   email: z.string().trim().toLowerCase().email().max(255),
-  phone: z.string().trim().max(40).optional().or(z.literal("")),
+  phone: optionalPhone,
   roleIds: z.array(z.coerce.number().int().positive()).max(10).optional(),
   status: z.enum(["active", "suspended", "pending_verification"]).optional(),
 });
@@ -1366,8 +1562,8 @@ export const organizationProfileSchema = z.object({
   tagline: z.string().trim().max(255).optional().nullable(),
   description: z.string().trim().max(5000).optional().nullable(),
   email: z.string().trim().toLowerCase().email().max(255).optional().nullable(),
-  phone: z.string().trim().max(40).optional().nullable(),
-  whatsapp: z.string().trim().max(40).optional().nullable(),
+  phone: optionalPhone,
+  whatsapp: optionalPhone,
   websiteUrl: z.string().trim().max(255).optional().nullable(),
   addressLine1: z.string().trim().max(255).optional().nullable(),
   postalCode: z.string().trim().max(30).optional().nullable(),
@@ -1416,7 +1612,8 @@ export async function updateOrganizationProfile({ identifier, payload }) {
   for (const [key, column] of Object.entries(ORGANIZATION_COLUMNS)) {
     if (payload[key] === undefined) continue;
     assignments.push(`${column} = ?`);
-    params.push(typeof payload[key] === "boolean" ? (payload[key] ? 1 : 0) : payload[key]);
+    const value = key === "description" ? sanitizeDescription(payload[key]) : payload[key];
+    params.push(typeof value === "boolean" ? (value ? 1 : 0) : value);
   }
   if (!assignments.length) return { id: organization.public_id, updated: false };
 
@@ -1440,7 +1637,7 @@ export const individualProfileSchema = z.object({
   firstName: z.string().trim().min(1).max(120).optional(),
   lastName: z.string().trim().min(1).max(120).optional(),
   email: z.string().trim().toLowerCase().email().max(255).optional(),
-  phone: z.string().trim().max(40).optional().nullable(),
+  phone: optionalPhone,
   profession: z.string().trim().max(255).optional().nullable(),
   bio: z.string().trim().max(5000).optional().nullable(),
   countryId: z.coerce.number().int().positive().optional().nullable(),
@@ -1492,7 +1689,7 @@ export async function updateIndividualProfile({ identifier, payload }) {
     const agentParams = [];
     const setAgent = (column, value) => { agentAssignments.push(`${column} = ?`); agentParams.push(value); };
     if (payload.profession !== undefined) setAgent("title", payload.profession);
-    if (payload.bio !== undefined) setAgent("bio", payload.bio);
+    if (payload.bio !== undefined) setAgent("bio", sanitizeDescription(payload.bio));
     if (payload.firstName !== undefined || payload.lastName !== undefined) {
       setAgent("first_name", firstName);
       setAgent("last_name", lastName);
@@ -1523,8 +1720,8 @@ export const agentSchema = z.object({
   firstName: z.string().trim().min(1).max(120),
   lastName: z.string().trim().min(1).max(120),
   email: z.string().trim().toLowerCase().email().max(255).optional().nullable(),
-  phone: z.string().trim().max(40).optional().nullable(),
-  whatsapp: z.string().trim().max(40).optional().nullable(),
+  phone: optionalPhone,
+  whatsapp: optionalPhone,
   title: z.string().trim().max(120).optional().nullable(),
   bio: z.string().trim().max(4000).optional().nullable(),
   licenseNumber: z.string().trim().max(80).optional().nullable(),
@@ -1553,7 +1750,7 @@ export async function upsertAgent({ identifier, payload, userId }) {
       last_name: payload.lastName,
       display_name: displayName,
       title: payload.title ?? null,
-      bio: payload.bio ?? null,
+      bio: sanitizeDescription(payload.bio) ?? null,
       email: payload.email ?? null,
       phone: payload.phone ?? null,
       whatsapp: payload.whatsapp ?? null,
@@ -1596,7 +1793,7 @@ export async function upsertAgent({ identifier, payload, userId }) {
         displayName,
         base,
         payload.title ?? null,
-        payload.bio ?? null,
+        sanitizeDescription(payload.bio) ?? null,
         payload.email ?? null,
         payload.phone ?? null,
         payload.whatsapp ?? null,
@@ -1693,7 +1890,48 @@ async function upsertPlanPrices(planId, prices, connection) {
   }
 }
 
+const PLAN_QUOTA_COLUMNS = ["listing_quota", "storage_quota", "featured_quota"];
+
 export async function upsertPlan({ identifier, payload, userId }) {
+  const before = identifier
+    ? await queryOne(`SELECT id, ${PLAN_QUOTA_COLUMNS.join(", ")} FROM plans WHERE public_id = ?`, [identifier])
+    : null;
+  const result = await savePlan({ identifier, payload, userId });
+  if (payload.addons && identifier) {
+    await syncPlanSubscribers(await queryValue("SELECT id FROM plans WHERE public_id = ?", [identifier]));
+  }
+  if (before) await syncPlanQuotas(before);
+  return result;
+}
+
+/**
+ * A quota edit reaches the plan's live subscribers. The account's quota mirrors its plan's (it is
+ * what listing creation checks), so it was left on the old number and Billing showed "13 / 10"
+ * beside "15 listings" (F24). An account whose quota an admin set by hand — anything other than
+ * the plan's old value — keeps it.
+ */
+async function syncPlanQuotas(before) {
+  const after = await queryOne(`SELECT ${PLAN_QUOTA_COLUMNS.join(", ")} FROM plans WHERE id = ?`, [before.id]);
+  for (const column of PLAN_QUOTA_COLUMNS) {
+    if (!after || String(after[column]) === String(before[column])) continue;
+    await execute(
+      `UPDATE accounts a
+          SET a.${column} = ?, a.updated_at = NOW(3)
+        WHERE a.${column} <=> ?
+          AND EXISTS (SELECT 1 FROM subscriptions s
+                       WHERE s.account_id = a.id AND s.plan_id = ? AND s.status IN ('active','trialing','past_due'))`,
+      [after[column], before[column], before.id]
+    );
+    if (column !== "storage_quota") {
+      await execute(
+        `UPDATE subscriptions SET ${column} = ?, updated_at = NOW(3) WHERE plan_id = ? AND status IN ('active','trialing','past_due')`,
+        [after[column] ?? 0, before.id]
+      );
+    }
+  }
+}
+
+async function savePlan({ identifier, payload, userId }) {
   return withTransaction(async (connection) => {
     if (identifier) {
       const plan = await queryOne("SELECT id, public_id FROM plans WHERE public_id = ?", [identifier], connection);
@@ -1776,6 +2014,8 @@ export const packageChangeSchema = z.object({
   // Change Package modal submits back) — this used to coerce that ULID to a
   // number, which is always NaN, so every package change failed validation.
   packageId: z.string().trim().min(1),
+  // `next` waits for the renewal date; `now` changes the plan and quotas straight away.
+  effective: z.enum(["next", "now"]).default("next"),
   note: z.string().trim().max(500).optional(),
 });
 
@@ -1785,17 +2025,19 @@ export const packageChangeSchema = z.object({
  * self-service "Choose Plan" — see `accounts.service.js#assignPlanToAccount`.
  * This wrapper only resolves the admin's account/org identifier.
  */
-export async function changeAccountPackage({ identifier, payload }) {
-  const account = await queryOne(
-    `SELECT a.id, a.public_id FROM accounts a
-      LEFT JOIN organizations o ON o.account_id = a.id
-      WHERE a.public_id = ? OR o.public_id = ? OR o.slug = ? LIMIT 1`,
-    [identifier, identifier, identifier]
-  );
-  if (!account) throw AppError.notFound("That account was not found.");
-
-  const result = await assignPlanToAccount({ accountId: account.id, packageId: payload.packageId });
+export async function changeAccountPackage({ identifier, payload, userId }) {
+  const account = await accountForAdmin(identifier);
+  const result =
+    payload.effective === "now"
+      ? { ...(await assignPlanToAccount({ accountId: account.id, packageId: payload.packageId })), scheduled: false }
+      : await schedulePlanChange({ accountId: account.id, packageId: payload.packageId, userId });
   return { id: account.public_id, ...result };
+}
+
+export async function cancelAccountPackageChange({ identifier }) {
+  const account = await accountForAdmin(identifier);
+  if (!(await cancelScheduledPlanChange(account.id))) throw AppError.notFound("No package change is scheduled.");
+  return { id: account.public_id, cancelled: true };
 }
 
 async function accountForAdmin(identifier) {

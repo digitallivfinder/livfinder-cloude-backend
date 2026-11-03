@@ -6,8 +6,9 @@ import { notifyAccount } from "../system/notifications.service.js";
 /**
  * Paid add-ons on top of a plan (migration 0059).
  *
- * An admin decides per plan whether an add-on can be switched on and what it costs (0 is a
- * real price); an account switches it on and keeps the plan, price and currency it agreed to.
+ * An admin decides per plan whether an add-on is offered and what it costs (0 is a real price).
+ * A plan that offers it switches it on for its accounts, and the account keeps the plan, price
+ * and currency it agreed to. It can still be switched off, and an admin can grant it elsewhere.
  * One row per add-on per account, reused when it is switched back on, so feeds, keys and the
  * lead history carry on where they stopped.
  *
@@ -194,6 +195,37 @@ export async function enableAddon({ accountId, code, userId, byPlatform = false,
     }
   ).catch(() => {});
   return listAccountAddons(accountId);
+}
+
+/**
+ * Brings an account's add-ons in line with its plan: what the plan offers comes on, and what was
+ * only on because of a plan that offered it goes off. An add-on someone switched on by hand
+ * (`enabled_by_user_id`) stays. `keepSwitchedOff` leaves one the account turned off itself, for
+ * when the plan was only edited rather than changed.
+ */
+export async function syncAccountAddons(accountId, { keepSwitchedOff = false } = {}) {
+  const subscription = await currentSubscription(accountId);
+  if (!subscription || LAPSED_SUBSCRIPTION.has(subscription.status)) return;
+  const offered = (await planAddonsByPlan([subscription.plan_id])).get(Number(subscription.plan_id)) || {};
+  const rows = await query("SELECT addon_code, status, ends_at, enabled_by_user_id FROM account_addons WHERE account_id = ?", [accountId]);
+  for (const code of ADDON_CODES) {
+    const row = rows.find((item) => item.addon_code === code);
+    const running = runningState(row, subscription);
+    if (offered[code]?.isAvailable) {
+      if (!running && !(keepSwitchedOff && row)) await enableAddon({ accountId, code, userId: null });
+    } else if (running && row.enabled_by_user_id === null) {
+      await disableAddon({ accountId, code });
+    }
+  }
+}
+
+/** After a plan's add-ons are edited, for every account on it. */
+export async function syncPlanSubscribers(planId) {
+  const accounts = await query(
+    "SELECT DISTINCT account_id FROM subscriptions WHERE plan_id = ? AND status IN ('active', 'trialing', 'past_due')",
+    [planId]
+  );
+  for (const { account_id: accountId } of accounts) await syncAccountAddons(accountId, { keepSwitchedOff: true });
 }
 
 /** Switches an add-on off. Feeds stop and leads stop going out; listings stay. */

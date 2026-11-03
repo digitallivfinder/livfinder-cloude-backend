@@ -1,3 +1,4 @@
+import { claimRecordsByEmail, createMemberAccount } from "../accounts/memberAccount.js";
 import env from "../../config/env.js";
 import logger from "../../config/logger.js";
 import { query, queryOne, execute } from "../../db/query.js";
@@ -113,7 +114,7 @@ export async function login({ email, password, mfaCode, ip, userAgent }) {
     }
   }
 
-  return withTransaction(async (connection) => {
+  const outcome = await withTransaction(async (connection) => {
     if (needsRehash) {
       // Migrate the stored hash to Argon2id now that the plaintext is in hand.
       const upgraded = await hashPassword(password);
@@ -150,6 +151,8 @@ export async function login({ email, password, mfaCode, ip, userAgent }) {
 
     return { user, session };
   });
+  await claimRecordsByEmail(user.id);
+  return outcome;
 }
 
 export async function logout({ sessionId, userId, everywhere = false, ip }) {
@@ -274,6 +277,19 @@ export async function changePassword({ userId, currentPassword, newPassword, ip,
   });
 }
 
+export async function resendEmailVerification({ email, ip }) {
+  const user = await queryOne(
+    "SELECT id FROM users WHERE email_normalized = ? AND email_verified_at IS NULL LIMIT 1",
+    [normalizeEmail(email)]
+  );
+  if (!user) return;
+  try {
+    await sendEmailVerification({ userId: user.id, ip });
+  } catch (error) {
+    logger.error({ err: error, userId: user.id }, "confirmation email could not be resent");
+  }
+}
+
 export async function sendEmailVerification({ userId, ip }) {
   const user = await queryOne("SELECT id, email, email_verified_at FROM users WHERE id = ?", [userId]);
   if (!user) throw AppError.notFound();
@@ -290,7 +306,7 @@ export async function sendEmailVerification({ userId, ip }) {
 }
 
 export async function verifyEmail({ token, ip }) {
-  return withTransaction(async (connection) => {
+  const result = await withTransaction(async (connection) => {
     const row = await consumeToken({ token, purpose: "email_verification" }, connection);
     if (!row) throw AppError.badRequest("That confirmation link is no longer valid.");
     await execute(
@@ -307,6 +323,8 @@ export async function verifyEmail({ token, ip }) {
     );
     return { userId: row.user_id };
   });
+  await claimRecordsByEmail(result.userId);
+  return result;
 }
 
 /**
@@ -317,6 +335,19 @@ export async function verifyEmail({ token, ip }) {
  * configuration. With none configured the endpoints report the provider as
  * unavailable rather than pretending to redirect.
  */
+const OAUTH_ENDPOINTS = {
+  google: {
+    authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+    tokenUrl: "https://oauth2.googleapis.com/token",
+    userInfoUrl: "https://openidconnect.googleapis.com/v1/userinfo",
+  },
+  linkedin: {
+    authorizeUrl: "https://www.linkedin.com/oauth/v2/authorization",
+    tokenUrl: "https://www.linkedin.com/oauth/v2/accessToken",
+    userInfoUrl: "https://api.linkedin.com/v2/userinfo",
+  },
+};
+
 export function configuredOAuthProviders() {
   const providers = [];
   for (const provider of ["google", "apple", "facebook", "linkedin"]) {
@@ -327,9 +358,9 @@ export function configuredOAuthProviders() {
         provider,
         clientId,
         clientSecret,
-        authorizeUrl: process.env[`OAUTH_${provider.toUpperCase()}_AUTHORIZE_URL`],
-        tokenUrl: process.env[`OAUTH_${provider.toUpperCase()}_TOKEN_URL`],
-        userInfoUrl: process.env[`OAUTH_${provider.toUpperCase()}_USERINFO_URL`],
+        authorizeUrl: process.env[`OAUTH_${provider.toUpperCase()}_AUTHORIZE_URL`] || OAUTH_ENDPOINTS[provider]?.authorizeUrl,
+        tokenUrl: process.env[`OAUTH_${provider.toUpperCase()}_TOKEN_URL`] || OAUTH_ENDPOINTS[provider]?.tokenUrl,
+        userInfoUrl: process.env[`OAUTH_${provider.toUpperCase()}_USERINFO_URL`] || OAUTH_ENDPOINTS[provider]?.userInfoUrl,
         scope: process.env[`OAUTH_${provider.toUpperCase()}_SCOPE`] || "openid email profile",
       });
     }
@@ -338,7 +369,24 @@ export function configuredOAuthProviders() {
 }
 
 /** Links or creates a user from a verified provider identity. */
-export async function upsertOAuthIdentity({ provider, subject, email, displayName, avatarUrl, ip, userAgent }) {
+export async function upsertOAuthIdentity({ provider, subject, email, emailVerified, displayName, avatarUrl, sellerType, ip, userAgent }) {
+  if (!email || !emailVerified) {
+    throw new AppError("That provider did not confirm your email address.", { status: 403, code: "EMAIL_NOT_VERIFIED" });
+  }
+  const result = await signInWithIdentity({ provider, subject, email, displayName, avatarUrl, ip, userAgent });
+  await claimRecordsByEmail(result.userId);
+  // Only a Member can still owe an application; an existing seller keeps what they have.
+  if (sellerType) {
+    await execute(
+      `UPDATE accounts a JOIN account_types t ON t.id = a.account_type_id
+          SET a.seller_intent = ? WHERE a.owner_user_id = ? AND t.code = 'personal'`,
+      [sellerType, result.userId]
+    );
+  }
+  return result;
+}
+
+async function signInWithIdentity({ provider, subject, email, displayName, avatarUrl, ip, userAgent }) {
   return withTransaction(async (connection) => {
     const existing = await queryOne(
       "SELECT user_id FROM user_identities WHERE provider = ? AND provider_uid = ? LIMIT 1",
@@ -351,6 +399,18 @@ export async function upsertOAuthIdentity({ provider, subject, email, displayNam
       const byEmail = email ? await findUserByEmail(email) : null;
       if (byEmail) {
         userId = byEmail.id;
+        // Nobody had proved they own this address, so whoever set its password may not be
+        // this person: that password and any session it opened stop working here.
+        if (!byEmail.email_verified_at) {
+          await execute(
+            `UPDATE users
+                SET password_hash = ?, password_updated_at = NOW(3), session_epoch = session_epoch + 1,
+                    email_verified_at = NOW(3), status = IF(status = 'pending_verification', 'active', status)
+              WHERE id = ?`,
+            [await hashPassword(randomToken(32)), userId],
+            connection
+          );
+        }
       } else {
         const result = await execute(
           `INSERT INTO users (public_id, email, email_normalized, email_verified_at, password_hash,
@@ -370,6 +430,7 @@ export async function upsertOAuthIdentity({ provider, subject, email, displayNam
           connection
         );
         userId = result.insertId;
+        await createMemberAccount({ userId, displayName: displayName || email, email }, connection);
       }
       await execute(
         `INSERT INTO user_identities (user_id, provider, provider_uid, email, raw_profile, created_at, last_used_at)

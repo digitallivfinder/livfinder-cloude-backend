@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import { optionalPhone } from "../../utils/phone.js";
 import { asyncHandler } from "../../middleware/errors.js";
 import { validate, q } from "../../middleware/validation.js";
 import { writeLimiter } from "../../middleware/rateLimit.js";
@@ -15,6 +16,7 @@ import { listFavourites, listSavedSearches } from "../portal/engagement.reposito
 import { resolveCategory } from "../../utils/categories.js";
 import { resolveLocation } from "../locations/locations.repository.js";
 import { sendMail } from "../system/mail.service.js";
+import env from "../../config/env.js";
 import net from "node:net";
 import { notifyNewBooking, notifyNewInquiry, notifyNewOffer } from "../system/notifications.service.js";
 import { idempotency } from "../../middleware/idempotency.js";
@@ -314,7 +316,7 @@ const inquirySchema = z.object({
   projectId: z.string().min(1).max(220).optional(),
   name: z.string().trim().min(1, "Enter your name.").max(200),
   email: z.string().trim().toLowerCase().email("Enter a valid email address.").max(255),
-  phone: z.string().trim().max(40).optional().or(z.literal("")),
+  phone: optionalPhone,
   message: z.string().trim().min(10, "Write a short message.").max(4000),
   inquiryType: z.enum(["general", "viewing", "callback", "brochure", "floor_plan", "price", "availability", "offer", "valuation", "charter"]).optional(),
   // Mirrors the `inquiries.channel` enum; the public contact form is "form".
@@ -511,7 +513,7 @@ router.post(
       notes: z.string().trim().max(2000).optional(),
       contactName: z.string().trim().max(200).optional(),
       contactEmail: z.string().trim().toLowerCase().email().max(255).optional(),
-      contactPhone: z.string().trim().max(40).optional(),
+      contactPhone: optionalPhone,
     }),
   }),
   asyncHandler(async (req, res) => {
@@ -1080,10 +1082,12 @@ router.post(
           [existing.id]
         );
       }
+      // A pending address gets the confirmation again, which is how a lost email is recovered.
+      if (existing.status === "pending" || existing.status === "unsubscribed") await sendNewsletterConfirmation(existing.id);
       return res.status(202).json(detailResponse({ status: "pending" }));
     }
 
-    await execute(
+    const insert = await execute(
       `INSERT INTO newsletter_subscribers
          (public_id, email, user_id, status, source, ip_address, unsubscribe_token, created_at)
        VALUES (?, ?, ?, 'pending', ?, INET6_ATON(?), ?, NOW(3))`,
@@ -1098,8 +1102,46 @@ router.post(
         crypto.randomBytes(16).toString("hex"),
       ]
     );
+    await sendNewsletterConfirmation(insert.insertId);
 
     return res.status(201).json(detailResponse({ status: "pending" }));
+  })
+);
+
+/**
+ * Double opt-in. Subscribing recorded a `pending` row and nothing else: no email went out and
+ * nothing could confirm it, so the list never had a confirmed subscriber (F17). The link carries
+ * the subscriber's own token, which also serves the unsubscribe link.
+ */
+async function sendNewsletterConfirmation(subscriberId) {
+  const row = await queryOne("SELECT email, unsubscribe_token FROM newsletter_subscribers WHERE id = ?", [subscriberId]);
+  if (!row?.unsubscribe_token) return;
+  const confirmUrl = `${env.FRONTEND_URL}/newsletter/confirm?token=${encodeURIComponent(row.unsubscribe_token)}`;
+  try {
+    await sendMail({
+      to: row.email,
+      subject: "Confirm your LivFinder newsletter subscription",
+      text: `Please confirm that you would like to receive the LivFinder newsletter:\n\n${confirmUrl}\n\nIf you did not ask for this, ignore this message and you will not be subscribed.`,
+    });
+  } catch {
+    // The row stays pending; subscribing again resends the confirmation.
+  }
+}
+
+router.get(
+  "/newsletter/confirm",
+  validate({ query: z.object({ token: z.string().trim().regex(/^[a-f0-9]{32}$/i, "That link is not valid.") }) }),
+  asyncHandler(async (req, res) => {
+    const row = await queryOne("SELECT id, status FROM newsletter_subscribers WHERE unsubscribe_token = ? LIMIT 1", [req.query.token]);
+    if (!row) throw AppError.notFound("That confirmation link is not valid.");
+    if (row.status === "pending") {
+      await execute(
+        "UPDATE newsletter_subscribers SET status = 'subscribed', confirmed_at = NOW(3), updated_at = NOW(3) WHERE id = ?",
+        [row.id]
+      );
+    }
+    const status = row.status === "pending" ? "subscribed" : row.status;
+    return res.json(detailResponse({ status }));
   })
 );
 

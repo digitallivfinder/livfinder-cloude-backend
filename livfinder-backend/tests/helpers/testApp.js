@@ -216,16 +216,49 @@ export async function cleanupProjects(publicIds) {
  */
 const disposableEmail = (prefix) => `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e6)}@example.test`;
 
+const uniquePhone = () => `+9715${String(Math.floor(Math.random() * 1e8)).padStart(8, "0")}`;
+
+/** What the signup API requires of everyone; a test spreads this first and overrides its subject. */
+export const personalSignup = () => ({
+  phone: uniquePhone(),
+  country: "United Arab Emirates",
+  displayName: "Disposable Owner",
+  bio: "<p>A disposable test account.</p>",
+});
+
+export const organizationSignup = () => ({
+  phone: uniquePhone(),
+  country: "United Arab Emirates",
+  publicName: "Disposable Agency",
+  organizationType: "agency",
+  registrationNumber: `REG-${Math.floor(Math.random() * 1e9)}`,
+  organizationEmail: "agency@example.test",
+  organizationPhone: uniquePhone(),
+  address: "Office 12, Marina Plaza, Dubai",
+  description: "<p>A disposable test company.</p>",
+});
+
 /** A real portal owner — user, personal account and owner membership — through the signup endpoint. */
 export async function createDisposablePortalOwner({ prefix = "disposable-owner", password = "LivFinder!2026" } = {}) {
   const email = disposableEmail(prefix);
   const response = await client().send("post", "/v1/accounts/personal/signup", {
+    ...personalSignup(),
     firstName: "Disposable", lastName: "Owner", email, password, confirmPassword: password,
     agreements: true, country: "United Arab Emirates", city: "Dubai", displayName: "Disposable Owner",
     categoryId: "realEstate",
   });
   if (response.status !== 201) throw new Error(`disposable signup failed: ${response.status} ${JSON.stringify(response.body)}`);
   await execute("UPDATE users SET status = 'active', email_verified_at = NOW(3) WHERE email_normalized = ?", [email]);
+  await execute(
+    `UPDATE accounts a JOIN users u ON u.id = a.owner_user_id
+        SET a.status = 'active', a.verification_status = 'verified' WHERE u.email_normalized = ?`,
+    [email]
+  );
+  await execute(
+    `UPDATE account_category_access aca JOIN accounts a ON a.id = aca.account_id JOIN users u ON u.id = a.owner_user_id
+        SET aca.status = 'approved' WHERE u.email_normalized = ?`,
+    [email]
+  );
   const user = await queryOne("SELECT id, public_id, email FROM users WHERE email_normalized = ?", [email]);
   return { id: user.id, publicId: user.public_id, email: user.email };
 }

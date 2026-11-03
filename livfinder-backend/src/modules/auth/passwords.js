@@ -41,9 +41,13 @@ export async function verifyPassword(storedHash, plain) {
 }
 
 const COMMON = new Set([
-  "password", "password1", "12345678", "qwertyui", "letmein1", "welcome1",
-  "livfinder", "changeme", "iloveyou", "adminadmin",
+  "password", "passw0rd", "p@ssword", "qwerty", "qwertyui", "qwertyuiop", "1q2w3e4r", "1qaz2wsx",
+  "letmein", "welcome", "changeme", "iloveyou", "adminadmin", "admin", "administrator",
+  "abcdefgh", "abc123", "monkey", "dragon", "football", "baseball", "sunshine", "princess", "trustno1",
 ]);
+
+// The base word decides it: "Password1234!" is "password" with the digits people always add.
+const baseWord = (password) => password.toLowerCase().replace(/[^a-z@]+$/, "").replace(/^[^a-z@]+/, "");
 
 /** Returns null when acceptable, or a user-facing reason when not. */
 export function passwordPolicyError(password, { email } = {}) {
@@ -51,7 +55,7 @@ export function passwordPolicyError(password, { email } = {}) {
     return "Password must be at least 10 characters.";
   }
   if (password.length > 200) return "Password must be 200 characters or fewer.";
-  if (COMMON.has(password.toLowerCase())) return "That password is too common.";
+  if (COMMON.has(baseWord(password)) || /^(.)\1+$|^\d+$/.test(password)) return "That password is too common.";
   if (email && password.toLowerCase().includes(String(email).split("@")[0].toLowerCase())) {
     return "Password must not contain your email address.";
   }

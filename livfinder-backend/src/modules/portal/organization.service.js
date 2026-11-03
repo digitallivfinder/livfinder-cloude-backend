@@ -1,6 +1,9 @@
+import { descriptionToHtml, sanitizeDescription } from "../../utils/richText.js";
+import { syncMembershipWithAgent } from "../accounts/teamInvitation.service.js";
 import crypto from "node:crypto";
 import net from "node:net";
 import { z } from "zod";
+import { optionalPhone } from "../../utils/phone.js";
 import { query, queryOne, queryValue, execute } from "../../db/query.js";
 import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
@@ -18,8 +21,8 @@ export const organizationUpdateSchema = z.object({
   tagline: z.string().trim().max(255).optional().or(z.literal("")),
   description: z.string().trim().max(8000).optional().or(z.literal("")),
   email: z.string().trim().max(255).optional().or(z.literal("")),
-  phone: z.string().trim().max(40).optional().or(z.literal("")),
-  whatsapp: z.string().trim().max(40).optional().or(z.literal("")),
+  phone: optionalPhone,
+  whatsapp: optionalPhone,
   website: z.string().trim().max(500).optional().or(z.literal("")),
   addressLine1: z.string().trim().max(255).optional().or(z.literal("")),
   addressLine2: z.string().trim().max(255).optional().or(z.literal("")),
@@ -43,8 +46,8 @@ export const agentCreateSchema = z.object({
   displayName: z.string().trim().max(200).optional(),
   title: z.string().trim().max(120).optional().or(z.literal("")),
   email: z.string().trim().toLowerCase().email().max(255).optional().or(z.literal("")),
-  phone: z.string().trim().max(40).optional().or(z.literal("")),
-  whatsapp: z.string().trim().max(40).optional().or(z.literal("")),
+  phone: optionalPhone,
+  whatsapp: optionalPhone,
   bio: z.string().trim().max(8000).optional().or(z.literal("")),
   licenseNumber: z.string().trim().max(120).optional().or(z.literal("")),
   experienceYears: z.coerce.number().int().min(0).max(80).optional(),
@@ -104,7 +107,7 @@ export async function getOrganization(organizationId) {
     legalName: row.legal_name,
     kind: row.kind,
     tagline: row.tagline,
-    description: row.description,
+    description: descriptionToHtml(row.description),
     logo: row.logo_url,
     coverImage: row.cover_image_url,
     email: row.email,
@@ -168,7 +171,7 @@ export async function updateOrganization({ organizationId, payload, req }) {
     if (payload.name !== undefined) set("name", payload.name);
     if (payload.legalName !== undefined) set("legal_name", payload.legalName || null);
     if (payload.tagline !== undefined) set("tagline", payload.tagline || null);
-    if (payload.description !== undefined) set("description", payload.description || null);
+    if (payload.description !== undefined) set("description", sanitizeDescription(payload.description) || null);
     if (payload.email !== undefined) set("email", payload.email || null);
     if (payload.phone !== undefined) set("phone", payload.phone || null);
     if (payload.whatsapp !== undefined) set("whatsapp", payload.whatsapp || null);
@@ -260,6 +263,7 @@ export async function listAgents({ organizationId, page = 1, pageSize = 20, sear
   return {
     data: rows.map((row) => ({
       ...serializeAgent(row),
+      hasLogin: Boolean(row.user_id),
       isPubliclyVisible: bool(row.is_publicly_visible),
       publicUrl: bool(row.is_publicly_visible) ? `/agents/${row.slug}` : null,
     })),
@@ -269,7 +273,7 @@ export async function listAgents({ organizationId, page = 1, pageSize = 20, sear
   };
 }
 
-async function uniqueAgentSlug(base, connection) {
+export async function uniqueAgentSlug(base, connection) {
   const root = slugify(base) || "agent";
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const candidate = attempt === 0 ? root : `${root}-${attempt + 1}`;
@@ -305,7 +309,7 @@ export async function createAgent({ organizationId, payload, req }) {
         displayName,
         slug,
         payload.title || null,
-        payload.bio || null,
+        sanitizeDescription(payload.bio) || null,
         photoUrl,
         payload.email || null,
         payload.phone || null,
@@ -353,7 +357,7 @@ export async function updateAgent({ organizationId, agentPublicId, payload, req 
     if (payload.lastName !== undefined) set("last_name", payload.lastName);
     if (payload.displayName !== undefined) set("display_name", payload.displayName);
     if (payload.title !== undefined) set("title", payload.title || null);
-    if (payload.bio !== undefined) set("bio", payload.bio || null);
+    if (payload.bio !== undefined) set("bio", sanitizeDescription(payload.bio) || null);
     if (payload.email !== undefined) set("email", payload.email || null);
     if (payload.phone !== undefined) set("phone", payload.phone || null);
     if (payload.whatsapp !== undefined) set("whatsapp", payload.whatsapp || null);
@@ -373,6 +377,7 @@ export async function updateAgent({ organizationId, agentPublicId, payload, req 
       await execute(`UPDATE agents SET ${assignments.join(", ")} WHERE id = ?`, [...params, agent.id], connection);
     }
     await applyAgentRelations({ agentId: agent.id, payload, connection });
+    if (payload.status !== undefined) await syncMembershipWithAgent({ agentId: agent.id, status: payload.status, connection });
   });
 
   const updated = await queryOne(
@@ -476,10 +481,10 @@ export async function categoryAccess(organizationId) {
   });
 }
 
-export async function assertCategoryAccess({ organizationId, category }) {
+export async function assertCategoryAccess({ organizationId, accountId: ownAccountId, category }) {
   const definition = resolveCategory(category);
   if (!definition) throw AppError.validation("Some information is invalid.", { category: "Unknown category." });
-  const accountId = await accountIdForOrganization(organizationId);
+  const accountId = organizationId ? await accountIdForOrganization(organizationId) : ownAccountId;
   const approved = accountId
     ? await queryValue(
         `SELECT aca.id FROM account_category_access aca

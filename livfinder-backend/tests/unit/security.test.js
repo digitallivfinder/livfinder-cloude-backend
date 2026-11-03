@@ -52,6 +52,9 @@ describe("passwords", () => {
     expect(passwordPolicyError("passwordpassword")).toMatch(/letter and one number/);
     expect(passwordPolicyError("password1")).toMatch(/at least 10/);
     expect(passwordPolicyError("livfinder123", { email: "livfinder@example.test" })).toMatch(/must not contain/);
+    expect(passwordPolicyError("password1234")).toMatch(/too common/);
+    expect(passwordPolicyError("Qwerty12345!")).toMatch(/too common/);
+    expect(passwordPolicyError("1234567890")).toMatch(/too common/);
     expect(passwordPolicyError("Reasonable42")).toBeNull();
   });
 });

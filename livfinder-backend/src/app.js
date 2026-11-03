@@ -1,3 +1,7 @@
+import { requireAccount, requireSellerTools } from "./middleware/auth.js";
+import { devMailboxRouter } from "./modules/system/devMailbox.routes.js";
+import { portalCalendarRouter } from "./modules/calendar/calendar.routes.js";
+import { myRecordsRouter } from "./modules/portal/myRecords.routes.js";
 import express from "express";
 import cookieParser from "cookie-parser";
 import pinoHttp from "pino-http";
@@ -26,6 +30,8 @@ import { leadFeedRouter, portalLeadsRouter } from "./modules/leads/leads.routes.
 import { withoutSecret } from "./utils/redactUrl.js";
 import importsAdminRouter from "./modules/imports/imports.admin.routes.js";
 import { legacyMediaRewrite } from "./middleware/legacyMedia.js";
+import { publicResponseCache } from "./middleware/publicCache.js";
+import chatRouter from "./modules/chat/chat.routes.js";
 
 export function createApp() {
   const app = express();
@@ -52,6 +58,7 @@ export function createApp() {
   // Health checks answer before the body parsers and the limiter so a probe
   // still works when the API is under load.
   app.use("/health", healthRouter);
+  if (!env.isProduction && !env.isTest && env.MAIL_DRIVER === "log") app.use("/dev/mailbox", devMailboxRouter);
 
   /**
    * The API root. This is not a website — opening the API port in a browser used to return a bare
@@ -106,12 +113,19 @@ export function createApp() {
   // Projects owns /v1/public/projects and /v1/public/developers. Mounted first
   // because the general public router ends in a `/:category/…` catch-all that
   // would otherwise answer /projects/facets as a category named "projects".
+  // Redis cache in front of every public read; see middleware/publicCache.js.
+  app.use("/v1/public", publicResponseCache());
   app.use("/v1/public", publicFeedFormatsRouter);
   app.use("/v1/public", projectsPublicRouter);
   app.use("/v1/public", publicRouter);
   app.use("/v1/auth", authRouter);
+  // Live chat for visitors, clients and staff; the socket that carries it is in realtime/.
+  app.use("/v1/chat", chatRouter);
   app.use("/v1/accounts", accountsRouter);
   app.use("/v1/media", mediaRouter);
+  app.use("/v1/portal", requireAccount, requireSellerTools);
+  app.use("/v1/portal", portalCalendarRouter);
+  app.use("/v1/portal", myRecordsRouter);
   app.use("/v1/portal", portalFeedFormatsRouter);
   app.use("/v1/portal", portalLeadsRouter);
   app.use("/v1/portal", portalRouter);

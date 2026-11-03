@@ -14,6 +14,7 @@ import * as authService from "./auth.service.js";
 import { serializeSession } from "./session.serializer.js";
 import { auditFromRequest } from "../system/audit.service.js";
 import { safeFetch } from "../../utils/safeFetch.js";
+import { safeReturnPath } from "../../utils/returnPath.js";
 import { execute, queryOne } from "../../db/query.js";
 import * as mfa from "./mfa.service.js";
 
@@ -26,7 +27,6 @@ const loginSchema = z.object({
   password: z.string().min(1, "Enter your password.").max(200),
   // Required only for accounts with MFA enrolled; the login answers MFA_REQUIRED when missing.
   mfaCode: z.string().trim().min(6).max(20).optional(),
-  remember: z.boolean().optional(),
 });
 
 function setSessionCookie(res, session) {
@@ -247,7 +247,8 @@ router.post(
     }),
   }),
   asyncHandler(async (req, res) => {
-    const enabled = await mfa.isMfaEnabled(req.auth.user.id);
+    // The same test sign-in uses, so a seeded MFA flag with no usable factor falls back to the password.
+    const enabled = await mfa.requiresMfaAtLogin(req.auth.user.id);
     let proved = false;
 
     if (enabled) {
@@ -298,10 +299,12 @@ router.post(
 router.post(
   "/email/resend",
   authLimiter,
-  requireAuth,
+  validate({ body: z.object({ email: z.string().trim().toLowerCase().email().max(255) }) }),
   asyncHandler(async (req, res) => {
-    const result = await authService.sendEmailVerification({ userId: req.auth.user.id, ip: req.ip });
-    return res.json(detailResponse(result));
+    // Sign-in is refused until the address is confirmed, so this cannot need a session. The
+    // answer is the same either way: it must not reveal which addresses have accounts.
+    await authService.resendEmailVerification({ email: req.body.email, ip: req.ip });
+    return res.json(detailResponse({ sent: true }));
   })
 );
 
@@ -324,6 +327,9 @@ router.post(
  * ------------------------------------------------------------------------ */
 
 const OAUTH_STATE_COOKIE = "livfinder_oauth_state";
+const OAUTH_RETURN_COOKIE = "livfinder_oauth_return";
+const OAUTH_SELLER_COOKIE = "livfinder_oauth_seller";
+const SELLER_TYPES = ["personal", "organization"];
 
 router.get(
   "/oauth/providers",
@@ -351,6 +357,30 @@ router.get(
       path: "/",
       maxAge: 10 * 60 * 1000,
     });
+    const returnPath = safeReturnPath(req.query.returnTo);
+    if (returnPath) {
+      res.cookie(OAUTH_RETURN_COOKIE, returnPath, {
+        httpOnly: true,
+        secure: env.isProduction,
+        sameSite: "lax",
+        path: "/",
+        maxAge: 10 * 60 * 1000,
+      });
+    } else {
+      res.clearCookie(OAUTH_RETURN_COOKIE, { path: "/" });
+    }
+    // Set by the Sell with us page: which account type the person picked before the button.
+    if (SELLER_TYPES.includes(req.query.sellerType)) {
+      res.cookie(OAUTH_SELLER_COOKIE, req.query.sellerType, {
+        httpOnly: true,
+        secure: env.isProduction,
+        sameSite: "lax",
+        path: "/",
+        maxAge: 10 * 60 * 1000,
+      });
+    } else {
+      res.clearCookie(OAUTH_SELLER_COOKIE, { path: "/" });
+    }
     const redirectUri = `${req.protocol}://${req.get("host")}/v1/auth/oauth/${req.params.provider}/callback`;
     const url = new URL(configured.authorizeUrl);
     url.searchParams.set("client_id", configured.clientId);
@@ -369,12 +399,20 @@ router.get(
     const configured = authService.configuredOAuthProviders().find((entry) => entry.provider === req.params.provider);
     if (!configured) throw AppError.notImplemented();
 
+    const sellerType = SELLER_TYPES.includes(req.cookies?.[OAUTH_SELLER_COOKIE]) ? req.cookies[OAUTH_SELLER_COOKIE] : null;
+    res.clearCookie(OAUTH_SELLER_COOKIE, { path: "/" });
+    const startPage = sellerType ? "signup" : "login";
+
+    // Pressing Cancel on the provider's screen comes back here.
+    if (req.query.error) return res.redirect(`${env.FRONTEND_URL}/${startPage}?oauth=cancelled`);
     const cookie = req.cookies?.[OAUTH_STATE_COOKIE];
     const [expectedState] = String(cookie || "").split(".");
     if (!expectedState || expectedState !== req.query.state) {
       throw AppError.badRequest("That sign-in attempt could not be verified. Try again.");
     }
     res.clearCookie(OAUTH_STATE_COOKIE, { path: "/" });
+    const returnPath = safeReturnPath(req.cookies?.[OAUTH_RETURN_COOKIE]);
+    res.clearCookie(OAUTH_RETURN_COOKIE, { path: "/" });
 
     const redirectUri = `${req.protocol}://${req.get("host")}/v1/auth/oauth/${req.params.provider}/callback`;
     // Administrator-supplied URL: checked against the allow-list and private ranges before
@@ -405,18 +443,21 @@ router.get(
         provider: req.params.provider,
         subject: String(profile.sub || profile.id),
         email: profile.email,
+        emailVerified: profile.email_verified === true || profile.email_verified === "true",
         displayName: profile.name || profile.given_name,
         avatarUrl: profile.picture,
+        sellerType,
         ip: req.ip,
         userAgent: req.get("user-agent"),
       }));
     } catch (error) {
       // An MFA-protected account is sent to the password-and-code sign-in, not left on an error.
       if (error?.code === "MFA_REQUIRED") return res.redirect(`${env.FRONTEND_URL}/login?mfa=required`);
+      if (error?.code === "EMAIL_NOT_VERIFIED") return res.redirect(`${env.FRONTEND_URL}/${startPage}?oauth=unverified`);
       throw error;
     }
     setSessionCookie(res, session);
-    return res.redirect(`${env.FRONTEND_URL}/portal/dashboard`);
+    return res.redirect(`${env.FRONTEND_URL}${returnPath ?? "/portal/dashboard"}`);
   })
 );
 

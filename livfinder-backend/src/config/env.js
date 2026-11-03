@@ -103,6 +103,24 @@ const schema = z.object({
   SESSION_RATE_LIMIT_MAX: int(1200),
   AUTH_RATE_LIMIT_MAX: int(10),
   PUBLIC_SITE_ORIGIN: z.string().default("https://livfinder.com"),
+
+  // Redis response cache for the public API (src/cache). Empty REDIS_URL means no cache: every
+  // request reads MySQL as before. See docs/redis-cache.md.
+  REDIS_URL: z.string().optional().transform((value) => value || null),
+  // Off under NODE_ENV=test unless switched on, so the suites always read the database.
+  CACHE_ENABLED: z.union([z.boolean(), z.string()]).optional().transform((value) => {
+    if (value === undefined || value === "") return null;
+    if (typeof value === "boolean") return value;
+    return ["1", "true", "yes", "on"].includes(value.toLowerCase());
+  }),
+  CACHE_PREFIX: z.string().default("lf"),
+  // How long an entry is served as fresh. Writes invalidate entries straight away, so this only
+  // bounds data that changes without a write going through the API (time-based expiry, raw SQL).
+  CACHE_PUBLIC_TTL_SECONDS: int(300),
+  // After that, how long the old copy may still be served while one request rebuilds it.
+  CACHE_STALE_SECONDS: int(600),
+  CACHE_MAX_ENTRY_BYTES: int(2 * 1024 * 1024),
+  CACHE_COMMAND_TIMEOUT_MS: int(250),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -119,6 +137,7 @@ export const env = Object.freeze({
   ...parsed.data,
   isProduction: parsed.data.NODE_ENV === "production",
   isTest: parsed.data.NODE_ENV === "test",
+  cacheEnabled: Boolean(parsed.data.REDIS_URL) && (parsed.data.CACHE_ENABLED ?? parsed.data.NODE_ENV !== "test"),
   allowedOrigins: parsed.data.LIVFINDER_ALLOWED_ORIGINS.length
     ? parsed.data.LIVFINDER_ALLOWED_ORIGINS
     : [parsed.data.FRONTEND_URL],
