@@ -5,6 +5,7 @@ import env from "../config/env.js";
 import logger from "../config/logger.js";
 import { isOriginAllowed } from "../middleware/security.js";
 import { resolveSession } from "../modules/auth/sessions.js";
+import { BOOT_WAIT_MS, waitFor } from "../cache/redis.js";
 import { loadAccountMemberships, loadPlatformAccess } from "../modules/auth/rbac.js";
 import { GUEST_COOKIE, guestFromToken, identityFromAuth, refFor, canViewSupport } from "../modules/chat/identity.js";
 import * as presence from "./presence.js";
@@ -97,14 +98,17 @@ async function attachRedisAdapter(server) {
     });
   }
   adapterClients = [pub, sub];
-  try {
-    await Promise.all([pub.connect(), sub.connect()]);
-    server.adapter(createAdapter(pub, sub, { key: `${env.CACHE_PREFIX}:rt` }));
-    logger.info("realtime relaying through redis");
-  } catch (error) {
-    // Single-instance delivery still works; the clients keep reconnecting.
-    logger.warn({ err: { code: error.code, message: error.message } }, "realtime redis not reachable at boot; local delivery only");
-  }
+  // A refused first connection never rejects (the reconnect strategy keeps retrying), so boot
+  // must not await it: the socket server has to start either way. The adapter is attached at
+  // once; until Redis answers, its commands wait in the clients' offline queue and every event
+  // is still delivered to this instance's own sockets.
+  const connected = Promise.all([pub.connect(), sub.connect()]).then(
+    () => logger.info("realtime relaying through redis"),
+    (error) => logger.warn({ err: { code: error.code, message: error.message } }, "realtime redis connect failed"),
+  );
+  server.adapter(createAdapter(pub, sub, { key: `${env.CACHE_PREFIX}:rt` }));
+  await Promise.race([connected, waitFor(BOOT_WAIT_MS)]);
+  if (!pub.isReady) logger.warn("realtime redis not reachable at boot; local delivery until it is");
 }
 
 export async function startRealtime(httpServer) {
@@ -112,6 +116,10 @@ export async function startRealtime(httpServer) {
   const allowed = new Set(env.allowedOrigins);
   io = new Server(httpServer, {
     path: SOCKET_PATH,
+    // Answer `/v1/realtime?…` as well as `/v1/realtime/?…`. The website's same-origin /v1 proxy
+    // (Next.js) redirects away the trailing slash, and with it the socket got the API's 404, so
+    // the live site only showed new messages after a refresh.
+    addTrailingSlash: false,
     serveClient: false,
     // Cross-site WebSocket hijacking: a socket carries the session cookie, so only the site's
     // own origins may open one. A request without an Origin (a native client, a server) has no

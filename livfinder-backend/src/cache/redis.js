@@ -14,6 +14,10 @@ let client = null;
 let connecting = null;
 const readyListeners = new Set();
 
+/** How long boot waits for a first connection before carrying on without Redis. */
+export const BOOT_WAIT_MS = 2500;
+export const waitFor = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export const cacheEnabled = () => env.cacheEnabled;
 export const isCacheReady = () => Boolean(client?.isReady);
 export const cacheKey = (...parts) => [env.CACHE_PREFIX, ...parts].join(":");
@@ -50,12 +54,15 @@ export async function connectCache() {
         .catch((error) => logger.error({ err: error }, "redis ready listener failed"));
     }
   });
-  connecting = client
-    .connect()
-    .then(() => client)
-    .catch((error) => {
-      // The reconnect strategy keeps trying in the background.
-      logger.warn({ err: { code: error.code, message: error.message } }, "redis not reachable at boot");
+  // With a reconnect strategy, node-redis keeps retrying a refused first connection and its
+  // connect() promise stays pending until Redis comes up. Callers (server boot) must not wait on
+  // that, so stop waiting after one connect attempt's worth of time; the client keeps retrying.
+  const attempt = client.connect().catch((error) => {
+    logger.warn({ err: { code: error.code, message: error.message } }, "redis not reachable at boot");
+  });
+  connecting = Promise.race([attempt, waitFor(BOOT_WAIT_MS)])
+    .then(() => {
+      if (!client?.isReady) logger.warn("redis not reachable at boot; serving without the cache until it is");
       return client;
     })
     .finally(() => {
