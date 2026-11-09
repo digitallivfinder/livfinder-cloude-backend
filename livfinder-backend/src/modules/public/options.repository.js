@@ -320,15 +320,28 @@ export async function filterOptions(category, filterKey, { q = null, parent = nu
       const row = await resolveLocation(preferCountry, { type: "country" });
       preferCountryId = row?.id ?? null;
     }
+    /**
+     * `parent` (a location id such as `city:12`) narrows the menu to the places inside that one —
+     * at any depth, busiest first — so a picker with Dubai selected can offer Dubai Marina and
+     * Downtown rather than the whole world again. An unknown parent offers nothing.
+     */
+    let ancestorId = null;
+    if (parent) {
+      const row = await resolveLocation(parent);
+      if (!row) return [];
+      ancestorId = row.id;
+    }
     const rows = await searchLocations({
       q,
       types: ["country", "state", "city", "community", "subcommunity"],
       limit,
-      preferCountryId,
+      ancestorId,
+      preferCountryId: ancestorId ? null : preferCountryId,
       // Scopes both the counts and the menu itself to the marketplace being browsed, which
       // supersedes the catalogue-wide `onlyWithListings` gate — that one let a place with
       // listings in some other category through, and then returned nothing when picked.
-      categoryRootId: definition?.rootId ?? null,
+      // `all=true` lifts it: an agent's service areas can be any place, listings or not.
+      categoryRootId: all ? null : definition?.rootId ?? null,
     });
     return rows;
   }

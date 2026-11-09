@@ -126,7 +126,7 @@ export async function getLocationById(id) {
  * Typeahead over 161k rows. Never returns the whole tree: the caller supplies a
  * query or a parent, and the limit is capped.
  */
-export async function searchLocations({ q, types = [], parentId = null, countryId = null, preferCountryId = null, categoryRootId = null, limit = 20, onlyWithListings = false } = {}) {
+export async function searchLocations({ q, types = [], parentId = null, ancestorId = null, countryId = null, preferCountryId = null, categoryRootId = null, limit = 20, onlyWithListings = false } = {}) {
   const conditions = ["l.deleted_at IS NULL", "l.status = 'active'", "l.is_searchable = 1"];
   const params = [];
 
@@ -138,6 +138,11 @@ export async function searchLocations({ q, types = [], parentId = null, countryI
   if (parentId) {
     conditions.push("l.parent_id = ?");
     params.push(Number(parentId));
+  }
+  if (ancestorId) {
+    // Every place inside the ancestor, at any depth: each row carries its whole chain.
+    conditions.push("l.id <> ? AND ? IN (l.parent_id, l.country_id, l.state_id, l.city_id, l.community_id)");
+    params.push(Number(ancestorId), Number(ancestorId));
   }
   if (countryId) {
     conditions.push("l.country_id = ?");

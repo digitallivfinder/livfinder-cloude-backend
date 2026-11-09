@@ -14,7 +14,6 @@ const STATIC_PATHS = [
   { url: "/helicopters", priority: 0.8, changeFrequency: "daily" },
   { url: "/watches", priority: 0.8, changeFrequency: "daily" },
   { url: "/blogs", priority: 0.7, changeFrequency: "daily" },
-  { url: "/about-us", priority: 0.5, changeFrequency: "monthly" },
   { url: "/countries", priority: 0.7, changeFrequency: "weekly" },
   // `/companies` canonicalises to `/agencies`; listing both advertised a URL that points elsewhere.
   { url: "/agencies", priority: 0.7, changeFrequency: "weekly" },
@@ -215,22 +214,6 @@ export async function sitemapEntries(kind = "all", { category } = {}) {
       lastModified: iso(row.updated_at),
       changeFrequency: "monthly",
       priority: 0.6,
-    }));
-  }
-
-  if (kind === "countries") {
-    const rows = await query(
-      `SELECT slug, name, updated_at FROM locations
-        WHERE level = 'country' AND status = 'active' AND deleted_at IS NULL AND active_listing_count > 0
-        ORDER BY active_listing_count DESC LIMIT 250`,
-      []
-    );
-    return rows.map((row) => ({
-      url: `/countries/${row.slug}`,
-      title: row.name,
-      lastModified: iso(row.updated_at),
-      changeFrequency: "weekly",
-      priority: 0.7,
     }));
   }
 

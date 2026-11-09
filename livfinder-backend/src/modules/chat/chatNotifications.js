@@ -4,7 +4,6 @@ import { execute } from "../../db/query.js";
 import { sendMail } from "../system/mail.service.js";
 import { notify } from "../system/notifications.service.js";
 import * as presence from "../../realtime/presence.js";
-import { resumeToken } from "./identity.js";
 
 /**
  * Telling people about a message they are not online to see.
@@ -13,7 +12,8 @@ import { resumeToken } from "./identity.js";
  * in-app notification and, at most once every EMAIL_GAP_MINUTES per conversation, an email. A
  * burst of ten messages is one email, not ten. A muted thread sends nothing.
  *
- * Guests have no account to sign in to, so their email carries a resume link that opens the chat.
+ * Guests get a link that opens the site's chat widget (`?chat=open`); the widget asks them to sign
+ * in, as every chat on the site does. There is no separate /chat page any more.
  */
 
 const EMAIL_GAP_MINUTES = 15;
@@ -24,7 +24,7 @@ const participantRef = (row) =>
 function linkFor(row, conversation) {
   const base = env.FRONTEND_URL.replace(/\/+$/, "");
   const id = encodeURIComponent(conversation.public_id);
-  if (row.guest_public_id) return `${base}/chat?resume=${encodeURIComponent(resumeToken(row.guest_public_id))}&conversation=${id}`;
+  if (row.guest_public_id) return `${base}/?chat=open&conversation=${id}`;
   if (row.role === "admin" || row.role === "observer") return `${base}/admin/support-chats?conversation=${id}`;
   return `${base}/portal/messages?conversation=${id}`;
 }

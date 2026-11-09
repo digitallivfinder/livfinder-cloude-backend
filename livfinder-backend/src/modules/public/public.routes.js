@@ -380,6 +380,57 @@ router.get(
  * Locations and countries
  * ------------------------------------------------------------------------ */
 
+/**
+ * What a visitor's prices and areas are shown in, and what they can switch to.
+ *
+ * `country` is the visitor's ISO code (the site stamps it into a cookie from the edge, or reads
+ * it from the browser's language). The answer carries that country's own currency and area unit
+ * as the defaults, every active currency, and the latest rates from the base currency, so the
+ * page can convert a listing's price without asking again. Public and cacheable: it depends on
+ * the country code alone, never on who is asking.
+ */
+router.get(
+  "/display-options",
+  asyncHandler(async (req, res) => {
+    const iso2 = /^[A-Za-z]{2}$/.test(String(req.query.country || "")) ? String(req.query.country).toUpperCase() : null;
+    const [countryRow, currencies, base, rates] = await Promise.all([
+      iso2
+        ? query(
+            `SELECT p.iso2, p.currency_code, p.default_area_unit, l.name
+               FROM location_country_profiles p
+               JOIN locations l ON l.id = p.location_id
+              WHERE p.iso2 = ? LIMIT 1`,
+            [iso2]
+          ).then((rows) => rows[0] || null)
+        : null,
+      query("SELECT code, name, symbol FROM currencies WHERE is_active = 1 ORDER BY sort_order, code"),
+      query("SELECT code FROM currencies WHERE is_base = 1 LIMIT 1").then((rows) => rows[0]?.code || "AED"),
+      query("SELECT base_code, quote_code, rate FROM fx_rates_latest"),
+    ]);
+    const active = new Set(currencies.map((row) => row.code));
+    const quotes = { [base]: 1 };
+    for (const row of rates) {
+      if (row.base_code === base && Number(row.rate) > 0) quotes[row.quote_code] = Number(row.rate);
+    }
+    // A country whose own currency is not offered (or has no rate) falls back to the base.
+    const countryCurrency = countryRow?.currency_code && active.has(countryRow.currency_code) && quotes[countryRow.currency_code] ? countryRow.currency_code : null;
+    const countryUnit = ["sqft", "sqm"].includes(countryRow?.default_area_unit) ? countryRow.default_area_unit : null;
+    res.json(
+      detailResponse({
+        country: countryRow ? { iso2: countryRow.iso2, name: countryRow.name } : null,
+        defaults: { currency: countryCurrency || base, areaUnit: countryUnit || "sqft", fromCountry: Boolean(countryRow) },
+        base,
+        rates: quotes,
+        currencies: currencies.filter((row) => quotes[row.code]).map((row) => ({ code: row.code, name: row.name, symbol: row.symbol })),
+        areaUnits: [
+          { code: "sqft", label: "Square feet", short: "sq ft" },
+          { code: "sqm", label: "Square metres", short: "m²" },
+        ],
+      })
+    );
+  })
+);
+
 router.get(
   "/countries",
   asyncHandler(async (req, res) => {

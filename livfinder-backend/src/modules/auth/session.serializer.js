@@ -64,9 +64,12 @@ function accountState(row) {
 
 export async function serializeSession(userId, { sessionId = null, activeAccountId = null } = {}) {
   const user = await queryOne(
-    `SELECT id, public_id, email, phone_e164, first_name, last_name, display_name, avatar_url,
-            status, email_verified_at, default_account_id, created_at, updated_at
-       FROM users WHERE id = ? AND deleted_at IS NULL`,
+    `SELECT u.id, u.public_id, u.email, u.phone_e164, u.first_name, u.last_name, u.display_name, u.avatar_url,
+            u.status, u.email_verified_at, u.default_account_id, u.created_at, u.updated_at,
+            u.preferred_area_unit, cur.code AS preferred_currency_code
+       FROM users u
+       LEFT JOIN currencies cur ON cur.id = u.preferred_currency_id
+      WHERE u.id = ? AND u.deleted_at IS NULL`,
     [userId]
   );
   if (!user) return null;
@@ -270,6 +273,12 @@ export async function serializeSession(userId, { sessionId = null, activeAccount
       email: user.email,
       phone: user.phone_e164 || null,
       avatarUrl: user.avatar_url,
+      // What this person chose to see prices and areas in. Null when they never chose — the
+      // website then goes by where they are (see the site's display preferences).
+      preferences: {
+        currency: user.preferred_currency_code || null,
+        areaUnit: user.preferred_area_unit || null,
+      },
       platformRole: isPlatformStaff ? "admin" : "client",
       emailVerified: Boolean(user.email_verified_at),
       status: user.status,
