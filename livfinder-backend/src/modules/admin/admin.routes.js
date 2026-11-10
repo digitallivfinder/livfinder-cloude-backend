@@ -16,6 +16,10 @@ import * as catalog from "./admin.catalog.js";
 import * as crm from "./admin.crm.js";
 import * as content from "./admin.content.js";
 import * as settings from "./admin.settings.js";
+import { LOOKUP_KINDS, lookupOptions } from "./admin.lookup.js";
+import { loadOptionSets } from "../options/optionSets.js";
+import { csvList as optionNames } from "../../utils/columnFilters.js";
+import "../options/filterOptionSets.js";
 import * as mutations from "./admin.mutations.js";
 import { documentFile } from "../leads/portalLeads.service.js";
 import { API_SCOPES } from "../../middleware/apiClient.js";
@@ -39,50 +43,55 @@ const listQuery = z
   .object({
     page: z.coerce.number().int().min(1).max(5000).optional(),
     pageSize: z.coerce.number().int().min(1).max(200).optional(),
-    status: z.string().trim().max(40).optional(),
+    // Header filters send several values comma-separated, so every key one can write allows a
+    // list (up to 400 characters); the list functions validate each value.
+    status: z.string().trim().max(400).optional(),
     category: z.string().trim().max(40).optional(),
     search: z.string().trim().max(200).optional(),
     sort: z.string().trim().max(40).optional(),
     owner: z.string().trim().max(200).optional(),
-    location: z.string().trim().max(200).optional(),
-    country: z.string().trim().max(120).optional(),
-    developer: z.string().trim().max(120).optional(),
+    location: z.string().trim().max(400).optional(),
+    country: z.string().trim().max(400).optional(),
+    developer: z.string().trim().max(400).optional(),
     // The Companies/Individuals "Package" filter — a plan's numeric id, matching what
     // `options.packages()` publishes. Missing here, `validate()` stripped it from every
     // request before the repository functions ever saw it.
-    package: z.string().trim().max(20).optional(),
+    package: z.string().trim().max(400).optional(),
     // Developments. These were sent by the screen and stripped here, so six of
     // its eight selects reached the repository as nothing at all.
-    developmentStatus: z.string().trim().max(40).optional(),
+    developmentStatus: z.string().trim().max(400).optional(),
     projectType: z.string().trim().max(40).optional(),
-    propertyType: z.string().trim().max(40).optional(),
+    propertyType: z.string().trim().max(400).optional(),
     handoverYear: z.string().trim().max(4).optional(),
     priceMin: z.string().trim().max(20).optional(),
     priceMax: z.string().trim().max(20).optional(),
     q: z.string().trim().max(200).optional(),
     author: z.string().trim().max(120).optional(),
-    type: z.string().trim().max(40).optional(),
+    type: z.string().trim().max(400).optional(),
     folder: z.string().trim().max(500).optional(),
     usage: z.string().trim().max(40).optional(),
-    targetType: z.string().trim().max(40).optional(),
-    rating: z.string().trim().max(4).optional(),
-    priority: z.string().trim().max(20).optional(),
-    entityType: z.string().trim().max(40).optional(),
-    reason: z.string().trim().max(60).optional(),
-    severity: z.string().trim().max(20).optional(),
-    source: z.string().trim().max(80).optional(),
-    inquiryType: z.string().trim().max(40).optional(),
-    agent: z.string().trim().max(64).optional(),
+    targetType: z.string().trim().max(400).optional(),
+    rating: z.string().trim().max(400).optional(),
+    priority: z.string().trim().max(400).optional(),
+    entityType: z.string().trim().max(400).optional(),
+    reason: z.string().trim().max(400).optional(),
+    severity: z.string().trim().max(400).optional(),
+    source: z.string().trim().max(400).optional(),
+    inquiryType: z.string().trim().max(400).optional(),
+    agent: z.string().trim().max(400).optional(),
     property: z.string().trim().max(64).optional(),
     community: z.string().trim().max(120).optional(),
     organizationId: z.string().trim().max(64).optional(),
-    roleId: z.string().trim().max(20).optional(),
+    roleId: z.string().trim().max(400).optional(),
     parentId: z.string().trim().max(64).optional(),
     parent: z.string().trim().max(64).optional(),
     from: z.string().trim().max(30).optional(),
     to: z.string().trim().max(30).optional(),
   })
-  .partial();
+  .partial()
+  // Table header filters add their own keys per list (see `applyColumnFilters`); each list
+  // function reads only the keys its spec names and binds every value, so any other key is inert.
+  .catchall(z.string().trim().max(400));
 
 const params = (req) => q(req) || {};
 
@@ -917,6 +926,39 @@ const TIERS = [
   { tier: "community", path: "communities" },
   { tier: "subCommunity", path: "sub-communities" },
 ];
+
+/**
+ * The option lists behind the table header filters (statuses, types, categories…), by set name:
+ * `?sets=report.status,report.priority` → `{ data: { "report.status": [{ value, label }], … } }`.
+ * Read from the database's own definitions (see modules/options); the frontend keeps none.
+ */
+router.get(
+  "/options",
+  requirePermission("listings.view", "companies.view", "individuals.view", "leads.view", "locations.view", "api.view", "reports.view", "users.view"),
+  validate({ query: z.object({ sets: z.string().trim().min(1).max(2000) }) }),
+  asyncHandler(async (req, res) => res.json({ data: await loadOptionSets(optionNames(q(req).sets, 80), "admin") }))
+);
+
+/**
+ * Options for the table header filters' search-as-you-type dropdowns (locations with their path,
+ * owners and companies with logos, agents, brands, admin users). Any admin who can open a list
+ * that uses one may search it.
+ */
+router.get(
+  "/lookup/:kind",
+  requirePermission("listings.view", "companies.view", "individuals.view", "leads.view", "locations.view", "api.view", "reports.view", "users.view"),
+  validate({
+    params: z.object({ kind: z.enum(LOOKUP_KINDS) }),
+    query: z.object({
+      q: z.string().trim().max(100).optional(),
+      ids: z.string().trim().max(4000).optional(),
+      types: z.string().trim().max(100).optional(),
+      kinds: z.string().trim().max(200).optional(),
+      category: z.string().trim().max(60).optional(),
+    }),
+  }),
+  asyncHandler(async (req, res) => res.json({ data: await lookupOptions(req.params.kind, params(req)) }))
+);
 
 for (const { tier, path } of TIERS) {
   router.get(

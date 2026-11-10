@@ -6,7 +6,7 @@ import { listFeedTokens } from "../leads/leadFeedTokens.service.js";
 import { WEBHOOK_EVENTS, listWebhooks } from "../leads/webhooks.service.js";
 import { descriptionToHtml } from "../../utils/richText.js";
 import {
-  query, queryOne, queryValue, adminPagination, adminList, int, num, bool, isoDate, isoDay,
+  query, queryOne, queryValue, adminPagination, adminList, int, num, bool, isoDate, isoDay, applyColumnFilters, csvList,
   frontendCategoryId, categoryIdsFor, rootIdFor,
 } from "./admin.shared.js";
 import { adminListingStatus, initialsOf } from "./admin.dashboard.js";
@@ -34,7 +34,7 @@ import {
 /* Listings                                                                    */
 /* -------------------------------------------------------------------------- */
 
-const ADMIN_STATUS_TO_DB = {
+export const ADMIN_STATUS_TO_DB = {
   approved: ["active"],
   pending: ["pending_review"],
   rejected: ["rejected"],
@@ -43,6 +43,71 @@ const ADMIN_STATUS_TO_DB = {
   draft: ["draft"],
   expired: ["expired"],
 };
+
+/** A listing's value from its category detail table, as a correlated subquery. */
+const detailColumn = (table, column) => `(SELECT d.${column} FROM ${table} d WHERE d.listing_id = l.id)`;
+const LISTING_YEAR = {
+  cars: detailColumn("listing_vehicle", "model_year"),
+  yachts: detailColumn("listing_marine", "build_year"),
+  jets: detailColumn("listing_aviation", "year_built"),
+  helicopters: detailColumn("listing_aviation", "year_built"),
+  watches: detailColumn("listing_timepiece", "year_of_production"),
+};
+
+/**
+ * Header filters on the admin listings tables. Each category shows its own columns; a filter for
+ * a column another category has simply never arrives. `definition` is the category being listed
+ * (none on All Listings).
+ */
+/** A location dropdown's ids, matched at whatever tier each sits (a country, a city, a community…). */
+function locationAtAnyTier(key, alias, tiers = ["country_id", "state_id", "city_id", "community_id", "sub_community_id"]) {
+  return {
+    type: "custom", key,
+    build: (value) => {
+      const ids = csvList(value).filter((id) => /^\d+$/.test(id));
+      if (!ids.length) return { sql: "1 = 0" };
+      const marks = ids.map(() => "?").join(", ");
+      return { sql: tiers.map((tier) => `${alias}.${tier} IN (${marks})`).join(" OR "), params: tiers.flatMap(() => ids) };
+    },
+  };
+}
+
+function listingColumnFilterSpec(definition) {
+  const year = LISTING_YEAR[definition?.listingType];
+  return [
+    { type: "text", key: "listing", columns: ["l.title", "l.reference", "l.public_id"] },
+    {
+      // Owner dropdown values: "org:<public id>" for a company, "user:<public id>" for someone listing alone.
+      type: "custom", key: "ownerId",
+      build: (value) => {
+        const values = csvList(value);
+        const orgs = values.filter((item) => item.startsWith("org:")).map((item) => item.slice(4));
+        const users = values.filter((item) => item.startsWith("user:")).map((item) => item.slice(5));
+        const parts = [];
+        if (orgs.length) parts.push(`l.organization_id IN (SELECT fo.id FROM organizations fo WHERE fo.public_id IN (${orgs.map(() => "?").join(", ")}))`);
+        if (users.length) parts.push(`(l.organization_id IS NULL AND l.created_by_user_id IN (SELECT fu.id FROM users fu WHERE fu.public_id IN (${users.map(() => "?").join(", ")})))`);
+        return parts.length ? { sql: parts.join(" OR "), params: [...orgs, ...users] } : { sql: "1 = 0" };
+      },
+    },
+    locationAtAnyTier("locationId", "l"),
+    { type: "in", key: "categories", column: "l.root_category_id", map: (value) => rootIdFor(value) },
+    // Property-type options carry the category's code (or its id when it has none).
+    { type: "in", key: "propertyType", column: "(SELECT COALESCE(pc.code, pc.id) FROM categories pc WHERE pc.id = l.category_id)" },
+    { type: "in", key: "brand", column: "l.brand_id", map: (value) => (/^\d+$/.test(value) ? value : null) },
+    { type: "range", keys: ["priceMin", "priceMax"], column: "l.price", decimal: true },
+    { type: "range", keys: ["bedsMin", "bedsMax"], column: detailColumn("listing_real_estate", "bedrooms") },
+    { type: "range", keys: ["bathsMin", "bathsMax"], column: detailColumn("listing_real_estate", "bathrooms") },
+    ...(year ? [{ type: "range", keys: ["yearMin", "yearMax"], column: year }] : []),
+    { type: "range", keys: ["mileageMin", "mileageMax"], column: detailColumn("listing_vehicle", "mileage_km") },
+    { type: "range", keys: ["lengthMin", "lengthMax"], column: detailColumn("listing_marine", "length_overall_ft"), decimal: true },
+    { type: "range", keys: ["passengersMin", "passengersMax"], column: detailColumn("listing_aviation", "passenger_capacity") },
+    { type: "range", keys: ["rangeMin", "rangeMax"], column: detailColumn("listing_aviation", "range_nm") },
+    { type: "range", keys: ["hoursMin", "hoursMax"], column: detailColumn("listing_aviation", "total_time_hours") },
+    { type: "text", key: "reference", columns: [detailColumn("listing_timepiece", "reference_number")] },
+    { type: "in", key: "condition", column: detailColumn("listing_timepiece", "condition_grade") },
+    { type: "date", keys: ["from", "to"], column: "l.created_at" },
+  ];
+}
 
 export async function listAdminListings({
   category = "real-estate",
@@ -54,6 +119,7 @@ export async function listAdminListings({
   page = 1,
   pageSize = 10,
   scopedRootIds = null,
+  ...columnFilters
 } = {}) {
   const definition = CATEGORY_DEFINITIONS.find((entry) => entry.listingType === category || entry.dbCode === category);
   const conditions = ["l.deleted_at IS NULL"];
@@ -74,32 +140,35 @@ export async function listAdminListings({
       params.push(...scopedRootIds);
     }
   }
-  const statuses = ADMIN_STATUS_TO_DB[status];
-  if (status === "changes") {
-    // Live listings whose owner's changes wait for approval (0060).
-    conditions.push("l.pending_revision_id IS NOT NULL AND EXISTS (SELECT 1 FROM listing_revisions r WHERE r.id = l.pending_revision_id AND r.status = 'pending')");
-  } else if (statuses) {
-    conditions.push(`l.status IN (${statuses.map(() => "?").join(", ")})`);
-    params.push(...statuses);
-  }
+  // One status from the tabs, or several from the Status header filter. "changes" = live
+  // listings whose owner's changes wait for approval (0060).
+  applyColumnFilters([{
+    type: "in", key: "status", column: "l.status",
+    cases: { changes: "l.pending_revision_id IS NOT NULL AND EXISTS (SELECT 1 FROM listing_revisions r WHERE r.id = l.pending_revision_id AND r.status = 'pending')" },
+    map: (value) => ADMIN_STATUS_TO_DB[value] ?? null,
+  }], { status }, conditions, params);
   if (search) {
     conditions.push("(l.title LIKE ? OR l.reference LIKE ? OR l.public_id = ?)");
     params.push(`%${search}%`, `%${search}%`, search);
   }
   if (owner) {
-    conditions.push("(org.name LIKE ? OR u.display_name LIKE ?)");
-    params.push(`%${owner}%`, `%${owner}%`);
+    // The name the Owner column shows: the company, else the person who listed it.
+    conditions.push("COALESCE(org.name, u.display_name) LIKE ?");
+    params.push(`%${owner}%`);
   }
   if (location) {
     conditions.push("(ct.name LIKE ? OR cm.name LIKE ? OR co.name LIKE ?)");
     params.push(`%${location}%`, `%${location}%`, `%${location}%`);
   }
+  applyColumnFilters(listingColumnFilterSpec(definition), columnFilters, conditions, params);
 
   const where = `WHERE ${conditions.join(" AND ")}`;
   const { page: safePage, pageSize: safeSize, offset } = adminPagination({ page, pageSize });
-  const orderBy =
+  // The id breaks ties, so a page boundary never repeats or skips a listing.
+  const orderBy = `${
     { newest: "l.created_at DESC", oldest: "l.created_at ASC", priceDesc: "l.price DESC", priceAsc: "l.price ASC", views: "l.view_count DESC" }[sort] ||
-    "l.created_at DESC";
+    "l.created_at DESC"
+  }, l.id DESC`;
 
   const [rows, total, summary] = await Promise.all([
     query(
@@ -129,7 +198,7 @@ export async function listAdminListings({
               veh.model_year, veh.mileage_km,
               mar.build_year, mar.length_overall_ft,
               av.year_built, av.passenger_capacity, av.range_nm, av.total_time_hours, av.aircraft_type,
-              tp.reference_number, tp.year_of_production
+              tp.reference_number, tp.year_of_production, tp.condition_grade
          FROM listings l
          JOIN categories cat ON cat.id = l.category_id
          LEFT JOIN locations ct ON ct.id = l.city_id
@@ -352,6 +421,8 @@ export function serializeAdminListingRow(row) {
     currency: row.currency_code,
     image: row.cover_image_url,
     location: row.location,
+    // Every tier the listing sits in, for the Location filters on tables that hold their rows.
+    ...(row.country_id !== undefined ? { locationIds: [row.country_id, row.state_id, row.city_id, row.community_id, row.sub_community_id].filter(Boolean).map(String) } : {}),
     owner: row.owner,
     ownerInitials: initialsOf(row.owner),
     organizationId: row.organization_public_id,
@@ -391,7 +462,11 @@ export function serializeAdminListingRow(row) {
     };
   }
   if (categoryId === "watch") {
-    return { ...base, brand: row.brand_name, collection: row.model_name, watchReference: row.reference_number, year: int(row.year_of_production) };
+    return {
+      ...base, brand: row.brand_name, collection: row.model_name, watchReference: row.reference_number, year: int(row.year_of_production),
+      conditionGrade: row.condition_grade ?? null,
+      condition: row.condition_grade ? row.condition_grade.split("_").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ") : null,
+    };
   }
   return base;
 }
@@ -414,6 +489,7 @@ export async function listAdminDevelopments({
   sort = "newest",
   page = 1,
   pageSize = 10,
+  ...columnFilters
 } = {}) {
   const conditions = ["p.deleted_at IS NULL"];
   const params = [];
@@ -426,14 +502,11 @@ export async function listAdminDevelopments({
    * `announced`/`under_construction`/…, so no tab except "All" ever matched a
    * row. Publication is now its own column and the tabs read it.
    */
-  if (status && status !== "all") {
-    conditions.push("p.moderation_status = ?");
-    params.push(status);
-  }
-  if (developmentStatus) {
-    conditions.push("p.status = ?");
-    params.push(developmentStatus);
-  }
+  // Tabs send one value; the Publication and Status header filters send several.
+  applyColumnFilters([
+    { type: "in", key: "status", column: "p.moderation_status" },
+    { type: "in", key: "developmentStatus", column: "p.status" },
+  ], { status, developmentStatus }, conditions, params);
   if (projectType) {
     conditions.push("p.project_type = ?");
     params.push(projectType);
@@ -448,17 +521,26 @@ export async function listAdminDevelopments({
   }
   if (developer) {
     // Accepts either the slug the public URL uses or the brand's public id, so
-    // the select and a hand-typed filter agree.
-    conditions.push("(b.slug = ? OR b.public_id = ?)");
-    params.push(developer, developer);
+    // the select and a hand-typed filter agree — one, or several from the header filter.
+    const developers = csvList(developer);
+    const marks = developers.map(() => "?").join(", ");
+    conditions.push(`(b.slug IN (${marks}) OR b.public_id IN (${marks}))`);
+    params.push(...developers, ...developers);
   }
   if (handoverYear) {
     conditions.push("YEAR(p.handover_date) = ?");
     params.push(Number(handoverYear));
   }
   if (location) {
-    conditions.push("? IN (p.country_id, p.state_id, p.city_id, p.community_id, p.sub_community_id)");
-    params.push(Number(location));
+    // A location id at any tier; several from the header filter match any of them.
+    const ids = csvList(location).filter((id) => /^\d+$/.test(id)).map(Number);
+    const tiers = ["p.country_id", "p.state_id", "p.city_id", "p.community_id", "p.sub_community_id"];
+    if (!ids.length) conditions.push("1 = 0");
+    else {
+      const marks = ids.map(() => "?").join(", ");
+      conditions.push(`(${tiers.map((column) => `${column} IN (${marks})`).join(" OR ")})`);
+      tiers.forEach(() => params.push(...ids));
+    }
   }
   if (propertyType) {
     conditions.push("EXISTS (SELECT 1 FROM project_unit_types ut WHERE ut.project_id = p.id AND ut.unit_type = ?)");
@@ -472,6 +554,13 @@ export async function listAdminDevelopments({
     conditions.push("p.min_price <= ?");
     params.push(Number(priceMax));
   }
+  applyColumnFilters([
+    { type: "text", key: "development", columns: ["p.name", "p.slug", "p.public_id"] },
+    { type: "range", keys: ["unitsMin", "unitsMax"], column: "p.available_units" },
+    { type: "date", keys: ["handoverFrom", "handoverTo"], column: "p.handover_date" },
+    { type: "range", keys: ["leadsMin", "leadsMax"], column: "(SELECT COUNT(*) FROM inquiries fi WHERE fi.project_id = p.id)" },
+    { type: "date", keys: ["from", "to"], column: "p.created_at" },
+  ], columnFilters, conditions, params);
 
   const joins = `
     LEFT JOIN brands b ON b.id = p.developer_brand_id
@@ -480,7 +569,7 @@ export async function listAdminDevelopments({
     LEFT JOIN locations ct ON ct.id = p.city_id
     LEFT JOIN locations cm ON cm.id = p.community_id`;
   const where = `WHERE ${conditions.join(" AND ")}`;
-  const orderBy = sort === "oldest" ? "p.created_at ASC" : "p.created_at DESC";
+  const orderBy = sort === "oldest" ? "p.created_at ASC, p.id ASC" : "p.created_at DESC, p.id DESC";
   const { page: safePage, pageSize: safeSize, offset } = adminPagination({ page, pageSize });
 
   const [rows, total, summary] = await Promise.all([
@@ -970,38 +1059,139 @@ const accountOpen = `EXISTS (SELECT 1 FROM verification_requests vr
     WHERE vr.subject_type = 'account' AND vr.subject_id = a.id AND vr.status IN ('pending', 'in_review'))`;
 const accountWaiting = `(${accountOpen} OR (a.status = 'pending' AND a.verification_status <> 'rejected'))`;
 
-export async function listAdminCompanies({ status = "all", search = "", category = "", country = "", packageId = "", page = 1, pageSize = 10 } = {}) {
+/**
+ * Header filters every account-backed list shares (Companies, Individuals): primary category,
+ * enabled categories and package. `account` is the SQL for the row's account id.
+ */
+const accountFilterSpec = (account) => [
+  {
+    // Primary = the first category the account was approved for (the order the list reads them in).
+    type: "custom", key: "primary",
+    build: (value) => {
+      const root = rootIdFor(value);
+      if (!root) return { sql: "1 = 0" };
+      return {
+        sql: `(SELECT COALESCE(pc.root_category_id, pc.id) FROM account_category_access paca
+                JOIN categories pc ON pc.id = paca.category_id
+               WHERE paca.account_id = ${account} AND paca.status = 'approved'
+               ORDER BY paca.id LIMIT 1) = ?`,
+        params: [root],
+      };
+    },
+  },
+  {
+    type: "custom", key: "categories",
+    build: (value) => {
+      const roots = [...new Set(csvList(value).map(rootIdFor).filter(Boolean))];
+      if (!roots.length) return { sql: "1 = 0" };
+      return {
+        sql: `EXISTS (SELECT 1 FROM account_category_access eaca JOIN categories ec ON ec.id = eaca.category_id
+                WHERE eaca.account_id = ${account} AND eaca.status = 'approved'
+                  AND COALESCE(ec.root_category_id, ec.id) IN (${roots.map(() => "?").join(", ")}))`,
+        params: roots,
+      };
+    },
+  },
+  {
+    // The package options publish the plan's numeric id.
+    type: "custom", key: "package",
+    build: (value) => {
+      const ids = csvList(value).filter((id) => /^\d+$/.test(id));
+      if (!ids.length) return { sql: "1 = 0" };
+      return {
+        sql: `EXISTS (SELECT 1 FROM subscriptions fs WHERE fs.account_id = ${account}
+                AND fs.plan_id IN (${ids.map(() => "?").join(", ")}) AND fs.status IN ('active','trialing','past_due'))`,
+        params: ids,
+      };
+    },
+  },
+];
+const wholeNumber = (value) => (/^\d{1,9}$/.test(String(value ?? "").trim()) ? Number(value) : null);
+const dayParam = (value) => (/^\d{4}-\d{2}-\d{2}$/.test(String(value ?? "")) ? String(value) : null);
+const placeholders = (list) => list.map(() => "?").join(", ");
+
+export async function listAdminCompanies({
+  status = "all", search = "", company = "", category = "", categories = "", primary = "", country = "", place = "", packageId = "",
+  api = "", agentsMin = "", agentsMax = "", listingsMin = "", listingsMax = "",
+  from = "", to = "", activeFrom = "", activeTo = "", page = 1, pageSize = 10,
+} = {}) {
   const conditions = ["o.deleted_at IS NULL"];
   const params = [];
-  if (status === "pending") {
-    conditions.push(companyWaiting);
-  } else if (status !== "all") {
-    conditions.push("o.status = ?");
-    params.push(status);
+  // Status arrives as one value from the old select or several from the column filter.
+  // "pending" and "rejected" are derived states, not raw `o.status` values.
+  const statuses = csvList(status).filter((value) => value !== "all");
+  if (statuses.length) {
+    const parts = [];
+    const raw = statuses.filter((value) => !["pending", "rejected"].includes(value));
+    if (statuses.includes("pending")) parts.push(companyWaiting);
+    if (statuses.includes("rejected")) parts.push("(o.status = 'pending' AND o.verification_status = 'rejected')");
+    if (raw.length) {
+      parts.push(`o.status IN (${placeholders(raw)})`);
+      params.push(...raw);
+    }
+    conditions.push(`(${parts.join(" OR ")})`);
   }
   if (search) {
-    conditions.push("(o.name LIKE ? OR o.legal_name LIKE ? OR o.slug LIKE ?)");
-    params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+    conditions.push("(o.name LIKE ? OR o.legal_name LIKE ? OR o.slug LIKE ? OR o.email LIKE ? OR o.phone LIKE ? OR CONCAT('CMP-', LPAD(o.id, 5, '0')) LIKE ?)");
+    params.push(...Array(6).fill(`%${search}%`));
   }
-  if (country) {
-    conditions.push("co.slug = ?");
-    params.push(country);
+  if (company) {
+    conditions.push("(o.name LIKE ? OR o.legal_name LIKE ? OR CONCAT('CMP-', LPAD(o.id, 5, '0')) LIKE ?)");
+    params.push(...Array(3).fill(`%${company}%`));
+  }
+  // The country options publish the location's numeric id; older links carried its slug.
+  applyColumnFilters([locationAtAnyTier("place", "o", ["country_id", "state_id", "city_id", "community_id"])], { place }, conditions, params);
+  const countries = csvList(country);
+  if (countries.length) {
+    conditions.push(`(co.id IN (${placeholders(countries)}) OR co.slug IN (${placeholders(countries)}))`);
+    params.push(...countries, ...countries);
   }
   // `options.packages()` (the filter dropdown) publishes the plan's numeric id, not its
   // public_id like everywhere else — matched here the same way it's offered.
-  if (packageId) {
+  const packageIds = csvList(packageId);
+  if (packageIds.length) {
     conditions.push(
-      `EXISTS (SELECT 1 FROM subscriptions s WHERE s.account_id = o.account_id AND s.plan_id = ? AND s.status IN ('active','trialing','past_due'))`
+      `EXISTS (SELECT 1 FROM subscriptions s WHERE s.account_id = o.account_id AND s.plan_id IN (${placeholders(packageIds)}) AND s.status IN ('active','trialing','past_due'))`
     );
-    params.push(packageId);
+    params.push(...packageIds);
   }
-  const rootId = category ? rootIdFor(category) : null;
+  // `category` (one) and `categories` (any of several) both mean "has approved access to".
+  const rootIds = [...new Set([...csvList(category), ...csvList(categories)].map(rootIdFor).filter(Boolean))];
+  if (rootIds.length) {
+    conditions.push(`EXISTS (SELECT 1 FROM account_category_access aca
+        JOIN categories occ ON occ.id = aca.category_id
+       WHERE aca.account_id = o.account_id AND aca.status = 'approved'
+         AND COALESCE(occ.root_category_id, occ.id) IN (${placeholders(rootIds)}))`);
+    params.push(...rootIds);
+  }
+  // Primary = the first category the account was approved for — the same order the
+  // `primaryCategory` field below is read in.
+  const primaryRoot = primary ? rootIdFor(primary) : null;
+  if (primaryRoot) {
+    conditions.push(`(SELECT COALESCE(pc.root_category_id, pc.id) FROM account_category_access paca
+        JOIN categories pc ON pc.id = paca.category_id
+       WHERE paca.account_id = o.account_id AND paca.status = 'approved'
+       ORDER BY paca.id LIMIT 1) = ?`);
+    params.push(primaryRoot);
+  }
+  if (api === "enabled") conditions.push(integrationsOn);
+  if (api === "disabled") conditions.push(`NOT ${integrationsOn}`);
+  const ranges = [
+    ["o.agent_count >= ?", wholeNumber(agentsMin)], ["o.agent_count <= ?", wholeNumber(agentsMax)],
+    ["o.listing_count >= ?", wholeNumber(listingsMin)], ["o.listing_count <= ?", wholeNumber(listingsMax)],
+  ];
+  // Day bounds are inclusive: `to` covers the whole of that day.
+  const lastActivity = "COALESCE((SELECT MAX(l.updated_at) FROM listings l WHERE l.organization_id = o.id), o.updated_at)";
+  const days = [
+    ["o.created_at >= ?", dayParam(from)], ["o.created_at < DATE_ADD(?, INTERVAL 1 DAY)", dayParam(to)],
+    [`${lastActivity} >= ?`, dayParam(activeFrom)], [`${lastActivity} < DATE_ADD(?, INTERVAL 1 DAY)`, dayParam(activeTo)],
+  ];
+  for (const [sql, value] of [...ranges, ...days]) {
+    if (value === null) continue;
+    conditions.push(sql);
+    params.push(value);
+  }
   const joins = [];
-  if (rootId) {
-    joins.push(`JOIN account_category_access aca ON aca.account_id = o.account_id AND aca.status = 'approved'
-                JOIN categories occ ON occ.id = aca.category_id AND COALESCE(occ.root_category_id, occ.id) = ?`);
-    params.unshift(rootId);
-  }
 
   const where = `WHERE ${conditions.join(" AND ")}`;
   const { page: safePage, pageSize: safeSize, offset } = adminPagination({ page, pageSize });
@@ -1034,7 +1224,7 @@ export async function listAdminCompanies({ status = "all", search = "", category
          LEFT JOIN locations ct ON ct.id = o.city_id
          ${where}
         GROUP BY o.id
-        ORDER BY o.created_at DESC LIMIT ${safeSize} OFFSET ${offset}`,
+        ORDER BY o.created_at DESC, o.id DESC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(
@@ -1058,7 +1248,8 @@ export async function listAdminCompanies({ status = "all", search = "", category
     ? await query(
         `SELECT aca.account_id, COALESCE(c.root_category_id, c.id) AS root_category_id, aca.status
            FROM account_category_access aca JOIN categories c ON c.id = aca.category_id
-          WHERE aca.account_id IN (${accountIds.map(() => "?").join(", ")})`,
+          WHERE aca.account_id IN (${accountIds.map(() => "?").join(", ")})
+          ORDER BY aca.id`,
         accountIds
       )
     : [];
@@ -1301,29 +1492,25 @@ export async function getAdminCompany(identifier) {
   };
 }
 
-export async function listAdminIndividuals({ status = "all", search = "", packageId = "", page = 1, pageSize = 10 } = {}) {
+export async function listAdminIndividuals({ status = "all", search = "", packageId = "", page = 1, pageSize = 10, ...columnFilters } = {}) {
   // "Individuals" are personal/lister accounts: a user with an account that is
   // not backed by an organization.
   const conditions = ["u.deleted_at IS NULL", "a.deleted_at IS NULL", "at.requires_organization = 0"];
   const params = [];
-  if (status === "pending") {
-    conditions.push(accountWaiting);
-  } else if (status !== "all") {
-    conditions.push("a.status = ?");
-    params.push(status);
-  }
   if (search) {
-    conditions.push("(u.display_name LIKE ? OR u.email LIKE ?)");
-    params.push(`%${search}%`, `%${search}%`);
+    conditions.push("(u.display_name LIKE ? OR u.email LIKE ? OR u.phone_e164 LIKE ? OR CONCAT('IND-', LPAD(u.id, 5, '0')) LIKE ?)");
+    params.push(...Array(4).fill(`%${search}%`));
   }
-  // `options.packages()` (the filter dropdown) publishes the plan's numeric id, not its
-  // public_id like everywhere else — matched here the same way it's offered.
-  if (packageId) {
-    conditions.push(
-      `EXISTS (SELECT 1 FROM subscriptions s WHERE s.account_id = a.id AND s.plan_id = ? AND s.status IN ('active','trialing','past_due'))`
-    );
-    params.push(packageId);
-  }
+  // Status arrives as one value from older links or several from the header filter.
+  applyColumnFilters([
+    { type: "text", key: "individual", columns: ["u.display_name", "u.first_name", "u.last_name", "CONCAT('IND-', LPAD(u.id, 5, '0'))"] },
+    { type: "text", key: "contact", columns: ["u.email", "u.phone_e164"] },
+    ...accountFilterSpec("a.id"),
+    { type: "range", keys: ["listingsMin", "listingsMax"], column: "(SELECT COUNT(*) FROM listings fl WHERE fl.account_id = a.id AND fl.deleted_at IS NULL)" },
+    { type: "in", key: "status", column: "a.status", cases: { pending: accountWaiting, rejected: "(a.status = 'pending' AND a.verification_status = 'rejected')" } },
+    { type: "date", keys: ["activeFrom", "activeTo"], column: "COALESCE(u.last_seen_at, u.created_at)" },
+    { type: "date", keys: ["from", "to"], column: "u.created_at" },
+  ], { ...columnFilters, status, package: columnFilters.package ?? packageId }, conditions, params);
 
   const where = `WHERE ${conditions.join(" AND ")}`;
   const { page: safePage, pageSize: safeSize, offset } = adminPagination({ page, pageSize });
@@ -1352,7 +1539,7 @@ export async function listAdminIndividuals({ status = "all", search = "", packag
          LEFT JOIN locations ct ON ct.id = u.city_id
          LEFT JOIN agents ag ON ag.user_id = u.id AND ag.deleted_at IS NULL
          ${where}
-        ORDER BY u.created_at DESC LIMIT ${safeSize} OFFSET ${offset}`,
+        ORDER BY u.created_at DESC, u.id DESC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(
@@ -1376,7 +1563,8 @@ export async function listAdminIndividuals({ status = "all", search = "", packag
     ? await query(
         `SELECT aca.account_id, COALESCE(c.root_category_id, c.id) AS root_category_id, aca.status
            FROM account_category_access aca JOIN categories c ON c.id = aca.category_id
-          WHERE aca.account_id IN (${accountIds.map(() => "?").join(", ")})`,
+          WHERE aca.account_id IN (${accountIds.map(() => "?").join(", ")})
+          ORDER BY aca.id`,
         accountIds
       )
     : [];
@@ -1608,7 +1796,7 @@ export async function listAdminAgents({ status = "all", search = "", organizatio
          LEFT JOIN organizations o ON o.id = a.organization_id
          LEFT JOIN users u ON u.id = a.user_id
          ${where}
-        ORDER BY a.created_at DESC LIMIT ${safeSize} OFFSET ${offset}`,
+        ORDER BY a.created_at DESC, a.id DESC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(`SELECT COUNT(*) FROM agents a LEFT JOIN organizations o ON o.id = a.organization_id ${where}`, params),
@@ -1700,7 +1888,25 @@ const LEVEL_BY_TIER = {
   "sub-community": "sub_community",
 };
 
-export async function listAdminLocations({ tier, parentId = null, search = "", status = "all", page = 1, pageSize = 20 } = {}) {
+/** A location's ancestor name at one tier, for the State / City / Community header filters. */
+const ancestorName = (column) => `(SELECT an.name FROM locations an WHERE an.id = l.${column})`;
+const LOCATION_COLUMN_FILTERS = [
+  { type: "text", key: "name", columns: ["l.name"] },
+  { type: "text", key: "slug", columns: ["l.slug"] },
+  { type: "in", key: "country", column: "l.country_id", map: (value) => (/^\d+$/.test(value) ? value : null) },
+  { type: "text", key: "state", columns: [ancestorName("state_id")] },
+  // Parent dropdowns (location ids) — the text keys above stay for older links.
+  { type: "in", key: "stateId", column: "l.state_id", map: (value) => (/^\d+$/.test(value) ? value : null) },
+  { type: "in", key: "cityId", column: "l.city_id", map: (value) => (/^\d+$/.test(value) ? value : null) },
+  { type: "in", key: "communityId", column: "l.community_id", map: (value) => (/^\d+$/.test(value) ? value : null) },
+  { type: "text", key: "city", columns: [ancestorName("city_id")] },
+  { type: "text", key: "community", columns: [ancestorName("community_id")] },
+  { type: "range", keys: ["childrenMin", "childrenMax"], column: "(SELECT COUNT(*) FROM locations fc WHERE fc.parent_id = l.id AND fc.deleted_at IS NULL)" },
+  { type: "range", keys: ["listingsMin", "listingsMax"], column: "l.active_listing_count" },
+  { type: "date", keys: ["from", "to"], column: "l.created_at" },
+];
+
+export async function listAdminLocations({ tier, parentId = null, search = "", status = "all", page = 1, pageSize = 20, ...columnFilters } = {}) {
   const level = LEVEL_BY_TIER[tier];
   if (!level) throw AppError.badRequest("Unknown location tier.");
 
@@ -1716,14 +1922,12 @@ export async function listAdminLocations({ tier, parentId = null, search = "", s
       params.push(parent.id);
     }
   }
-  if (status !== "all") {
-    conditions.push("l.status = ?");
-    params.push(status);
-  }
   if (search) {
     conditions.push("(l.name LIKE ? OR l.slug LIKE ?)");
     params.push(`%${search}%`, `%${search}%`);
   }
+  // Status: one value from older links, several from the header filter.
+  applyColumnFilters([{ type: "in", key: "status", column: "l.status" }, ...LOCATION_COLUMN_FILTERS], { ...columnFilters, status }, conditions, params);
 
   const where = `WHERE ${conditions.join(" AND ")}`;
   const { page: safePage, pageSize: safeSize, offset } = adminPagination({ page, pageSize });
@@ -1741,7 +1945,7 @@ export async function listAdminLocations({ tier, parentId = null, search = "", s
          LEFT JOIN locations ct ON ct.id = l.city_id
          LEFT JOIN locations cm ON cm.id = l.community_id
          ${where}
-        ORDER BY l.active_listing_count DESC, l.name ASC LIMIT ${safeSize} OFFSET ${offset}`,
+        ORDER BY l.active_listing_count DESC, l.name ASC, l.id ASC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(`SELECT COUNT(*) FROM locations l ${where}`, params),
@@ -1878,13 +2082,17 @@ function toOption(row) {
   return { id: row.public_id, value: String(row.id), label: row.name, slug: row.slug };
 }
 
-export async function listAdminCategories({ search = "", status = "all", parent = null, page = 1, pageSize = 50 } = {}) {
+export async function listAdminCategories({ search = "", status = "all", parent = null, page = 1, pageSize = 50, ...columnFilters } = {}) {
   const conditions = ["c.deleted_at IS NULL"];
   const params = [];
-  if (status !== "all") {
-    conditions.push("c.status = ?");
-    params.push(status);
-  }
+  // Status: one value from older links, several from the header filter.
+  applyColumnFilters([
+    { type: "in", key: "status", column: "c.status" },
+    { type: "text", key: "name", columns: ["c.name"] },
+    { type: "text", key: "slug", columns: ["c.slug", "c.code"] },
+    { type: "range", keys: ["listingsMin", "listingsMax"], column: "c.active_listing_count" },
+    { type: "date", keys: ["from", "to"], column: "c.created_at" },
+  ], { ...columnFilters, status }, conditions, params);
   if (search) {
     conditions.push("(c.name LIKE ? OR c.slug LIKE ?)");
     params.push(`%${search}%`, `%${search}%`);
@@ -1905,7 +2113,7 @@ export async function listAdminCategories({ search = "", status = "all", parent 
               c.sort_order, c.parent_id, c.root_category_id, c.listing_count, c.active_listing_count,
               c.created_at, c.updated_at, p.name AS parent_name
          FROM categories c LEFT JOIN categories p ON p.id = c.parent_id
-         ${where} ORDER BY c.sort_order ASC, c.name ASC LIMIT ${safeSize} OFFSET ${offset}`,
+         ${where} ORDER BY c.sort_order ASC, c.name ASC, c.id ASC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(`SELECT COUNT(*) FROM categories c ${where}`, params),
@@ -2100,6 +2308,7 @@ export async function listOwnerListings({ ownerType, ownerId, page = 1, pageSize
               ) AS cover_image_url,
               l.view_count, l.inquiry_count, l.root_category_id, cat.name AS category_name,
               CONCAT_WS(', ', NULLIF(cm.name, ''), NULLIF(ct.name, ''), NULLIF(co.name, '')) AS location,
+              l.country_id, l.state_id, l.city_id, l.community_id, l.sub_community_id,
               COALESCE(org.name, u.display_name) AS owner, org.public_id AS organization_public_id,
               ag.display_name AS agent_name, br.name AS brand_name, bm.name AS model_name
          FROM listings l
@@ -2112,7 +2321,7 @@ export async function listOwnerListings({ ownerType, ownerId, page = 1, pageSize
          LEFT JOIN locations cm ON cm.id = l.community_id
          LEFT JOIN brands br ON br.id = l.brand_id
          LEFT JOIN brand_models bm ON bm.id = l.brand_model_id
-         ${where} ORDER BY l.created_at DESC LIMIT ${safeSize} OFFSET ${offset}`,
+         ${where} ORDER BY l.created_at DESC, l.id DESC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(

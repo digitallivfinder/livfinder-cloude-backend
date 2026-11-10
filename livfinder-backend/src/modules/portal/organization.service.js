@@ -1,4 +1,5 @@
 import { descriptionToHtml, sanitizeDescription } from "../../utils/richText.js";
+import { applyColumnFilters } from "../../utils/columnFilters.js";
 import { syncMembershipWithAgent } from "../accounts/teamInvitation.service.js";
 import crypto from "node:crypto";
 import net from "node:net";
@@ -233,7 +234,20 @@ export async function updateOrganization({ organizationId, payload, req }) {
 /* Agents                                                                      */
 /* -------------------------------------------------------------------------- */
 
-export async function listAgents({ organizationId, page = 1, pageSize = 20, search = "", status = "all" }) {
+/** Portal team table header filters. */
+const AGENT_FILTERS = [
+  { type: "text", key: "agentName", columns: ["a.display_name", "a.first_name", "a.last_name"] },
+  { type: "text", key: "email", columns: ["a.email"] },
+  { type: "text", key: "phone", columns: ["a.phone"] },
+  { type: "in", key: "statusIn", column: "a.status" },
+  { type: "in", key: "verification", column: "a.verification_status" },
+  { type: "range", keys: ["listingsMin", "listingsMax"], column: "a.listing_count" },
+  { type: "range", keys: ["reviewsMin", "reviewsMax"], column: "a.review_count" },
+  { type: "range", keys: ["ratingMin", "ratingMax"], column: "a.rating_avg", decimal: true },
+  { type: "bool", key: "publicProfile", when: { yes: "a.is_publicly_visible = 1", no: "a.is_publicly_visible = 0" } },
+];
+
+export async function listAgents({ organizationId, page = 1, pageSize = 20, search = "", status = "all", ...columnFilters }) {
   const conditions = ["a.organization_id = ?", "a.deleted_at IS NULL"];
   const params = [organizationId];
   if (status !== "all") {
@@ -245,6 +259,7 @@ export async function listAgents({ organizationId, page = 1, pageSize = 20, sear
     conditions.push("(a.display_name LIKE ? OR a.email LIKE ?)");
     params.push(`%${term}%`, `%${term}%`);
   }
+  applyColumnFilters(AGENT_FILTERS, columnFilters, conditions, params);
   const where = `WHERE ${conditions.join(" AND ")}`;
   const safePage = Math.max(1, Number(page) || 1);
   const safeSize = Math.min(100, Math.max(1, Number(pageSize) || 20));

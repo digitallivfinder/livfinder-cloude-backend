@@ -163,7 +163,7 @@ export async function getLead(scope, publicId) {
             COALESCE(c.display_name, l.name) AS contact_name,
             COALESCE(c.primary_email, l.email) AS contact_email,
             COALESCE(c.primary_phone_e164, l.phone_e164) AS contact_phone,
-            src.name AS source_name, ag.display_name AS agent_name, lr.code AS lost_reason_code,
+            src.name AS source_name, ag.display_name AS agent_name, ag.public_id AS agent_public_id, lr.code AS lost_reason_code,
             li.title AS listing_title, li.public_id AS listing_public_id,
             pj.name AS project_name, pj.public_id AS project_public_id
        FROM leads l
@@ -235,6 +235,7 @@ export async function getLead(scope, publicId) {
     intent: row.intent,
     timeframe: row.timeframe,
     priority: lead.priority,
+    assignedAgentId: row.agent_public_id ?? null,
     assignedAgentName: row.agent_name,
     budget: row.budget_min ? { min: Number(row.budget_min), max: row.budget_max ? Number(row.budget_max) : null, currency: row.currency_code } : null,
     receivedAt: row.created_at,

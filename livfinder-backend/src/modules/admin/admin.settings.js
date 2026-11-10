@@ -1,5 +1,5 @@
 import {
-  query, queryOne, queryValue, adminPagination, adminList, int, bool, isoDate,
+  query, queryOne, queryValue, adminPagination, adminList, int, bool, isoDate, applyColumnFilters, csvList,
 } from "./admin.shared.js";
 import * as options from "./admin.options.js";
 import { execute } from "../../db/query.js";
@@ -209,7 +209,7 @@ export async function listAdminRoles({ page = 1, pageSize = 50 } = {}) {
       `SELECT r.id, r.code, r.name, r.description, r.scope, r.is_system, r.created_at,
               (SELECT COUNT(*) FROM user_roles ur WHERE ur.role_id = r.id) AS user_count
          FROM roles r WHERE r.scope = 'platform'
-        ORDER BY r.sort_order ASC LIMIT ${safeSize} OFFSET ${offset}`
+        ORDER BY r.sort_order ASC, r.id ASC LIMIT ${safeSize} OFFSET ${offset}`
     ),
     queryValue("SELECT COUNT(*) FROM roles WHERE scope = 'platform'"),
   ]);
@@ -405,21 +405,37 @@ const DOMAIN_LABELS = Object.freeze({
   api: "API & webhooks",
 });
 
-export async function listAdminAccessUsers({ status = "all", search = "", roleId = "", page = 1, pageSize = 20 } = {}) {
+/** Admin users' header filters. Permissions is the sum of the user's platform roles' permissions, as the column adds them up. */
+const ACCESS_USER_FILTERS = [
+  { type: "in", key: "status", column: "u.status" },
+  { type: "text", key: "user", columns: ["u.display_name", "u.first_name", "u.last_name", "u.email", "u.public_id"] },
+  {
+    type: "custom", key: "roleId",
+    build: (value) => {
+      const ids = csvList(value).filter((id) => /^\d+$/.test(id));
+      return ids.length
+        ? { sql: `EXISTS (SELECT 1 FROM user_roles fr WHERE fr.user_id = u.id AND fr.role_id IN (${ids.map(() => "?").join(", ")}))`, params: ids }
+        : { sql: "1 = 0" };
+    },
+  },
+  {
+    type: "range", keys: ["permissionsMin", "permissionsMax"],
+    column: `(SELECT COUNT(*) FROM user_roles fur JOIN roles fro ON fro.id = fur.role_id AND fro.scope = 'platform'
+               JOIN role_permissions frp ON frp.role_id = fur.role_id WHERE fur.user_id = u.id)`,
+  },
+  { type: "date", keys: ["loginFrom", "loginTo"], column: "u.last_login_at" },
+  { type: "date", keys: ["from", "to"], column: "u.created_at" },
+];
+
+export async function listAdminAccessUsers({ status = "all", search = "", roleId = "", page = 1, pageSize = 20, ...columnFilters } = {}) {
   const conditions = ["u.deleted_at IS NULL", "EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id)"];
   const params = [];
-  if (status !== "all") {
-    conditions.push("u.status = ?");
-    params.push(status);
-  }
   if (search) {
-    conditions.push("(u.display_name LIKE ? OR u.email LIKE ?)");
-    params.push(`%${search}%`, `%${search}%`);
+    conditions.push("(u.display_name LIKE ? OR u.email LIKE ? OR u.public_id = ?)");
+    params.push(`%${search}%`, `%${search}%`, search);
   }
-  if (roleId) {
-    conditions.push("EXISTS (SELECT 1 FROM user_roles ur2 WHERE ur2.user_id = u.id AND ur2.role_id = ?)");
-    params.push(Number(roleId));
-  }
+  // Status and role: one value from older links, several from the header filters.
+  applyColumnFilters(ACCESS_USER_FILTERS, { ...columnFilters, status, roleId }, conditions, params);
 
   const where = `WHERE ${conditions.join(" AND ")}`;
   const { page: safePage, pageSize: safeSize, offset } = adminPagination({ page, pageSize });
@@ -434,7 +450,7 @@ export async function listAdminAccessUsers({ status = "all", search = "", roleId
          LEFT JOIN roles r ON r.id = ur.role_id
          ${where}
         GROUP BY u.id
-        ORDER BY u.created_at ASC LIMIT ${safeSize} OFFSET ${offset}`,
+        ORDER BY u.created_at ASC, u.id ASC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(`SELECT COUNT(*) FROM users u ${where}`, params),
@@ -522,25 +538,22 @@ function redactContext(value, depth = 0) {
   return result;
 }
 
-export async function listAdminSystemLogs({ severity = "all", search = "", source = "", from, to, page = 1, pageSize = 20 } = {}) {
+/** System log header filters. Type is the exception class, as the Type column shows it. */
+const SYSTEM_LOG_FILTERS = [
+  { type: "in", key: "severity", column: "s.level" },
+  { type: "in", key: "source", column: "s.channel" },
+  { type: "text", key: "log", columns: ["CAST(s.id AS CHAR)"] },
+  { type: "text", key: "logType", columns: ["s.exception_class"] },
+  { type: "text", key: "message", columns: ["s.message"] },
+  { type: "text", key: "requestId", columns: ["s.request_id"] },
+  { type: "date", keys: ["from", "to"], column: "s.occurred_at" },
+];
+
+export async function listAdminSystemLogs({ severity = "all", search = "", source = "", from, to, page = 1, pageSize = 20, ...columnFilters } = {}) {
   const conditions = [];
   const params = [];
-  if (severity !== "all") {
-    conditions.push("s.level = ?");
-    params.push(severity);
-  }
-  if (source) {
-    conditions.push("s.channel = ?");
-    params.push(source);
-  }
-  if (from) {
-    conditions.push("s.occurred_at >= ?");
-    params.push(new Date(from));
-  }
-  if (to) {
-    conditions.push("s.occurred_at <= ?");
-    params.push(new Date(`${to}T23:59:59`));
-  }
+  // Severity, source and dates: one value from older links, several from the header filters.
+  applyColumnFilters(SYSTEM_LOG_FILTERS, { ...columnFilters, severity, source, from, to }, conditions, params);
   if (search) {
     conditions.push("(s.message LIKE ? OR s.exception_class LIKE ? OR s.request_id = ?)");
     params.push(`%${search}%`, `%${search}%`, search);
@@ -555,7 +568,7 @@ export async function listAdminSystemLogs({ severity = "all", search = "", sourc
               s.request_id, s.user_id, s.url, s.http_method, s.http_status, s.duration_ms,
               u.display_name AS user_name
          FROM system_logs s LEFT JOIN users u ON u.id = s.user_id
-         ${where} ORDER BY s.occurred_at DESC LIMIT ${safeSize} OFFSET ${offset}`,
+         ${where} ORDER BY s.occurred_at DESC, s.id DESC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(`SELECT COUNT(*) FROM system_logs s ${where}`, params),

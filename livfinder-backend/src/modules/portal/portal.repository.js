@@ -1,4 +1,5 @@
 import { query, queryOne, queryValue } from "../../db/query.js";
+import { agentIn, applyColumnFilters, locationAtAnyTier } from "../../utils/columnFilters.js";
 import { bool, int, isoDate, isoDay, num } from "../../serializers/primitives.js";
 import { frontendCategoryId, categoryByRootId } from "../../utils/categories.js";
 
@@ -24,7 +25,13 @@ const STATUS_LABELS = {
 };
 
 // The portal's tab vocabulary differs from the database's status enum.
-const TAB_TO_STATUSES = {
+/** The listing table's Status filter values (the tabs), with their labels. */
+export const LISTING_TAB_LABELS = Object.freeze([
+  ["active", "Active"], ["pending", "Pending review"], ["draft", "Draft"], ["soldOrRented", "Sold / Rented"],
+  ["expired", "Expired"], ["rejected", "Rejected"], ["archived", "Archived"],
+]);
+
+export const TAB_TO_STATUSES = {
   all: null,
   active: ["active"],
   pending: ["pending_review"],
@@ -208,9 +215,22 @@ export async function listAccountListings({
   page = 1,
   pageSize = 10,
   agentId = null,
+  ...columnFilters
 }) {
   const conditions = ["l.account_id = ?", "l.deleted_at IS NULL"];
   const params = [accountId];
+  // Table header filters (portal ListingCollection). The tabs keep `status`; the Status column
+  // filter sends several of the same tab values as `statusIn`.
+  applyColumnFilters([
+    { type: "text", key: "title", columns: ["l.title", "l.reference", "l.public_id"] },
+    { type: "in", key: "statusIn", column: "l.status", map: (value) => TAB_TO_STATUSES[value] ?? null },
+    { type: "range", keys: ["priceMin", "priceMax"], column: "l.price", decimal: true },
+    locationAtAnyTier("locationId", "l"),
+    agentIn("agent", "l.agent_id"),
+    { type: "range", keys: ["viewsMin", "viewsMax"], column: "l.view_count" },
+    { type: "range", keys: ["inquiriesMin", "inquiriesMax"], column: "l.inquiry_count" },
+    { type: "date", keys: ["updatedFrom", "updatedTo"], column: "l.updated_at" },
+  ], columnFilters, conditions, params);
 
   const statuses = TAB_TO_STATUSES[status];
   if (statuses) {

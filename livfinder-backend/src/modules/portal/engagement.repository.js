@@ -1,4 +1,5 @@
 import { query, queryOne, queryValue } from "../../db/query.js";
+import { agentIn, applyColumnFilters, csvList, referenceNumber } from "../../utils/columnFilters.js";
 import { bool, int, isoDate, isoDay, num } from "../../serializers/primitives.js";
 import { funnelStepOf } from "../leads/leadFunnel.js";
 import { PORTAL_LISTING_COLUMNS, PORTAL_LISTING_JOINS, serializePortalListing, formatMoney, relativeTime, rootIdForFrontendCategory, titleize } from "./portal.repository.js";
@@ -35,7 +36,27 @@ function paginate({ page, pageSize }, defaultSize = 10) {
 /* Inquiries                                                                   */
 /* -------------------------------------------------------------------------- */
 
-export async function listInquiries({ accountId, organizationId, search = "", listing = "all", category = "all", status = "all", from, to, sort = "newest", page = 1, pageSize = 10 }) {
+/** Portal enquiries' header filters. Category is the subject's: a development, else the listing's root. */
+const INQUIRY_FILTERS = [
+  { type: "text", key: "buyer", columns: ["i.name", "i.email", "i.phone"] },
+  { type: "text", key: "listingText", columns: ["l.title", "l.reference", "pj.name"] },
+  {
+    type: "custom", key: "categories",
+    build: (value) => {
+      const slugs = csvList(value);
+      const parts = [];
+      if (slugs.includes("real-estate-developments")) parts.push("i.project_id IS NOT NULL");
+      const roots = slugs.filter((slug) => slug !== "real-estate-developments").map(rootIdForFrontendCategory).filter(Boolean);
+      if (roots.length) parts.push(`(i.project_id IS NULL AND l.root_category_id IN (${roots.map(() => "?").join(", ")}))`);
+      return parts.length ? { sql: parts.join(" OR "), params: roots } : { sql: "1 = 0" };
+    },
+  },
+  { type: "text", key: "message", columns: ["i.message"] },
+  { type: "date", keys: ["receivedFrom", "receivedTo"], column: "i.created_at" },
+  { type: "in", key: "statusIn", column: "i.status" },
+];
+
+export async function listInquiries({ accountId, organizationId, search = "", listing = "all", category = "all", status = "all", from, to, sort = "newest", page = 1, pageSize = 10, ...columnFilters }) {
   const scope = scopeClause("i", { accountId, organizationId });
   const conditions = [scope.sql, "i.deleted_at IS NULL", "i.is_spam = 0"];
   const params = [...scope.params];
@@ -75,6 +96,7 @@ export async function listInquiries({ accountId, organizationId, search = "", li
     params.push(`%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`);
   }
 
+  applyColumnFilters(INQUIRY_FILTERS, columnFilters, conditions, params);
   const where = `WHERE ${conditions.join(" AND ")}`;
   const { page: safePage, pageSize: safeSize, offset } = paginate({ page, pageSize });
   const orderBy = sort === "oldest" ? "i.created_at ASC" : "i.created_at DESC";
@@ -404,7 +426,16 @@ export async function listConversations({ userId, organizationId, filter = "all"
 
 const BOOKING_STATUS_BUCKETS = { pending: "requested", reschedule: "rescheduled" };
 
-export async function listBookings({ accountId, organizationId, search = "", category = "all", status = "upcoming", from, to, view = "list", page = 1, pageSize = 10 }) {
+const BOOKING_FILTERS = [
+  { type: "date", keys: ["startFrom", "startTo"], column: "b.scheduled_start" },
+  { type: "text", key: "client", columns: ["b.contact_name", "b.contact_email", "b.contact_phone"] },
+  { type: "in", key: "bookingType", column: "b.booking_type" },
+  { type: "text", key: "listingText", columns: ["l.title", "l.reference"] },
+  agentIn("agent", "b.agent_id"),
+  { type: "in", key: "statusIn", column: "b.status" },
+];
+
+export async function listBookings({ accountId, organizationId, search = "", category = "all", status = "upcoming", from, to, view = "list", page = 1, pageSize = 10, ...columnFilters }) {
   const scope = scopeClause("b", { accountId, organizationId });
   const conditions = [scope.sql, "b.deleted_at IS NULL"];
   const params = [...scope.params];
@@ -438,6 +469,7 @@ export async function listBookings({ accountId, organizationId, search = "", cat
     params.push(`%${term}%`, `%${term}%`, `%${term}%`);
   }
 
+  applyColumnFilters(BOOKING_FILTERS, columnFilters, conditions, params);
   const where = `WHERE ${conditions.join(" AND ")}`;
   const { page: safePage, pageSize: safeSize, offset } = paginate({ page, pageSize });
 
@@ -544,7 +576,18 @@ export async function bookingCounts({ accountId, organizationId }) {
 
 const OFFER_STATUS_BUCKETS = { new: ["submitted"], negotiating: ["countered", "under_review"], declined: ["declined", "rejected"] };
 
-export async function listOffers({ accountId, organizationId, search = "", category = "all", listing = "all", status = "all", sort = "newest", view = "list", page = 1, pageSize = 10 }) {
+const OFFER_FILTERS = [
+  { type: "text", key: "buyer", columns: ["o.buyer_name", "o.buyer_email", "o.buyer_phone"] },
+  { type: "text", key: "listingText", columns: ["l.title", "l.reference"] },
+  { type: "range", keys: ["askingMin", "askingMax"], column: "l.price", decimal: true },
+  { type: "range", keys: ["offerMin", "offerMax"], column: "o.amount", decimal: true },
+  // The Difference column: the offer against the asking price, in percent.
+  { type: "range", keys: ["differenceMin", "differenceMax"], column: "((o.amount - l.price) / NULLIF(l.price, 0) * 100)", decimal: true },
+  { type: "date", keys: ["receivedFrom", "receivedTo"], column: "o.created_at" },
+  { type: "in", key: "statusIn", column: "o.status" },
+];
+
+export async function listOffers({ accountId, organizationId, search = "", category = "all", listing = "all", status = "all", sort = "newest", view = "list", page = 1, pageSize = 10, ...columnFilters }) {
   const scope = scopeClause("o", { accountId, organizationId });
   const conditions = [scope.sql, "o.deleted_at IS NULL"];
   const params = [...scope.params];
@@ -572,6 +615,7 @@ export async function listOffers({ accountId, organizationId, search = "", categ
     params.push(`%${term}%`, `%${term}%`, `%${term}%`);
   }
 
+  applyColumnFilters(OFFER_FILTERS, columnFilters, conditions, params);
   const where = `WHERE ${conditions.join(" AND ")}`;
   const { page: safePage, pageSize: safeSize, offset } = paginate({ page, pageSize });
   const orderBy =
@@ -978,7 +1022,16 @@ function monthOverMonthPercent(thisMonth, lastMonth) {
   return Math.round(((current - previous) / previous) * 1000) / 10;
 }
 
-export async function listPayments({ accountId, search = "", from, to, status = "all", category = "all", page = 1, pageSize = 10 }) {
+const PAYMENT_FILTERS = [
+  { type: "text", key: "transaction", columns: ["p.reference", "p.provider_payment_id"] },
+  { type: "date", keys: ["dateFrom", "dateTo"], column: "COALESCE(p.paid_at, p.created_at)" },
+  { type: "text", key: "description", columns: ["i.invoice_number", "p.payment_type", "p.provider"] },
+  { type: "in", key: "method", column: "(SELECT fm.method_type FROM payment_methods fm WHERE fm.id = p.payment_method_id)" },
+  { type: "range", keys: ["amountMin", "amountMax"], column: "p.amount", decimal: true },
+  { type: "in", key: "statusIn", column: "p.status" },
+];
+
+export async function listPayments({ accountId, search = "", from, to, status = "all", category = "all", page = 1, pageSize = 10, ...columnFilters }) {
   const conditions = ["p.account_id = ?"];
   const params = [accountId];
   if (status !== "all") {
@@ -1003,6 +1056,7 @@ export async function listPayments({ accountId, search = "", from, to, status = 
     params.push(`%${term}%`, `%${term}%`, `%${term}%`);
   }
 
+  applyColumnFilters(PAYMENT_FILTERS, columnFilters, conditions, params);
   const where = `WHERE ${conditions.join(" AND ")}`;
   const { page: safePage, pageSize: safeSize, offset } = paginate({ page, pageSize });
 
@@ -1087,7 +1141,20 @@ function quotaBenefit(quota, unit) {
   return `${quota} ${unit}`;
 }
 
-export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
+const INVOICE_FILTERS = [
+  { type: "date", keys: ["dateFrom", "dateTo"], column: "i.issued_at" },
+  { type: "text", key: "invoice", columns: ["i.invoice_number"] },
+  // Invoice # box with "LF-INV-" fixed; any part of the long number matches.
+  referenceNumber("invoiceNumber", "i.invoice_number", "LF-INV-", { partial: true }),
+  { type: "text", key: "plan", columns: ["(SELECT fp.name FROM subscriptions fs JOIN plans fp ON fp.id = fs.plan_id WHERE fs.id = i.subscription_id)"] },
+  { type: "range", keys: ["amountMin", "amountMax"], column: "i.total", decimal: true },
+  { type: "in", key: "statusIn", column: "i.status" },
+];
+
+export async function accountBilling({ accountId, page = 1, pageSize = 5, ...columnFilters }) {
+  const invoiceFilter = applyColumnFilters(INVOICE_FILTERS, columnFilters, [], []);
+  const invoiceWhere = ["i.account_id = ?", ...invoiceFilter.conditions].join(" AND ");
+  const invoiceParams = [accountId, ...invoiceFilter.params];
   const { page: safePage, pageSize: safeSize, offset } = paginate({ page, pageSize }, 5);
   const [subscription, plans, invoices, invoiceTotal, seatsUsed] = await Promise.all([
     queryOne(
@@ -1124,10 +1191,10 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5 }) {
          FROM invoices i
          LEFT JOIN subscriptions s ON s.id = i.subscription_id
          LEFT JOIN plans p ON p.id = s.plan_id
-        WHERE i.account_id = ? ORDER BY i.issued_at DESC LIMIT ${safeSize} OFFSET ${offset}`,
-      [accountId]
+        WHERE ${invoiceWhere} ORDER BY i.issued_at DESC, i.id DESC LIMIT ${safeSize} OFFSET ${offset}`,
+      invoiceParams
     ),
-    queryValue("SELECT COUNT(*) FROM invoices WHERE account_id = ?", [accountId]),
+    queryValue(`SELECT COUNT(*) FROM invoices i WHERE ${invoiceWhere}`, invoiceParams),
     // Seats in use. The Billing screen shows a "Team Members" meter against the plan's
     // `agent_seat_quota`; nothing was ever published for it, so the row read
     // `undefined.used` and the whole screen threw.
@@ -1281,7 +1348,18 @@ async function planPricing(publicIds, preferredCurrency = "AED") {
   return result;
 }
 
-export async function accountPayouts({ accountId, page = 1, pageSize = 10 }) {
+const PAYOUT_FILTERS = [
+  { type: "text", key: "payout", columns: ["po.reference", "po.public_id"] },
+  { type: "date", keys: ["dateFrom", "dateTo"], column: "po.scheduled_for" },
+  { type: "in", key: "method", column: "(SELECT fm.method_type FROM payout_methods fm WHERE fm.id = po.payout_method_id)" },
+  { type: "range", keys: ["amountMin", "amountMax"], column: "po.net_amount", decimal: true },
+  { type: "in", key: "statusIn", column: "po.status" },
+];
+
+export async function accountPayouts({ accountId, page = 1, pageSize = 10, ...columnFilters }) {
+  const payoutFilter = applyColumnFilters(PAYOUT_FILTERS, columnFilters, [], []);
+  const payoutWhere = ["po.account_id = ?", ...payoutFilter.conditions].join(" AND ");
+  const payoutParams = [accountId, ...payoutFilter.params];
   const { page: safePage, pageSize: safeSize, offset } = paginate({ page, pageSize });
   const [rows, total, summary, method] = await Promise.all([
     query(
@@ -1292,11 +1370,11 @@ export async function accountPayouts({ accountId, page = 1, pageSize = 10 }) {
               pm.account_last_four AS last4
          FROM payouts po
          LEFT JOIN payout_methods pm ON pm.id = po.payout_method_id
-        WHERE po.account_id = ?
+        WHERE ${payoutWhere}
         ORDER BY po.scheduled_for DESC LIMIT ${safeSize} OFFSET ${offset}`,
-      [accountId]
+      payoutParams
     ),
-    queryValue("SELECT COUNT(*) FROM payouts WHERE account_id = ?", [accountId]),
+    queryValue(`SELECT COUNT(*) FROM payouts po WHERE ${payoutWhere}`, payoutParams),
     queryOne(
       `SELECT COALESCE(SUM(CASE WHEN status = 'paid' THEN net_amount_base END), 0) AS total_paid,
               COALESCE(SUM(CASE WHEN status IN ('pending','scheduled','processing') THEN net_amount_base END), 0) AS pending,

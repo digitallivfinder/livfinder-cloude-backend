@@ -200,14 +200,22 @@ adminFeedMappingsRouter.get(
   validate({
     query: z.object({
       status: z.enum(["unmapped", "mapped", "all"]).optional(),
-      type: z.enum(MAPPING_TYPES).optional(),
+      // One kind, or several comma-separated from the Kind header filter.
+      type: z.string().trim().max(80).refine((value) => value.split(",").every((part) => MAPPING_TYPES.includes(part.trim())), "Unknown mapping type.").optional(),
       page: z.coerce.number().int().min(1).max(10_000).optional(),
       pageSize: z.coerce.number().int().min(1).max(100).optional(),
+      // Table header filters (see MAPPING_COLUMN_FILTERS).
+      sent: z.string().trim().max(200).optional(),
+      target: z.string().trim().max(200).optional(),
+      seenMin: z.string().trim().max(12).optional(),
+      seenMax: z.string().trim().max(12).optional(),
+      seenFrom: z.string().trim().max(10).optional(),
+      seenTo: z.string().trim().max(10).optional(),
     }),
   }),
   asyncHandler(async (req, res) => {
-    const { status = "unmapped", type, page = 1, pageSize = 50 } = req.validatedQuery || {};
-    const result = await listMappings({ status, type, page, pageSize });
+    const { status = "unmapped", type, page = 1, pageSize = 50, ...columnFilters } = req.validatedQuery || {};
+    const result = await listMappings({ status, type, page, pageSize, ...columnFilters });
     return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
   })
 );

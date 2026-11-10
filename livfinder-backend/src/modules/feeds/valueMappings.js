@@ -1,6 +1,7 @@
 import { execute, query, queryOne } from "../../db/query.js";
 import { AppError } from "../../utils/errors.js";
 import { importProviderId } from "../imports/importConnection.js";
+import { applyColumnFilters } from "../../utils/columnFilters.js";
 
 /**
  * Mapping a company's own words to LivFinder's (Phase 5): place names and property types that do
@@ -80,16 +81,26 @@ function serialize(row) {
   };
 }
 
-export async function listMappings({ status = "unmapped", type = null, page = 1, pageSize = 50 } = {}) {
+/** What a mapped value points at, as the Maps to column names it. */
+const MAPPED_TO = `CASE WHEN m.is_unmapped = 1 THEN NULL
+    WHEN m.mapping_type = 'location' THEN (SELECT t.name FROM locations t WHERE t.id = m.internal_id)
+    ELSE COALESCE((SELECT tc.name FROM categories tc WHERE tc.code = m.internal_value AND tc.root_category_id = m.scope_key LIMIT 1), m.internal_value) END`;
+const MAPPING_COLUMN_FILTERS = [
+  { type: "in", key: "type", column: "m.mapping_type" },
+  { type: "text", key: "sent", columns: ["m.external_label", "m.external_value"] },
+  { type: "range", keys: ["seenMin", "seenMax"], column: "m.seen_count" },
+  { type: "date", keys: ["seenFrom", "seenTo"], column: "m.last_seen_at" },
+  { type: "text", key: "target", columns: [MAPPED_TO] },
+];
+
+export async function listMappings({ status = "unmapped", type = null, page = 1, pageSize = 50, ...columnFilters } = {}) {
   const providerId = await importProviderId();
   const conditions = ["m.provider_id = ?", "m.connection_id IS NULL", `m.mapping_type IN (${MAPPING_TYPES.map(() => "?").join(", ")})`, "m.is_active = 1"];
   const params = [providerId, ...MAPPING_TYPES];
   if (status === "unmapped") conditions.push("m.is_unmapped = 1");
   if (status === "mapped") conditions.push("m.is_unmapped = 0");
-  if (type) {
-    conditions.push("m.mapping_type = ?");
-    params.push(type);
-  }
+  // Kind: one type from older callers, several from the header filter.
+  applyColumnFilters(MAPPING_COLUMN_FILTERS, { ...columnFilters, type }, conditions, params);
   const where = `WHERE ${conditions.join(" AND ")}`;
   const offset = (Math.max(1, page) - 1) * pageSize;
   const [rows, total] = await Promise.all([

@@ -1,4 +1,5 @@
 import { execute, query, queryOne, queryValue } from "../../db/query.js";
+import { applyColumnFilters, csvList } from "../../utils/columnFilters.js";
 import { ulid } from "../../utils/ids.js";
 import { importProviderId } from "./importConnection.js";
 import { publicListingUrl } from "./listingImport.service.js";
@@ -10,6 +11,10 @@ import { publicListingUrl } from "./listingImport.service.js";
  */
 
 const IMPORT_TYPE_LABEL = { single: "single", api_push: "bulk", full: "file" };
+/** The import Type filter's values: what each `feed_imports.import_type` is called on screen. */
+export const IMPORT_TYPES = Object.freeze([["single", "Single"], ["bulk", "Bulk"], ["file", "File"]]);
+/** An import row's Result segments ("succeeded" includes rows with warnings). */
+export const IMPORT_ITEM_RESULTS = Object.freeze([["failed", "Failed"], ["warning", "With warnings"], ["succeeded", "Succeeded (incl. warnings)"], ["queued", "Queued"]]);
 
 function parseJson(value, fallback) {
   if (value === null || value === undefined) return fallback;
@@ -210,7 +215,18 @@ export function serializeImport(row) {
   };
 }
 
-export async function listImports({ organizationId = null, accountId = null, organizationPublicId = null, apiClientPublicId = null, status = null, type = null, search = null, page = 1, pageSize = 20 } = {}) {
+/** Admin header filters on the imports table. "bulk" and "file" are the labels of api_push and full runs. */
+const IMPORT_FILTERS = [
+  { type: "in", key: "status", column: "fi.status" },
+  { type: "in", key: "type", column: "fi.import_type", map: (value) => ({ single: "single", bulk: "api_push", file: "full" })[value] ?? null },
+  { type: "date", keys: ["from", "to"], column: "fi.created_at" },
+  { type: "text", key: "companyName", columns: ["o.name"] },
+  { type: "text", key: "sentWith", columns: ["ac.name", "ac.client_id", "INET6_NTOA(fi.source_ip)"] },
+  { type: "range", keys: ["listingsMin", "listingsMax"], column: "fi.total_rows" },
+  { type: "range", keys: ["failedMin", "failedMax"], column: "fi.failed_count" },
+];
+
+export async function listImports({ organizationId = null, accountId = null, organizationPublicId = null, apiClientPublicId = null, status = null, type = null, search = null, page = 1, pageSize = 20, columnFilters = {} } = {}) {
   const providerId = await importProviderId();
   const conditions = ["fi.provider_id = ?"];
   const params = [providerId];
@@ -224,21 +240,17 @@ export async function listImports({ organizationId = null, accountId = null, org
     params.push(accountId);
   }
   if (organizationPublicId) {
-    conditions.push("o.public_id = ?");
-    params.push(organizationPublicId);
+    // One company, or several from the Company dropdown.
+    const companies = csvList(organizationPublicId);
+    conditions.push(`o.public_id IN (${companies.map(() => "?").join(", ")})`);
+    params.push(...companies);
   }
   if (apiClientPublicId) {
     conditions.push("ac.public_id = ?");
     params.push(apiClientPublicId);
   }
-  if (status) {
-    conditions.push("fi.status = ?");
-    params.push(status);
-  }
-  if (type) {
-    conditions.push("fi.import_type = ?");
-    params.push(type === "bulk" ? "api_push" : type);
-  }
+  // Status and type: one value from the portal and partner screens, several from admin's header filters.
+  applyColumnFilters(IMPORT_FILTERS, { ...columnFilters, status: status ?? "", type: type ?? "" }, conditions, params);
   if (search) {
     conditions.push("(fi.public_id = ? OR o.name LIKE ? OR ac.name LIKE ? OR ac.client_id = ?)");
     params.push(search, `%${search}%`, `%${search}%`, search);
@@ -287,13 +299,27 @@ export function serializeItem(row) {
   };
 }
 
-export async function listImportItems(importId, { status = null, search = null, page = 1, pageSize = 50 } = {}) {
+/** An import's rows: the Result segments ("succeeded" includes rows with warnings) and admin's header filters. */
+const IMPORT_ITEM_FILTERS = [
+  {
+    type: "in", key: "status",
+    cases: {
+      failed: "fii.status = 'failed'",
+      warning: "fii.status = 'warning'",
+      succeeded: "fii.status IN ('success','warning')",
+      queued: "fii.status = 'queued'",
+    },
+  },
+  { type: "range", keys: ["rowMin", "rowMax"], column: "fii.source_row" },
+  { type: "text", key: "partnerId", columns: ["fii.external_id"] },
+  { type: "text", key: "listing", columns: ["l.title", "l.reference"] },
+  { type: "text", key: "problem", columns: ["CAST(fii.errors AS CHAR)", "CAST(fii.warnings AS CHAR)"] },
+];
+
+export async function listImportItems(importId, { status = null, search = null, page = 1, pageSize = 50, columnFilters = {} } = {}) {
   const conditions = ["fii.import_id = ?"];
   const params = [importId];
-  if (status === "failed") conditions.push("fii.status = 'failed'");
-  else if (status === "warning") conditions.push("fii.status = 'warning'");
-  else if (status === "succeeded") conditions.push("fii.status IN ('success','warning')");
-  else if (status === "queued") conditions.push("fii.status = 'queued'");
+  applyColumnFilters(IMPORT_ITEM_FILTERS, { ...columnFilters, status: status ?? "" }, conditions, params);
   if (search) {
     conditions.push("(fii.external_id LIKE ? OR l.reference = ? OR l.title LIKE ?)");
     params.push(`%${search}%`, search, `%${search}%`);
@@ -398,17 +424,33 @@ export function serializeApiClient(row) {
   };
 }
 
-export async function listApiClients({ organizationPublicId = null, status = null, search = null, page = 1, pageSize = 20 } = {}) {
+/** Admin header filters on the API keys table. Scopes match a key holding any of the chosen scopes. */
+const API_CLIENT_FILTERS = [
+  { type: "in", key: "status", column: "ac.status", map: (value) => (["active", "suspended", "revoked"].includes(value) ? value : null) },
+  { type: "text", key: "companyName", columns: ["o.name"] },
+  { type: "text", key: "key", columns: ["ac.name", "ac.client_id"] },
+  {
+    type: "custom", key: "scopes",
+    build: (value) => {
+      const scopes = csvList(value);
+      return scopes.length ? { sql: scopes.map(() => "JSON_CONTAINS(ac.scopes, JSON_QUOTE(?))").join(" OR "), params: scopes } : null;
+    },
+  },
+  { type: "text", key: "ips", columns: ["CAST(ac.allowed_ips AS CHAR)"] },
+  { type: "date", keys: ["usedFrom", "usedTo"], column: "ac.last_used_at" },
+  { type: "range", keys: ["importsMin", "importsMax"], column: "(SELECT COUNT(*) FROM feed_imports ffi WHERE ffi.api_client_id = ac.id)" },
+  { type: "text", key: "createdBy", columns: ["u.display_name", "u.email"] },
+];
+
+export async function listApiClients({ organizationPublicId = null, status = null, search = null, page = 1, pageSize = 20, columnFilters = {} } = {}) {
   const conditions = ["ac.organization_id IS NOT NULL"];
   const params = [];
   if (organizationPublicId) {
-    conditions.push("o.public_id = ?");
-    params.push(organizationPublicId);
+    const companies = csvList(organizationPublicId);
+    conditions.push(`o.public_id IN (${companies.map(() => "?").join(", ")})`);
+    params.push(...companies);
   }
-  if (status) {
-    conditions.push("ac.status = ?");
-    params.push(status);
-  }
+  applyColumnFilters(API_CLIENT_FILTERS, { ...columnFilters, status: status ?? "" }, conditions, params);
   if (search) {
     conditions.push("(ac.name LIKE ? OR ac.client_id = ? OR o.name LIKE ?)");
     params.push(`%${search}%`, search, `%${search}%`);

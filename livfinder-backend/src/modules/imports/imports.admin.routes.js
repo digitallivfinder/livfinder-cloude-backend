@@ -18,15 +18,19 @@ import * as repo from "./imports.repository.js";
  */
 const router = Router();
 
-const listQuery = z.object({
-  page: z.coerce.number().int().min(1).max(10_000).optional(),
-  pageSize: z.coerce.number().int().min(1).max(100).optional(),
-  status: z.string().trim().max(30).optional(),
-  type: z.enum(["single", "bulk"]).optional(),
-  search: z.string().trim().max(120).optional(),
-  company: z.string().trim().max(40).optional(),
-  apiKey: z.string().trim().max(40).optional(),
-});
+const listQuery = z
+  .object({
+    page: z.coerce.number().int().min(1).max(10_000).optional(),
+    pageSize: z.coerce.number().int().min(1).max(100).optional(),
+    // One value, or several comma-separated from the header filters.
+    status: z.string().trim().max(120).optional(),
+    type: z.string().trim().max(60).optional(),
+    search: z.string().trim().max(120).optional(),
+    company: z.string().trim().max(400).optional(),
+    apiKey: z.string().trim().max(40).optional(),
+  })
+  // Header filter keys; the repository reads only those its filter specs name.
+  .catchall(z.string().trim().max(400));
 
 router.get(
   "/listing-imports",
@@ -35,7 +39,7 @@ router.get(
   requirePermission("api.view"),
   validate({ query: listQuery }),
   asyncHandler(async (req, res) => {
-    const { page = 1, pageSize = 20, status, type, search, company, apiKey } = q(req);
+    const { page = 1, pageSize = 20, status, type, search, company, apiKey, ...columnFilters } = q(req);
     const result = await repo.listImports({
       organizationPublicId: company || null,
       apiClientPublicId: apiKey || null,
@@ -44,6 +48,7 @@ router.get(
       search: search || null,
       page,
       pageSize,
+      columnFilters,
     });
     return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
   })
@@ -72,14 +77,14 @@ router.get(
     query: z.object({
       page: z.coerce.number().int().min(1).max(10_000).optional(),
       pageSize: z.coerce.number().int().min(1).max(100).optional(),
-      status: z.enum(["failed", "warning", "succeeded", "queued"]).optional(),
+      status: z.string().trim().max(60).refine((value) => value.split(",").every((part) => ["failed", "warning", "succeeded", "queued"].includes(part.trim())), "Unknown result.").optional(),
       search: z.string().trim().max(191).optional(),
-    }),
+    }).catchall(z.string().trim().max(400)),
   }),
   asyncHandler(async (req, res) => {
     const row = await findImport(req);
-    const { page = 1, pageSize = 50, status, search } = q(req);
-    const result = await repo.listImportItems(row.id, { status, search, page, pageSize });
+    const { page = 1, pageSize = 50, status, search, ...columnFilters } = q(req);
+    const result = await repo.listImportItems(row.id, { status, search, page, pageSize, columnFilters });
     return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
   })
 );
@@ -104,13 +109,15 @@ router.get(
   requirePermission("api.view"),
   validate({ query: listQuery }),
   asyncHandler(async (req, res) => {
-    const { page = 1, pageSize = 20, status, search, company } = q(req);
+    const { page = 1, pageSize = 20, status, search, company, type, apiKey, ...columnFilters } = q(req);
     const result = await repo.listApiClients({
       organizationPublicId: company || null,
-      status: ["active", "suspended", "revoked"].includes(status) ? status : null,
+      // Unknown statuses are dropped by the repository's filter spec.
+      status: status || null,
       search: search || null,
       page,
       pageSize,
+      columnFilters,
     });
     return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
   })

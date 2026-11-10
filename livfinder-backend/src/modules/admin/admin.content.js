@@ -1,5 +1,5 @@
 import {
-  query, queryOne, queryValue, adminPagination, adminList, int, num, bool, isoDate, frontendCategoryId,
+  query, queryOne, queryValue, adminPagination, adminList, int, num, bool, isoDate, frontendCategoryId, applyColumnFilters, csvList, referenceNumber,
 } from "./admin.shared.js";
 import { htmlToBlocks } from "../../serializers/editorial.js";
 import * as options from "./admin.options.js";
@@ -12,27 +12,41 @@ import * as options from "./admin.options.js";
 /* Articles                                                                    */
 /* -------------------------------------------------------------------------- */
 
-export async function listAdminArticles({ status = "all", search = "", category = "", author = "", page = 1, pageSize = 10 } = {}) {
+/**
+ * Article filters. The Category column shows an article's first category (lowest term id — the
+ * order the list reads them in), so its filter matches that one. Author options carry the
+ * author's public id; older links carry the slug.
+ */
+const PRIMARY_ARTICLE_CATEGORY = `(SELECT ft.slug FROM post_terms fpt JOIN editorial_terms ft ON ft.id = fpt.term_id
+    WHERE fpt.post_id = p.id AND ft.taxonomy = 'category' ORDER BY ft.id LIMIT 1)`;
+const ARTICLE_FILTERS = [
+  { type: "in", key: "status", column: "p.status" },
+  { type: "text", key: "article", columns: ["p.title", "p.slug", "p.public_id"] },
+  { type: "in", key: "category", column: PRIMARY_ARTICLE_CATEGORY },
+  {
+    type: "custom", key: "author",
+    build: (value) => {
+      const values = csvList(value);
+      const marks = values.map(() => "?").join(", ");
+      return values.length ? { sql: `au.public_id IN (${marks}) OR au.slug IN (${marks})`, params: [...values, ...values] } : null;
+    },
+  },
+  { type: "date", keys: ["dateFrom", "dateTo"], column: "p.published_at" },
+  { type: "date", keys: ["updatedFrom", "updatedTo"], column: "p.updated_at" },
+  { type: "range", keys: ["viewsMin", "viewsMax"], column: "p.view_count" },
+];
+
+export async function listAdminArticles({ status = "all", search = "", category = "", author = "", page = 1, pageSize = 10, ...columnFilters } = {}) {
   const conditions = ["p.deleted_at IS NULL"];
   const params = [];
   const joins = ["LEFT JOIN authors au ON au.id = p.author_id"];
 
-  if (status !== "all") {
-    conditions.push("p.status = ?");
-    params.push(status);
-  }
+  // Status, category and author arrive as one value from the tabs and toolbar or several from
+  // the header filters.
+  applyColumnFilters(ARTICLE_FILTERS, { ...columnFilters, status, category, author }, conditions, params);
   if (search) {
     conditions.push("(p.title LIKE ? OR p.slug LIKE ? OR p.excerpt LIKE ?)");
     params.push(`%${search}%`, `%${search}%`, `%${search}%`);
-  }
-  if (author) {
-    conditions.push("au.slug = ?");
-    params.push(author);
-  }
-  if (category) {
-    joins.push(`JOIN post_terms pt ON pt.post_id = p.id
-                JOIN editorial_terms t ON t.id = pt.term_id AND t.taxonomy = 'category' AND t.slug = ?`);
-    params.unshift(category);
   }
 
   const where = `WHERE ${conditions.join(" AND ")}`;
@@ -47,7 +61,7 @@ export async function listAdminArticles({ status = "all", search = "", category 
               au.public_id AS author_public_id, au.name AS author_name, au.slug AS author_slug,
               au.avatar_url AS author_avatar
          FROM posts p ${joins.join("\n")} ${where}
-        ORDER BY p.updated_at DESC LIMIT ${safeSize} OFFSET ${offset}`,
+        ORDER BY p.updated_at DESC, p.id DESC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(`SELECT COUNT(DISTINCT p.id) FROM posts p ${joins.join("\n")} ${where}`, params),
@@ -64,7 +78,8 @@ export async function listAdminArticles({ status = "all", search = "", category 
     ? await query(
         `SELECT pt.post_id, t.slug, t.name, t.taxonomy FROM post_terms pt
            JOIN editorial_terms t ON t.id = pt.term_id
-          WHERE pt.post_id IN (${ids.map(() => "?").join(", ")})`,
+          WHERE pt.post_id IN (${ids.map(() => "?").join(", ")})
+          ORDER BY t.id`,
         ids
       )
     : [];
@@ -187,13 +202,33 @@ export async function adminArticleOptions() {
 /* Media library                                                               */
 /* -------------------------------------------------------------------------- */
 
-export async function listAdminMedia({ type = "all", search = "", folder = "", usage = "", page = 1, pageSize = 24 } = {}) {
+/**
+ * Media filters, shared by the toolbar (the grid view has no table header) and the list view's
+ * header filters. "pdf" and "other" are toolbar types that are not stored media types.
+ */
+const MEDIA_FILTERS = [
+  { type: "in", key: "type", column: "m.media_type", cases: { pdf: "m.mime_type = 'application/pdf'", other: "m.media_type NOT IN ('image','video','document')" } },
+  // The Media column: the file's name as uploaded (or as stored when that is missing) and its reference.
+  { type: "text", key: "media", columns: ["COALESCE(m.original_file_name, m.file_name)", "CONCAT('MED-', LPAD(m.id, 6, '0'))"] },
+  { type: "in", key: "format", column: "m.mime_type" },
+  // Uploaded By: users from the user search (public ids).
+  {
+    type: "custom", key: "uploadedBy",
+    build: (value) => {
+      const ids = csvList(value);
+      return ids.length ? { sql: `m.uploaded_by_user_id IN (SELECT fu.id FROM users fu WHERE fu.public_id IN (${ids.map(() => "?").join(", ")}))`, params: ids } : null;
+    },
+  },
+  { type: "range", keys: ["widthMin", "widthMax"], column: "m.width" },
+  { type: "range", keys: ["sizeMinKb", "sizeMaxKb"], column: "(m.file_size_bytes / 1024)", decimal: true },
+  { type: "date", keys: ["dateFrom", "dateTo"], column: "m.created_at" },
+  { type: "text", key: "url", columns: ["COALESCE(m.cdn_url, m.url)"] },
+];
+
+export async function listAdminMedia({ type = "all", search = "", folder = "", usage = "", page = 1, pageSize = 24, ...columnFilters } = {}) {
   const conditions = ["m.deleted_at IS NULL"];
   const params = [];
-  if (type !== "all") {
-    conditions.push("m.media_type = ?");
-    params.push(type);
-  }
+  applyColumnFilters(MEDIA_FILTERS, { ...columnFilters, type }, conditions, params);
   if (search) {
     conditions.push("(m.original_file_name LIKE ? OR m.file_name LIKE ? OR m.alt_text LIKE ? OR m.caption LIKE ?)");
     params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
@@ -218,7 +253,7 @@ export async function listAdminMedia({ type = "all", search = "", folder = "", u
          FROM media_assets m
          LEFT JOIN media_folders f ON f.id = m.folder_id
          LEFT JOIN users u ON u.id = m.uploaded_by_user_id
-         ${where} ORDER BY m.created_at DESC LIMIT ${safeSize} OFFSET ${offset}`,
+         ${where} ORDER BY m.created_at DESC, m.id DESC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(`SELECT COUNT(*) FROM media_assets m LEFT JOIN media_folders f ON f.id = m.folder_id ${where}`, params),
@@ -416,23 +451,33 @@ function reviewTarget(row, targets) {
   };
 }
 
-export async function listAdminReviews({ status = "all", search = "", targetType = "", rating = "", sort = "newest", page = 1, pageSize = 10 } = {}) {
+/** What the Review For column names: the reviewed listing, company or agent (see `resolveReviewTargets`). */
+const REVIEW_TARGET_TITLE = `COALESCE(CASE r.subject_type
+    WHEN 'listing' THEN (SELECT tl.title FROM listings tl WHERE tl.id = r.subject_id)
+    WHEN 'organization' THEN (SELECT COALESCE(tor.name, tor.legal_name) FROM organizations tor WHERE tor.id = r.subject_id)
+    WHEN 'agent' THEN (SELECT tu.display_name FROM agents ta LEFT JOIN users tu ON tu.id = ta.user_id WHERE ta.id = r.subject_id)
+  END, (SELECT ro.name FROM organizations ro WHERE ro.id = r.organization_id))`;
+const REVIEW_FILTERS = [
+  { type: "in", key: "status", column: "r.status" },
+  { type: "in", key: "targetType", column: "r.subject_type" },
+  // The stars the Rating column draws.
+  { type: "in", key: "rating", column: "ROUND(r.rating)", map: (value) => (/^[1-5]$/.test(value) ? Number(value) : null) },
+  { type: "text", key: "review", columns: ["CONCAT('RV-', LPAD(r.id, 6, '0'))", "r.title", "r.body"] },
+  // The Review column's number box ("RV-" fixed): the reference is built from the id.
+  referenceNumber("reviewNumber", "CONCAT('RV-', LPAD(r.id, 6, '0'))", "RV-"),
+  { type: "text", key: "reviewer", columns: ["r.author_name", "r.author_email"] },
+  { type: "text", key: "reviewFor", columns: [REVIEW_TARGET_TITLE] },
+  { type: "date", keys: ["dateFrom", "dateTo"], column: "r.created_at" },
+];
+
+export async function listAdminReviews({ status = "all", search = "", targetType = "", rating = "", sort = "newest", page = 1, pageSize = 10, ...columnFilters } = {}) {
   const conditions = ["r.deleted_at IS NULL"];
   const params = [];
   // The Reviews screen has always shown a "Sort by" control; it was never read here.
   const order = sort === "oldest" ? "ASC" : "DESC";
-  if (status !== "all") {
-    conditions.push("r.status = ?");
-    params.push(status);
-  }
-  if (targetType) {
-    conditions.push("r.subject_type = ?");
-    params.push(targetType);
-  }
-  if (rating) {
-    conditions.push("r.rating = ?");
-    params.push(Number(rating));
-  }
+  // Status, target type and rating: one value from the tabs and toolbar, several from the
+  // header filters.
+  applyColumnFilters(REVIEW_FILTERS, { ...columnFilters, status, targetType, rating }, conditions, params);
   if (search) {
     conditions.push("(r.title LIKE ? OR r.body LIKE ? OR r.author_name LIKE ?)");
     params.push(`%${search}%`, `%${search}%`, `%${search}%`);
@@ -454,7 +499,7 @@ export async function listAdminReviews({ status = "all", search = "", targetType
          LEFT JOIN organizations o ON o.id = r.organization_id
          LEFT JOIN users mu ON mu.id = r.moderated_by_user_id
          LEFT JOIN review_responses rr ON rr.review_id = r.id
-         ${where} ORDER BY r.created_at ${order} LIMIT ${safeSize} OFFSET ${offset}`,
+         ${where} ORDER BY r.created_at ${order}, r.id ${order} LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(`SELECT COUNT(*) FROM reviews r ${where}`, params),
@@ -625,38 +670,47 @@ export async function adminReviewerHistory(reviewerId, fallback = {}) {
 /* Reports                                                                     */
 /* -------------------------------------------------------------------------- */
 
-export async function listAdminReports({ status = "all", search = "", priority = "", entityType = "", reason = "", from = "", to = "", sort = "newest", page = 1, pageSize = 10 } = {}) {
+/** What the Reported Item column names: the live subject, else its filing-time snapshot. */
+const REPORT_SUBJECT_TITLE = `COALESCE(CASE r.subject_type
+    WHEN 'listing' THEN (SELECT sl.title FROM listings sl WHERE sl.id = r.subject_id)
+    WHEN 'organization' THEN (SELECT COALESCE(so.name, so.legal_name) FROM organizations so WHERE so.id = r.subject_id)
+    WHEN 'review' THEN (SELECT COALESCE(NULLIF(sr.title, ''), CONCAT('RV-', LPAD(sr.id, 6, '0'))) FROM reviews sr WHERE sr.id = r.subject_id)
+  END, JSON_UNQUOTE(JSON_EXTRACT(r.subject_snapshot, '$.title')))`;
+const REPORT_FILTERS = [
+  { type: "in", key: "status", column: "r.status" },
+  { type: "in", key: "priority", column: "r.priority" },
+  { type: "in", key: "entityType", column: "r.subject_type" },
+  { type: "in", key: "reason", column: "rr.code" },
+  { type: "text", key: "report", columns: ["r.reference", "rr.name"] },
+  // The Report column's number box ("RPT-" fixed).
+  referenceNumber("reportNumber", "r.reference", "RPT-"),
+  { type: "text", key: "item", columns: [REPORT_SUBJECT_TITLE] },
+  { type: "text", key: "reporter", columns: ["(SELECT fu.display_name FROM users fu WHERE fu.id = r.reporter_user_id)", "r.reporter_email"] },
+  {
+    // Assigned admin by public id, or "unassigned".
+    type: "custom", key: "assignee",
+    build: (value) => {
+      const values = csvList(value);
+      const ids = values.filter((item) => item !== "unassigned");
+      const parts = [];
+      if (values.includes("unassigned")) parts.push("r.assigned_to_user_id IS NULL");
+      if (ids.length) parts.push(`r.assigned_to_user_id IN (SELECT fa.id FROM users fa WHERE fa.public_id IN (${ids.map(() => "?").join(", ")}))`);
+      return parts.length ? { sql: parts.join(" OR "), params: ids } : null;
+    },
+  },
+  { type: "date", keys: ["from", "to"], column: "r.created_at" },
+  { type: "date", keys: ["updatedFrom", "updatedTo"], column: "r.updated_at" },
+];
+
+export async function listAdminReports({ status = "all", search = "", priority = "", entityType = "", reason = "", from = "", to = "", sort = "newest", page = 1, pageSize = 10, ...columnFilters } = {}) {
   const conditions = [];
   const params = [];
-  if (status !== "all") {
-    conditions.push("r.status = ?");
-    params.push(status);
-  }
-  if (priority) {
-    conditions.push("r.priority = ?");
-    params.push(priority);
-  }
-  if (entityType) {
-    conditions.push("r.subject_type = ?");
-    params.push(entityType);
-  }
+  // Status, priority, type, reason and dates: one value from the tabs and toolbar, several from
+  // the header filters.
+  applyColumnFilters(REPORT_FILTERS, { ...columnFilters, status, priority, entityType, reason, from, to }, conditions, params);
   if (search) {
     conditions.push("(r.reference LIKE ? OR r.details LIKE ? OR r.reporter_email LIKE ?)");
     params.push(`%${search}%`, `%${search}%`, `%${search}%`);
-  }
-  // The Reports screen offered Reason, Date Range and Sort controls that were sent in
-  // the URL and then ignored here, so every one of them was a filter that did nothing.
-  if (reason) {
-    conditions.push("rr.code = ?");
-    params.push(reason);
-  }
-  if (from) {
-    conditions.push("r.created_at >= ?");
-    params.push(`${from} 00:00:00`);
-  }
-  if (to) {
-    conditions.push("r.created_at <= ?");
-    params.push(`${to} 23:59:59`);
   }
 
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -675,7 +729,7 @@ export async function listAdminReports({ status = "all", search = "", priority =
          LEFT JOIN report_reasons rr ON rr.id = r.reason_id
          LEFT JOIN users au ON au.id = r.assigned_to_user_id
          LEFT JOIN users ru ON ru.id = r.reporter_user_id
-         ${where} ORDER BY r.created_at ${order} LIMIT ${safeSize} OFFSET ${offset}`,
+         ${where} ORDER BY r.created_at ${order}, r.id ${order} LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(`SELECT COUNT(*) FROM reports r LEFT JOIN report_reasons rr ON rr.id = r.reason_id ${where}`, params),
@@ -735,6 +789,11 @@ export async function listAdminReports({ status = "all", search = "", priority =
       statuses: ["new", "triaged", "in_review", "escalated", "resolved", "dismissed", "duplicate"],
       priorities: ["low", "normal", "high", "urgent"],
       reasons: reasons.map((row) => ({ value: row.code, label: row.name })),
+      // Everyone a report is assigned to, for the Assigned To header filter.
+      assignees: (await query(
+        `SELECT DISTINCT u.public_id, u.display_name FROM reports r JOIN users u ON u.id = r.assigned_to_user_id
+          ORDER BY u.display_name LIMIT 200`
+      )).map((row) => ({ value: row.public_id, label: row.display_name })),
       // `types` and `categories` used to be published here too. A report has one
       // subject dimension — `subject_type` — and no category at all, so the screen's
       // "Report Type" and "Category" selects could never filter anything.
@@ -769,6 +828,8 @@ export async function listAdminReports({ status = "all", search = "", priority =
  * read from the live row so a renamed listing is not reported under its old name.
  * An `agent` subject has no admin detail route, so it stays plain text.
  */
+const ADMIN_LISTING_CATEGORIES = new Set(["real-estate", "cars", "yachts", "jets", "helicopters", "watches"]);
+
 async function resolveReportSubjects(rows) {
   const idsOf = (type) => [...new Set(rows.filter((row) => row.subject_type === type && row.subject_id).map((row) => String(row.subject_id)))];
   const placeholders = (ids) => ids.map(() => "?").join(", ");
@@ -778,7 +839,14 @@ async function resolveReportSubjects(rows) {
   const listingIds = idsOf("listing");
   if (listingIds.length) {
     const listings = await query(
-      `SELECT l.id, l.reference, l.title, c.slug AS root_slug
+      `SELECT l.id, l.reference, l.title, c.slug AS root_slug,
+              -- The same picture the admin listings table shows: the cover, else the first gallery image.
+              COALESCE(
+                l.cover_image_url,
+                (SELECT lm.url FROM listing_media lm
+                   WHERE lm.listing_id = l.id AND lm.media_type = 'image'
+                   ORDER BY lm.is_cover DESC, lm.sort_order ASC, lm.id ASC LIMIT 1)
+              ) AS cover_image_url
          FROM listings l
          LEFT JOIN categories c ON c.id = COALESCE(l.root_category_id, l.category_id)
         WHERE l.id IN (${placeholders(listingIds)})`,
@@ -788,8 +856,9 @@ async function resolveReportSubjects(rows) {
       remember("listing", String(listing.id), {
         title: listing.title,
         reference: listing.reference,
-        // Only Real Estate has an admin listing detail route today.
-        href: listing.root_slug === "real-estate" && listing.reference ? `/admin/listings/real-estate/${listing.reference}` : null,
+        image: listing.cover_image_url || null,
+        // Every listing category has an admin detail route (/admin/listings/<category>/<reference>).
+        href: ADMIN_LISTING_CATEGORIES.has(listing.root_slug) && listing.reference ? `/admin/listings/${listing.root_slug}/${listing.reference}` : null,
       });
     }
   }
@@ -797,7 +866,7 @@ async function resolveReportSubjects(rows) {
   const organizationIds = idsOf("organization");
   if (organizationIds.length) {
     const organizations = await query(
-      `SELECT o.id, o.public_id, o.name, o.legal_name
+      `SELECT o.id, o.public_id, o.name, o.legal_name, o.logo_url
          FROM organizations o WHERE o.id IN (${placeholders(organizationIds)})`,
       organizationIds
     );
@@ -805,6 +874,7 @@ async function resolveReportSubjects(rows) {
       remember("organization", String(organization.id), {
         title: organization.name || organization.legal_name,
         reference: organization.public_id,
+        image: organization.logo_url || null,
         href: `/admin/companies/${organization.public_id}`,
       });
     }
@@ -844,6 +914,8 @@ function reportEntity(row, subjects) {
     title: live?.title ?? snapshot?.title ?? null,
     reference: live?.reference ?? snapshot?.reference ?? null,
     href: live?.href ?? null,
+    // A listing's cover photo or a company's logo; the table shows the type's letter without one.
+    image: live?.image ?? null,
     // True when the subject row is gone; the report still has to be reviewable.
     removed: Boolean(row.subject_id) && !live,
   };

@@ -118,6 +118,17 @@ export async function resolveLocation(value, { type } = {}) {
   );
 }
 
+/** Several locations by id, as entities with their ancestor chain. Unknown ids are skipped. */
+export async function getLocationsByIds(ids = []) {
+  const numeric = [...new Set(ids.map(Number).filter((id) => Number.isInteger(id) && id > 0))].slice(0, 100);
+  if (!numeric.length) return [];
+  const rows = await query(
+    `SELECT ${SELECT_COLUMNS} ${FROM_CLAUSE} WHERE l.id IN (${numeric.map(() => "?").join(", ")}) AND l.deleted_at IS NULL`,
+    numeric
+  );
+  return rows.map(toEntity);
+}
+
 export async function getLocationById(id) {
   return queryOne(`SELECT ${SELECT_COLUMNS} ${FROM_CLAUSE} WHERE l.id = ? AND l.deleted_at IS NULL`, [Number(id)]);
 }
@@ -126,7 +137,7 @@ export async function getLocationById(id) {
  * Typeahead over 161k rows. Never returns the whole tree: the caller supplies a
  * query or a parent, and the limit is capped.
  */
-export async function searchLocations({ q, types = [], parentId = null, ancestorId = null, countryId = null, preferCountryId = null, categoryRootId = null, limit = 20, onlyWithListings = false } = {}) {
+export async function searchLocations({ q, types = [], parentId = null, ancestorId = null, countryId = null, preferCountryId = null, categoryRootId = null, limit = 20, onlyWithListings = false, rankBy = "listings" } = {}) {
   const conditions = ["l.deleted_at IS NULL", "l.status = 'active'", "l.is_searchable = 1"];
   const params = [];
 
@@ -157,6 +168,8 @@ export async function searchLocations({ q, types = [], parentId = null, ancestor
     params.push(`${q}%`, `${q}%`, `${q}%`);
     ranking = "l.active_listing_count DESC, l.is_core_market DESC, CHAR_LENGTH(l.name) ASC, l.name ASC";
   }
+  // The admin filters rank places by the place itself, never by what is listed there.
+  if (rankBy === "place") ranking = q ? "l.is_core_market DESC, CHAR_LENGTH(l.name) ASC, l.name ASC" : "l.depth ASC, l.is_core_market DESC, l.name ASC";
 
   const safeLimit = Math.min(50, Math.max(1, Number(limit) || 20));
 
@@ -223,7 +236,11 @@ export async function searchLocations({ q, types = [], parentId = null, ancestor
 }
 
 /** Wider search used when a prefix match returns too little. */
-export async function searchLocationsContains({ q, types = [], countryId = null, limit = 20 }) {
+/**
+ * `rankBy: "place"` orders by the place itself (core markets, tier, name) rather than by how many
+ * listings it holds — the admin table filters offer the whole tree, never what is listed.
+ */
+export async function searchLocationsContains({ q, types = [], countryId = null, limit = 20, rankBy = "listings" }) {
   if (!q) return [];
   const levels = types.flatMap((type) => TYPE_TO_LEVELS[type] || [type]);
   const params = [`%${q}%`, `%${q}%`];
@@ -242,7 +259,7 @@ export async function searchLocationsContains({ q, types = [], countryId = null,
     `SELECT ${SELECT_COLUMNS} ${FROM_CLAUSE}
       WHERE l.deleted_at IS NULL AND l.status = 'active' AND l.is_searchable = 1
         AND (l.name LIKE ? OR l.name_ascii LIKE ?)${levelFilter}${countryFilter}
-      ORDER BY l.active_listing_count DESC, l.is_core_market DESC, CHAR_LENGTH(l.name) ASC
+      ORDER BY ${rankBy === "place" ? "l.is_core_market DESC, CHAR_LENGTH(l.name) ASC, l.depth ASC" : "l.active_listing_count DESC, l.is_core_market DESC, CHAR_LENGTH(l.name) ASC"}
       LIMIT ${safeLimit}`,
     params
   );

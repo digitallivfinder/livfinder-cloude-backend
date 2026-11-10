@@ -1,4 +1,6 @@
 import { publishBookingChange } from "../calendar/calendar.service.js";
+import { applyColumnFilters, csvList, locationAtAnyTier } from "../../utils/columnFilters.js";
+import { lookupOptions } from "../admin/admin.lookup.js";
 import { Router } from "express";
 import { z } from "zod";
 import { asyncHandler } from "../../middleware/errors.js";
@@ -36,6 +38,9 @@ import { createInvoiceCheckout } from "../system/payments.service.js";
 import env from "../../config/env.js";
 import { API_SCOPES } from "../../middleware/apiClient.js";
 import * as importsRepo from "../imports/imports.repository.js";
+import { loadOptionSets } from "../options/optionSets.js";
+import { rootIdFor } from "../admin/admin.shared.js";
+import "../options/filterOptionSets.js";
 
 const router = Router();
 
@@ -66,7 +71,77 @@ const listQuery = z
     filter: z.string().trim().max(30).optional(),
     conversationId: z.string().trim().max(64).optional(),
   })
-  .partial();
+  .partial()
+  // Table header filters add their own keys per list; each list function reads only the keys its
+  // filter spec names and binds every value, so any other key is inert.
+  .catchall(z.string().trim().max(400));
+
+/* -------------------------------------------------------------------------- */
+/* Header filter dropdowns                                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The option lists behind the portal's table header filters, by set name (see modules/options).
+ * Only sets registered for the portal are answered.
+ */
+router.get(
+  "/options",
+  validate({ query: z.object({ sets: z.string().trim().min(1).max(2000) }) }),
+  asyncHandler(async (req, res) => res.json({ data: await loadOptionSets(csvList(q(req).sets, 60), "portal") }))
+);
+
+/**
+ * Search-as-you-type options for the portal's table header filters. Places are public data (the
+ * same search the admin uses, with each place's full path); agents are only the caller's own
+ * company's. `{ value, label, description, image }` per option, as the filter component reads.
+ */
+router.get(
+  "/lookup/:kind",
+  validate({
+    params: z.object({ kind: z.enum(["location", "agent", "listing"]) }),
+    query: z.object({ q: z.string().trim().max(100).optional(), ids: z.string().trim().max(4000).optional(), types: z.string().trim().max(100).optional() }),
+  }),
+  asyncHandler(async (req, res) => {
+    const { q: text = "", ids = "", types = "" } = q(req) || {};
+    if (req.params.kind === "location") return res.json({ data: await lookupOptions("location", { q: text, ids, types }) });
+    if (req.params.kind === "listing") {
+      // This account's own listings (or developments), by title or reference; `types` keeps to one category.
+      const { accountId, organizationId } = scope(req);
+      const wanted = csvList(ids, 100);
+      const category = csvList(types)[0] ?? "";
+      if (category === "real-estate-developments") {
+        const rows = await query(
+          `SELECT p.public_id, p.name, p.cover_image_url FROM projects p
+            WHERE p.organization_id = ? AND p.deleted_at IS NULL
+              ${wanted.length ? `AND p.public_id IN (${wanted.map(() => "?").join(", ")})` : text ? "AND p.name LIKE ?" : ""}
+            ORDER BY p.created_at DESC LIMIT 30`,
+          [organizationId ?? 0, ...(wanted.length ? wanted : text ? [`%${text}%`] : [])]
+        );
+        return res.json({ data: rows.map((row) => ({ value: row.public_id, label: row.name, description: "Development", image: row.cover_image_url })) });
+      }
+      const rootId = category ? rootIdFor(category) : null;
+      const rows = await query(
+        `SELECT l.public_id, l.title, l.reference, l.cover_image_url FROM listings l
+          WHERE l.account_id = ? AND l.deleted_at IS NULL ${rootId ? "AND l.root_category_id = ?" : ""}
+            ${wanted.length ? `AND l.public_id IN (${wanted.map(() => "?").join(", ")})` : text ? "AND (l.title LIKE ? OR l.reference LIKE ?)" : ""}
+          ORDER BY l.created_at DESC LIMIT 30`,
+        [accountId, ...(rootId ? [rootId] : []), ...(wanted.length ? wanted : text ? [`%${text}%`, `%${text}%`] : [])]
+      );
+      return res.json({ data: rows.map((row) => ({ value: row.public_id, label: row.title, description: row.reference, image: row.cover_image_url })) });
+    }
+    const { organizationId } = scope(req);
+    if (!organizationId) return res.json({ data: [] });
+    const wanted = csvList(ids, 100);
+    const rows = await query(
+      `SELECT a.public_id, a.display_name, a.photo_url, a.title FROM agents a
+        WHERE a.organization_id = ? AND a.deleted_at IS NULL
+          ${wanted.length ? `AND a.public_id IN (${wanted.map(() => "?").join(", ")})` : text ? "AND a.display_name LIKE ?" : ""}
+        ORDER BY a.display_name ASC LIMIT 30`,
+      [organizationId, ...(wanted.length ? wanted : text ? [`%${text}%`] : [])]
+    );
+    return res.json({ data: rows.map((row) => ({ value: row.public_id, label: row.display_name, description: row.title || "Agent", image: row.photo_url })) });
+  })
+);
 
 /* -------------------------------------------------------------------------- */
 /* Dashboard                                                                   */
@@ -92,14 +167,17 @@ router.get(
     const { accountId, agentId } = scope(req);
     // An agent-role member sees only their own inventory.
     const restrictToAgent = req.auth.activeMembership?.role === "agent" ? agentId : null;
+    const { status, category, search, sort, page, pageSize, ...columnFilters } = params;
     const result = await portalRepo.listAccountListings({
+      // Header filters first: the account and agent scope below always win.
+      ...columnFilters,
       accountId,
-      status: params.status || "all",
-      category: params.category || "all",
-      search: params.search || "",
-      sort: params.sort || "newest",
-      page: params.page || 1,
-      pageSize: params.pageSize || 5,
+      status: status || "all",
+      category: category || "all",
+      search: search || "",
+      sort: sort || "newest",
+      page: page || 1,
+      pageSize: pageSize || 5,
       agentId: restrictToAgent,
     });
     return res.json({
@@ -974,12 +1052,18 @@ router.patch(
 
 /* Listing imports pushed through this company's API keys, with the result for every listing. */
 
-const importListQuery = z.object({
-  page: z.coerce.number().int().min(1).max(10_000).optional(),
-  pageSize: z.coerce.number().int().min(1).max(100).optional(),
-  status: z.enum(["queued", "running", "completed", "partial", "failed"]).optional(),
-  type: z.enum(["single", "bulk"]).optional(),
-});
+// One value, or several comma-separated from the imports table's header filters.
+const oneOrMore = (allowed) =>
+  z.string().trim().max(200).refine((value) => value.split(",").every((part) => allowed.includes(part.trim())), "Unknown value.");
+const importListQuery = z
+  .object({
+    page: z.coerce.number().int().min(1).max(10_000).optional(),
+    pageSize: z.coerce.number().int().min(1).max(100).optional(),
+    status: oneOrMore(["queued", "running", "completed", "partial", "failed"]).optional(),
+    type: oneOrMore(["single", "bulk", "file"]).optional(),
+  })
+  // Header filter keys; the imports repository reads only those its filter spec names.
+  .catchall(z.string().trim().max(400));
 
 router.get(
   "/integrations/imports",
@@ -988,7 +1072,7 @@ router.get(
   asyncHandler(async (req, res) => {
     // A company's runs by organization; an individual's by account.
     const organizationId = req.auth?.activeMembership?.organization_id ?? null;
-    const { page = 1, pageSize = 20, status, type } = q(req);
+    const { page = 1, pageSize = 20, status, type, ...columnFilters } = q(req);
     const result = await importsRepo.listImports({
       organizationId,
       accountId: organizationId ? null : requireAccountId(req),
@@ -996,6 +1080,7 @@ router.get(
       type,
       page,
       pageSize,
+      columnFilters,
     });
     return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
   })
@@ -1021,14 +1106,14 @@ router.get(
     query: z.object({
       page: z.coerce.number().int().min(1).max(10_000).optional(),
       pageSize: z.coerce.number().int().min(1).max(100).optional(),
-      status: z.enum(["failed", "warning", "succeeded", "queued"]).optional(),
+      status: oneOrMore(["failed", "warning", "succeeded", "queued"]).optional(),
       search: z.string().trim().max(191).optional(),
-    }),
+    }).catchall(z.string().trim().max(400)),
   }),
   asyncHandler(async (req, res) => {
     const row = await ownImport(req);
-    const { page = 1, pageSize = 50, status, search } = q(req);
-    const result = await importsRepo.listImportItems(row.id, { status, search, page, pageSize });
+    const { page = 1, pageSize = 50, status, search, ...columnFilters } = q(req);
+    const result = await importsRepo.listImportItems(row.id, { status, search, page, pageSize, columnFilters });
     return res.json(listResponse(result.rows, { page, pageSize, total: result.total }));
   })
 );
@@ -1514,7 +1599,7 @@ router.get(
   validate({ query: listQuery }),
   asyncHandler(async (req, res) => {
     const organizationId = requireOrganizationId(req);
-    const { status = "all", search, sort, page, pageSize } = q(req);
+    const { status = "all", search, sort, page, pageSize, ...columnFilters } = q(req);
     const conditions = ["p.organization_id = ?", "p.deleted_at IS NULL"];
     const params = [organizationId];
     if (status && status !== "all") {
@@ -1533,6 +1618,15 @@ router.get(
       conditions.push("(p.name LIKE ? OR p.slug LIKE ?)");
       params.push(`%${term}%`, `%${term}%`);
     }
+    // The developments table shares the listings table's header filters.
+    applyColumnFilters([
+      { type: "text", key: "title", columns: ["p.name", "p.slug", "p.public_id"] },
+      { type: "in", key: "statusIn", column: "p.moderation_status", map: (value) => MODERATION_BY_TAB[value] ?? (Object.values(MODERATION_BY_TAB).includes(value) ? value : null) },
+      { type: "range", keys: ["priceMin", "priceMax"], column: "p.min_price", decimal: true },
+      locationAtAnyTier("locationId", "p"),
+      { type: "range", keys: ["inquiriesMin", "inquiriesMax"], column: "(SELECT COUNT(*) FROM inquiries fi WHERE fi.project_id = p.id)" },
+      { type: "date", keys: ["updatedFrom", "updatedTo"], column: "p.updated_at" },
+    ], columnFilters, conditions, params);
     const where = conditions.join(" AND ");
     const size = Math.min(Math.max(Number(pageSize) || 12, 1), 100);
     const current = Math.max(Number(page) || 1, 1);

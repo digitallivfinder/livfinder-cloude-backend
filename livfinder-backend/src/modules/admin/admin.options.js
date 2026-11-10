@@ -24,7 +24,7 @@ async function locationTier(level, { parentId = null, limit = 500 } = {}) {
        FROM locations
       WHERE level = ? AND deleted_at IS NULL AND status = 'active'
         ${parentId ? "AND parent_id = ?" : ""}
-      ORDER BY active_listing_count DESC, name ASC
+      ORDER BY is_core_market DESC, name ASC
       LIMIT ${Number(limit)}`,
     parentId ? [level, parentId] : [level]
   );
@@ -39,10 +39,11 @@ export const subCommunities = (parentId) => locationTier("sub_community", { pare
 
 /** A flat, mixed-tier location list for screens with a single Location select. */
 export async function locations(limit = 300) {
+  // The location tree itself, by tier and name — not the places that happen to hold listings.
   const rows = await query(
     `SELECT id, name, level FROM locations
-      WHERE deleted_at IS NULL AND status = 'active' AND active_listing_count > 0
-      ORDER BY active_listing_count DESC LIMIT ${Number(limit)}`
+      WHERE deleted_at IS NULL AND status = 'active'
+      ORDER BY depth ASC, is_core_market DESC, name ASC LIMIT ${Number(limit)}`
   );
   return rows.map((row) => ({ ...pair(String(row.id), row.name), level: row.level }));
 }
@@ -124,16 +125,10 @@ export async function developers() {
   // against and what the public `?developer=` parameter carries. It used to be
   // the numeric brand id, so choosing a developer filtered on an id against a
   // slug column and returned nothing at all.
-  const rows = await query(
-    `SELECT DISTINCT b.id, b.name, b.slug FROM brands b
-       JOIN projects p ON p.developer_brand_id = b.id AND p.deleted_at IS NULL
-      WHERE b.deleted_at IS NULL ORDER BY b.name ASC LIMIT 300`
+  // Every developer brand, not only those with a project.
+  const source = await query(
+    "SELECT id, name, slug FROM brands WHERE kind = 'property_developer' AND deleted_at IS NULL AND is_active = 1 ORDER BY name ASC LIMIT 400"
   ).catch(() => []);
-  const source = rows.length
-    ? rows
-    : await query(
-        "SELECT id, name, slug FROM brands WHERE kind = 'property_developer' AND deleted_at IS NULL AND is_active = 1 ORDER BY name ASC LIMIT 400"
-      ).catch(() => []);
   return source.map((row) => ({ ...pair(row.slug, row.name), id: String(row.id), slug: row.slug }));
 }
 
@@ -177,13 +172,15 @@ export async function roleOptions() {
   return rows.map((row) => ({ ...pair(String(row.id), row.name), code: row.code }));
 }
 
+/** Staff who can upload to the library (users with a platform role), by public id. Not read from the files. */
 export async function uploaders() {
   const rows = await query(
-    `SELECT DISTINCT u.id, u.display_name FROM media_assets m
-       JOIN users u ON u.id = m.uploaded_by_user_id
-      WHERE m.deleted_at IS NULL ORDER BY u.display_name ASC LIMIT 200`
+    `SELECT u.public_id, u.display_name FROM users u
+      WHERE u.deleted_at IS NULL
+        AND EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id AND r.scope = 'platform' WHERE ur.user_id = u.id)
+      ORDER BY u.display_name ASC LIMIT 200`
   ).catch(() => []);
-  return rows.map((row) => pair(String(row.id), row.display_name));
+  return rows.map((row) => pair(row.public_id, row.display_name));
 }
 
 export async function reportReasons() {

@@ -1,6 +1,6 @@
 import {
   query, queryOne, queryValue, adminPagination, adminList, int, num, bool, isoDate,
-  frontendCategoryId, categoryIdsFor, rootIdFor,
+  frontendCategoryId, categoryIdsFor, rootIdFor, applyColumnFilters, csvList, referenceNumber,
 } from "./admin.shared.js";
 import * as options from "./admin.options.js";
 import { adminListingStatus } from "./admin.dashboard.js";
@@ -27,6 +27,11 @@ export function screenLeadStatus(status, stageType) {
   return "new";
 }
 
+/** The Status column's values, in the order the filter lists them, with their labels. */
+export const LEAD_SCREEN_STATUSES = Object.freeze([
+  ["new", "New"], ["qualified", "Qualified"], ["follow-up", "Follow-up"], ["viewing", "Viewing"], ["closed", "Closed"], ["lost", "Lost"],
+]);
+
 const SCREEN_STATUS_FILTER = {
   new: "l.status = 'open' AND st.stage_type = 'new'",
   qualified: "l.status = 'open' AND st.stage_type = 'qualified'",
@@ -35,6 +40,46 @@ const SCREEN_STATUS_FILTER = {
   closed: "l.status IN ('won','lost','disqualified')",
   lost: "l.status = 'lost'",
 };
+
+/**
+ * Header filters on the admin leads tables. `stage` is the Status column exactly as each row shows
+ * it (see `screenLeadStatus`); the tabs keep their own `status` grouping, where Closed includes Lost.
+ */
+const OPEN_LEAD = "(l.status = 'open' OR l.status IS NULL OR l.status = '')";
+const LEAD_COLUMN_FILTERS = [
+  { type: "text", key: "lead", columns: ["l.reference", "l.public_id"] },
+  // The Lead filter's number: "786" finds LD-786 and LD-00000786 (some references are zero-padded).
+  referenceNumber("leadNumber", "l.reference", "LD-"),
+  {
+    // Property dropdown: "listing:<public id>" or "project:<public id>" (a development lead).
+    type: "custom", key: "propertyId",
+    build: (value) => {
+      const values = csvList(value);
+      const listings = values.filter((item) => item.startsWith("listing:")).map((item) => item.slice(8));
+      const projects = values.filter((item) => item.startsWith("project:")).map((item) => item.slice(8));
+      const parts = [];
+      if (listings.length) parts.push(`li.public_id IN (${listings.map(() => "?").join(", ")})`);
+      if (projects.length) parts.push(`(li.id IS NULL AND pj.public_id IN (${projects.map(() => "?").join(", ")}))`);
+      return parts.length ? { sql: parts.join(" OR "), params: [...listings, ...projects] } : { sql: "1 = 0" };
+    },
+  },
+  { type: "text", key: "contact", columns: ["COALESCE(c.display_name, l.name)", "c.first_name", "c.last_name", "CONCAT_WS(' ', c.first_name, c.last_name)", "c.primary_email", "c.primary_phone_e164", "l.email"] },
+  // The Property column shows the listing when there is one, else the development.
+  { type: "text", key: "propertyName", columns: ["CASE WHEN li.id IS NOT NULL THEN CONCAT_WS(' ', li.title, li.reference) ELSE pj.name END"] },
+  {
+    type: "in", key: "stage",
+    cases: {
+      new: `${OPEN_LEAD} AND (st.stage_type IS NULL OR st.stage_type NOT IN ('qualified','contacted','nurturing','proposal','negotiation'))`,
+      qualified: `${OPEN_LEAD} AND st.stage_type = 'qualified'`,
+      "follow-up": `${OPEN_LEAD} AND st.stage_type IN ('contacted','nurturing')`,
+      viewing: `${OPEN_LEAD} AND st.stage_type IN ('proposal','negotiation')`,
+      closed: `NOT ${OPEN_LEAD} AND l.status <> 'lost'`,
+      lost: "l.status = 'lost'",
+    },
+  },
+  { type: "date", keys: ["activeFrom", "activeTo"], column: "l.last_activity_at" },
+  { type: "date", keys: ["from", "to"], column: "l.created_at" },
+];
 
 export async function listAdminLeads({
   category = "real-estate",
@@ -48,6 +93,7 @@ export async function listAdminLeads({
   sort = "newest",
   page = 1,
   pageSize = 10,
+  ...columnFilters
 } = {}) {
   const rootId = rootIdFor(category);
   const conditions = ["l.deleted_at IS NULL"];
@@ -65,18 +111,13 @@ export async function listAdminLeads({
       params.push(status);
     }
   }
-  if (inquiryType) {
-    conditions.push("l.intent = ?");
-    params.push(inquiryType);
-  }
-  if (source) {
-    conditions.push("src.code = ?");
-    params.push(source);
-  }
-  if (agent) {
-    conditions.push("ag.public_id = ?");
-    params.push(agent);
-  }
+  // One value from the old selects, several from the header filters.
+  applyColumnFilters([
+    { type: "in", key: "inquiryType", column: "l.intent" },
+    { type: "in", key: "source", column: "src.code" },
+    { type: "in", key: "agent", column: "ag.public_id", cases: { unassigned: "l.owner_agent_id IS NULL" } },
+  ], { inquiryType, source, agent }, conditions, params);
+  applyColumnFilters(LEAD_COLUMN_FILTERS, columnFilters, conditions, params);
   if (property) {
     conditions.push("(li.public_id = ? OR pj.public_id = ?)");
     params.push(property, property);
@@ -92,7 +133,7 @@ export async function listAdminLeads({
 
   const where = `WHERE ${conditions.join(" AND ")}`;
   const { page: safePage, pageSize: safeSize, offset } = adminPagination({ page, pageSize });
-  const orderBy = sort === "oldest" ? "l.created_at ASC" : "l.created_at DESC";
+  const orderBy = sort === "oldest" ? "l.created_at ASC, l.id ASC" : "l.created_at DESC, l.id DESC";
 
   const joins = `
      LEFT JOIN crm_contacts c ON c.id = l.contact_id
@@ -244,30 +285,25 @@ async function leadSummary(rootId) {
 }
 
 async function leadOptions(rootId) {
-  const [sources, stages, agents, communities] = await Promise.all([
+  const [sources, stages, agents] = await Promise.all([
     query("SELECT code, name FROM lead_sources WHERE is_active = 1 ORDER BY name LIMIT 100").catch(() => []),
     query("SELECT id, name FROM lead_pipeline_stages ORDER BY sort_order LIMIT 100").catch(() => []),
+    // Agents who can take the category's leads: their company may work the category, or it is
+    // one of their own specialties. Not read from the leads already assigned.
     query(
-      `SELECT DISTINCT ag.public_id, ag.display_name FROM agents ag
-         JOIN leads l ON l.owner_agent_id = ag.id
-        WHERE ag.deleted_at IS NULL${rootId ? " AND l.root_category_id = ?" : ""}
-        ORDER BY ag.display_name LIMIT 200`,
-      rootId ? [rootId] : []
-    ),
-    query(
-      `SELECT DISTINCT cm.slug, cm.name FROM locations cm
-         JOIN listings li ON li.community_id = cm.id
-         JOIN leads l ON l.primary_listing_id = li.id
-        WHERE cm.deleted_at IS NULL${rootId ? " AND l.root_category_id = ?" : ""}
-        ORDER BY cm.name LIMIT 200`,
-      rootId ? [rootId] : []
+      `SELECT ag.public_id, ag.display_name FROM agents ag
+         LEFT JOIN organizations ao ON ao.id = ag.organization_id
+        WHERE ag.deleted_at IS NULL
+          ${rootId ? `AND (EXISTS (SELECT 1 FROM account_category_access ca WHERE ca.account_id = ao.account_id AND ca.category_id = ? AND ca.status = 'approved')
+               OR EXISTS (SELECT 1 FROM agent_specialties sp JOIN categories sc ON sc.id = sp.category_id WHERE sp.agent_id = ag.id AND COALESCE(sc.root_category_id, sc.id) = ?))` : ""}
+        ORDER BY ag.display_name LIMIT 500`,
+      rootId ? [rootId, rootId] : []
     ),
   ]);
   return {
     sources: sources.map((row) => ({ value: row.code, label: row.name })),
     stages: stages.map((row) => ({ value: String(row.id), label: row.name })),
     agents: agents.map((row) => ({ id: row.public_id, value: row.public_id, label: row.display_name, name: row.display_name })),
-    communities: communities.map((row) => row.slug),
   };
 }
 
@@ -554,6 +590,37 @@ function relativeShort(value) {
 /* Contacts                                                                    */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Header filters on the admin contacts tables (the all-contacts screen and the per-category ones
+ * show slightly different columns over the same rows). Lead counts cover every category, as the
+ * Leads / Listings columns do.
+ */
+const CONTACT_LEADS = "FROM leads fl WHERE fl.contact_id = c.id AND fl.deleted_at IS NULL";
+const CONTACT_COLUMN_FILTERS = [
+  { type: "text", key: "contact", columns: ["c.display_name", "c.first_name", "c.last_name", "CONCAT_WS(' ', c.first_name, c.last_name)", "CONCAT('CT-', LPAD(c.id, 6, '0'))", "c.public_id"] },
+  { type: "text", key: "phone", columns: ["c.primary_phone_e164"] },
+  { type: "text", key: "email", columns: ["c.primary_email"] },
+  { type: "text", key: "contactInfo", columns: ["c.primary_email", "c.primary_phone_e164"] },
+  { type: "in", key: "contactType", column: "c.contact_type" },
+  {
+    // The source options carry the lead source's id; older links carry its code.
+    type: "custom", key: "source",
+    build: (value) => {
+      const values = csvList(value);
+      if (!values.length) return null;
+      const marks = values.map(() => "?").join(", ");
+      return { sql: `src.id IN (${marks}) OR src.code IN (${marks})`, params: [...values, ...values] };
+    },
+  },
+  { type: "in", key: "stage", column: "c.lifecycle_stage" },
+  { type: "range", keys: ["leadsMin", "leadsMax"], column: "c.lead_count" },
+  { type: "range", keys: ["activeLeadsMin", "activeLeadsMax"], column: `(SELECT COUNT(*) ${CONTACT_LEADS} AND fl.status = 'open')` },
+  { type: "range", keys: ["listingsMin", "listingsMax"], column: `(SELECT COUNT(DISTINCT fl.primary_listing_id) ${CONTACT_LEADS})` },
+  { type: "date", keys: ["inquiryFrom", "inquiryTo"], column: "c.last_contacted_at" },
+  { type: "date", keys: ["activeFrom", "activeTo"], column: "c.last_activity_at" },
+  { type: "date", keys: ["from", "to"], column: "c.created_at" },
+];
+
 export async function listAdminContacts({
   category = "real-estate",
   status = "all",
@@ -562,6 +629,7 @@ export async function listAdminContacts({
   country = "",
   page = 1,
   pageSize = 10,
+  ...columnFilters
 } = {}) {
   const rootId = rootIdFor(category);
   const conditions = ["c.deleted_at IS NULL"];
@@ -579,14 +647,11 @@ export async function listAdminContacts({
     conditions.push("c.lifecycle_stage = ?");
     params.push(status);
   }
-  if (source) {
-    conditions.push("src.code = ?");
-    params.push(source);
-  }
   if (country) {
     conditions.push("co.slug = ?");
     params.push(country);
   }
+  applyColumnFilters(CONTACT_COLUMN_FILTERS, { ...columnFilters, source: columnFilters.source ?? source }, conditions, params);
   if (search) {
     conditions.push("(c.first_name LIKE ? OR c.last_name LIKE ? OR c.primary_email LIKE ? OR c.primary_phone_e164 LIKE ? OR c.public_id = ?)");
     params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, search);
@@ -609,7 +674,7 @@ export async function listAdminContacts({
          ${joins.join("\n")}
          LEFT JOIN languages lang ON lang.id = c.preferred_language_id
          ${where}
-        ORDER BY c.created_at DESC LIMIT ${safeSize} OFFSET ${offset}`,
+        ORDER BY c.created_at DESC, c.id DESC LIMIT ${safeSize} OFFSET ${offset}`,
       params
     ),
     queryValue(`SELECT COUNT(DISTINCT c.id) FROM crm_contacts c ${joins.join("\n")} ${where}`, params),
@@ -883,5 +948,7 @@ async function contactFilterOptions() {
     countries,
     sources: sources.map((row) => ({ id: String(row.id), name: row.name, value: String(row.id), label: row.name })),
     statuses: options.staticOptions(["active", "inactive", "unqualified", "converted"]),
+    // `crm_contacts.lifecycle_stage`, which the Status column shows and its header filter matches.
+    stages: options.staticOptions(["subscriber", "lead", "marketing_qualified", "sales_qualified", "opportunity", "customer", "evangelist", "other"]),
   };
 }

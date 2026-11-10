@@ -150,3 +150,6 @@ export function scopeDevelopmentParam(param = "id") {
     }
   };
 }
+
+/* Table header filters: the helper lives in utils so non-admin modules can share it. */
+export { applyColumnFilters, csvList, referenceNumber } from "../../utils/columnFilters.js";
