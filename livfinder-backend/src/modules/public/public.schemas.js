@@ -50,6 +50,12 @@ export const listingSearchQuery = z
     beds: z.union([z.string(), z.array(z.string())]).optional(),
     bathrooms: z.union([z.string(), z.array(z.string())]).optional(),
     baths: z.union([z.string(), z.array(z.string())]).optional(),
+    // Real estate: every chosen amenity must be present; repeatable like the chips above.
+    amenities: z.union([z.string().max(100), z.array(z.string().max(100)).max(20)]).optional(),
+    // An unknown duration or segment is a 422, not a silently ignored filter.
+    rentPeriod: z.enum(["yearly", "monthly", "weekly", "daily"]).optional().or(z.literal("").transform(() => undefined)),
+    propertySegment: z.enum(["residential", "commercial"]).optional().or(z.literal("").transform(() => undefined)),
+    segment: z.enum(["residential", "commercial"]).optional().or(z.literal("").transform(() => undefined)),
     page: z.coerce.number().int().min(1).max(2000).optional(),
     pageSize: z.coerce.number().int().min(1).max(100).optional(),
     cursor: z.coerce.number().int().min(0).max(100000).optional(),
@@ -65,8 +71,8 @@ export const listingSearchQuery = z
    * did `completionStatus` and `ownershipType`. Every key the schema names above already
    * rejects a repeat with a 422; these now do the same.
    *
-   * The four keys that are genuinely repeatable — `location`, `bedrooms`/`beds`,
-   * `bathrooms`/`baths` — are declared explicitly above and are unaffected by this.
+   * The keys that are genuinely repeatable — `location`, `bedrooms`/`beds`,
+   * `bathrooms`/`baths`, `amenities` — are declared explicitly above and are unaffected by this.
    */
   .catchall(optionalString(120));
 

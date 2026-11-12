@@ -66,6 +66,8 @@ export const realEstateDetail = z.object({
   unitNumber: optionalText(40),
   buildingName: optionalText(180),
   yearBuilt: optionalInt(1500, 2200),
+  // Mirrors the ENUM column. `under_construction` is still accepted from an older form or import
+  // and stored as off_plan by `writeDetail` (migration 0076 folded it into Off Plan).
   completionStatus: z.enum(["ready", "off_plan", "under_construction", "shell_and_core"]).optional().nullable(),
   handoverDate: z.string().max(20).optional().nullable(),
   furnishing: z.enum(["unfurnished", "semi_furnished", "furnished", "fully_fitted"]).optional().nullable(),

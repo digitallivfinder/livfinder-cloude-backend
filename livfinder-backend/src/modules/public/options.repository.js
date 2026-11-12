@@ -1,6 +1,7 @@
 import { query } from "../../db/query.js";
 import { resolveCategory } from "../../utils/categories.js";
 import { SPEC_MAP } from "../search/searchFilters.js";
+import { PROPERTY_SEGMENTS, propertyTypeInSegment } from "../search/propertySegments.js";
 import { resolveLocation, searchLocations, toEntity } from "../locations/locations.repository.js";
 
 /**
@@ -172,7 +173,7 @@ export async function listModels(listingType, { brandSlug = null, q = null, limi
 }
 
 /** Sub-categories, e.g. the real-estate property types or the yacht types. */
-export async function listCategoryTypes(listingType, { q = null, limit = 60 } = {}) {
+export async function listCategoryTypes(listingType, { q = null, limit = 60, segment = null } = {}) {
   const definition = resolveCategory(listingType);
   if (!definition) return [];
   const params = [definition.rootId];
@@ -180,6 +181,11 @@ export async function listCategoryTypes(listingType, { q = null, limit = 60 } = 
   if (q) {
     filter = " AND c.name LIKE ?";
     params.push(`${q}%`);
+  }
+  // A segment narrows the list after the query, so it never changes how the rows are counted.
+  if (segment && definition.listingType === "real-estate") {
+    const rows = await listCategoryTypes(listingType, { q, limit: 200 });
+    return rows.filter((row) => propertyTypeInSegment(row.value, segment)).slice(0, Math.min(200, Math.max(1, Number(limit) || 60)));
   }
   const safeLimit = Math.min(200, Math.max(1, Number(limit) || 60));
   /**
@@ -290,6 +296,54 @@ function humanise(value) {
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
+/** An ENUM column's values, in the order the column declares them. */
+async function enumOptions(table, column, type) {
+  const rows = await query(
+    `SELECT COLUMN_TYPE AS column_type FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [table, column]
+  );
+  const match = /^enum\((.*)\)$/i.exec(rows[0]?.column_type || "");
+  if (!match) return [];
+  return [...match[1].matchAll(/'((?:[^']|'')*)'/g)].map(([, raw]) => {
+    const value = raw.replace(/''/g, "'");
+    return { id: `${type}:${value}`, value, slug: value, label: humanise(value), type };
+  });
+}
+
+/**
+ * The amenities a marketplace offers, from the feature catalogue linked to its root category —
+ * never from what listings happen to carry. Each row names its group so a menu can section them.
+ */
+async function listAmenities(listingType, { q = null } = {}) {
+  const definition = resolveCategory(listingType);
+  if (!definition) return [];
+  const params = [definition.rootId];
+  let filter = "";
+  if (q) {
+    filter = " AND f.name LIKE ?";
+    params.push(`%${q}%`);
+  }
+  const rows = await query(
+    `SELECT f.slug, f.name, fg.code AS group_code, fg.name AS group_name
+       FROM category_features cf
+       JOIN features f ON f.id = cf.feature_id AND f.is_filterable = 1
+       LEFT JOIN feature_groups fg ON fg.id = f.feature_group_id
+      WHERE cf.category_id = ?${filter}
+      ORDER BY fg.sort_order IS NULL, fg.sort_order, cf.sort_order, f.sort_order, f.name`,
+    params
+  );
+  return rows.map((row) => ({
+    id: `amenity:${row.slug}`,
+    value: row.slug,
+    slug: row.slug,
+    label: row.name,
+    group: row.group_name || null,
+    groupCode: row.group_code || null,
+    type: "amenity",
+  }));
+}
+
 const FACET_KEY_COLUMN = {
   "real-estate": { furnishing: "facet_a", completion: "facet_b", completionStatus: "facet_b", ownershipType: "facet_c" },
   cars: { transmission: "facet_a", fuelType: "facet_b", condition: "facet_c" },
@@ -359,12 +413,28 @@ export async function filterOptions(category, filterKey, { q = null, parent = nu
   }
 
   if (["propertyType", "category", "assetType"].includes(filterKey)) {
-    return listCategoryTypes(listingType, { q, limit });
+    // Real estate's `parent` is the Residential / Commercial segment.
+    const segment = listingType === "real-estate" && PROPERTY_SEGMENTS.some((row) => row.value === parent) ? parent : null;
+    return listCategoryTypes(listingType, { q, limit, segment });
+  }
+
+  if (listingType === "real-estate" && filterKey === "propertySegment") {
+    return PROPERTY_SEGMENTS.map((row) => ({ id: `segment:${row.value}`, ...row, slug: row.value, type: "propertySegment" }));
+  }
+
+  if (listingType === "real-estate" && filterKey === "rentPeriod") {
+    return enumOptions("listing_real_estate", "rent_period", "rentPeriod");
+  }
+
+  if (filterKey === "amenities") {
+    return listAmenities(listingType, { q });
   }
 
   const column = FACET_KEY_COLUMN[listingType]?.[filterKey];
   if (column) {
-    const values = await facetValues(listingType, column, { limit });
+    let values = await facetValues(listingType, column, { limit });
+    // Under Construction is folded into Off Plan; it is no longer offered as its own status.
+    if (listingType === "real-estate" && column === "facet_b") values = values.filter((option) => option.value !== "under_construction");
     return q ? values.filter((option) => option.label.toLowerCase().startsWith(q.toLowerCase())) : values;
   }
 

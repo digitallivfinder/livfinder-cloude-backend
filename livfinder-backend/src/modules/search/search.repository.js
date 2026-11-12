@@ -1,5 +1,6 @@
 import { query, queryValue } from "../../db/query.js";
 import { resolveLocation } from "../locations/locations.repository.js";
+import { segmentCondition } from "./propertySegments.js";
 import { normalizeSearchInput, SORT_MAP, RANGE_FILTERS, FACET_FILTERS, DETAIL_FILTERS, COLOUR_FAMILIES } from "./searchFilters.js";
 import { serializeListingCard } from "../../serializers/listing.js";
 
@@ -224,14 +225,46 @@ export async function buildSearchQuery(rawFilters = {}) {
     params.push(Number(resolved));
   }
 
-  // Bedrooms/bathrooms are multi-select "3, 4, 5+" chips, not a range.
-  if (filters.bedrooms.length && filters.listingType === "real-estate") {
-    conditions.push(`ls.spec_a IN (${filters.bedrooms.map(() => "?").join(", ")})`);
-    params.push(...filters.bedrooms);
+  // Bedrooms/bathrooms are multi-select chips — exact counts, plus "8+" for eight or more.
+  if (filters.listingType === "real-estate") {
+    for (const [column, chips] of [["ls.spec_a", filters.bedrooms], ["ls.spec_b", filters.bathrooms]]) {
+      const parts = [];
+      if (chips.exact.length) {
+        parts.push(`${column} IN (${chips.exact.map(() => "?").join(", ")})`);
+        params.push(...chips.exact);
+      }
+      if (chips.atLeast !== null) {
+        parts.push(`${column} >= ?`);
+        params.push(chips.atLeast);
+      }
+      if (parts.length) conditions.push(parts.length > 1 ? `(${parts.join(" OR ")})` : parts[0]);
+    }
   }
-  if (filters.bathrooms.length && filters.listingType === "real-estate") {
-    conditions.push(`ls.spec_b IN (${filters.bathrooms.map(() => "?").join(", ")})`);
-    params.push(...filters.bathrooms);
+
+  if (filters.listingType === "real-estate") {
+    // Rent duration: how the rent is quoted (yearly, monthly …).
+    if (filters.rentPeriod) {
+      conditions.push("ls.price_period = ?");
+      params.push(filters.rentPeriod);
+    }
+    // Residential / Commercial, from the shared grouping of leaf categories.
+    const segment = segmentCondition(filters.propertySegment);
+    if (segment) {
+      conditions.push(segment.sql);
+      params.push(...segment.params);
+    }
+    // Amenities: a listing must have every one that is chosen.
+    if (filters.amenities.length) {
+      conditions.push(
+        `ls.listing_id IN (
+           SELECT lf.listing_id FROM listing_features lf
+             JOIN features f ON f.id = lf.feature_id
+            WHERE f.slug IN (${filters.amenities.map(() => "?").join(", ")})
+            GROUP BY lf.listing_id
+           HAVING COUNT(DISTINCT f.id) = ?)`
+      );
+      params.push(...filters.amenities, filters.amenities.length);
+    }
   }
 
   for (const range of RANGE_FILTERS[filters.listingType] || []) {
@@ -250,6 +283,13 @@ export async function buildSearchQuery(rawFilters = {}) {
   for (const [key, column] of Object.entries(FACET_FILTERS[filters.listingType] || {})) {
     const value = filters.facets[key];
     if (!value) continue;
+    // Under Construction is folded into Off Plan (migration 0076). Until a database has run it,
+    // Off Plan still finds the listings stored the old way, and an old link to Under
+    // Construction lands on Off Plan rather than on an empty page.
+    if (filters.listingType === "real-estate" && key === "completionStatus" && ["off_plan", "under_construction"].includes(value)) {
+      conditions.push(`ls.${column} IN ('off_plan', 'under_construction')`);
+      continue;
+    }
     conditions.push(`ls.${column} = ?`);
     params.push(value);
   }

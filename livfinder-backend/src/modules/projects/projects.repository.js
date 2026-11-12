@@ -1,4 +1,6 @@
 import { query, queryOne, queryValue } from "../../db/query.js";
+import { PROJECT_TYPES_BY_SEGMENT } from "../search/propertySegments.js";
+import { parseAmenities } from "../search/searchFilters.js";
 import { resolveLocation } from "../locations/locations.repository.js";
 import { asArray, toNumber } from "../../utils/http.js";
 import {
@@ -245,6 +247,26 @@ export async function buildProjectQuery(filters = {}) {
   if (areaMax !== null) {
     conditions.push("ps.area_min <= ?");
     params.push(areaMax);
+  }
+
+  // Residential / Commercial: the development's type, grouped as the listing search groups types.
+  const segmentTypes = PROJECT_TYPES_BY_SEGMENT[filters.propertySegment];
+  if (segmentTypes) {
+    conditions.push(`ps.project_type IN (${segmentTypes.map(() => "?").join(", ")})`);
+    params.push(...segmentTypes);
+  }
+
+  // Amenities: a development must offer every one that is chosen (same slugs as listings).
+  const amenities = parseAmenities(filters.amenities);
+  if (amenities.length) {
+    conditions.push(
+      `ps.project_id IN (
+         SELECT pa.project_id FROM project_amenities pa
+          WHERE pa.slug IN (${amenities.map(() => "?").join(", ")})
+          GROUP BY pa.project_id
+         HAVING COUNT(DISTINCT pa.slug) = ?)`
+    );
+    params.push(...amenities, amenities.length);
   }
 
   const maxDownPayment = toNumber(filters.maxDownPayment);

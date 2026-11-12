@@ -297,6 +297,11 @@ async function writeDetail({ listingType, listingId, detail }, executor) {
     throw AppError.validation("Some information is invalid.", fields);
   }
 
+  // Under Construction is folded into Off Plan (migration 0076): an older form or import may
+  // still send it, but it is stored as off_plan so it cannot come back.
+  if (listingType === "real-estate" && parsed.data.completionStatus === "under_construction") {
+    parsed.data.completionStatus = "off_plan";
+  }
   const entries = Object.entries(parsed.data).filter(([, value]) => value !== undefined);
   const assignments = [];
   const params = [];

@@ -1,5 +1,6 @@
 import { resolveCategory } from "../../utils/categories.js";
 import { asArray, toInt, toNumber, toBool, cleanString } from "../../utils/http.js";
+import { isPropertySegment } from "./propertySegments.js";
 
 /**
  * The listing_search spec/facet slots, per root category. Mirrors the mapping
@@ -148,6 +149,39 @@ export const SORT_MAP = {
   popular: "ls.boost_score DESC, ls.quality_score DESC, ls.listing_id DESC",
 };
 
+/** Rent duration as the filter spells it → `listing_search.price_period` as the projection stores it. */
+export const RENT_PERIODS = { yearly: "year", monthly: "month", weekly: "week", daily: "day" };
+
+/**
+ * Bedroom / bathroom chips: exact counts, plus "8+" meaning eight or more.
+ *
+ * `["2", "3", "8+"]` → `{ exact: [2, 3], atLeast: 8 }`. A plain number is an exact count; a
+ * number with a trailing "+" is a minimum, and the lowest one given wins.
+ */
+export function parseCountChips(values) {
+  const exact = [];
+  let atLeast = null;
+  for (const raw of asArray(values)) {
+    const text = String(raw).trim();
+    const plus = /^(\d+)\+$/.exec(text);
+    if (plus) {
+      const minimum = Number(plus[1]);
+      atLeast = atLeast === null ? minimum : Math.min(atLeast, minimum);
+      continue;
+    }
+    const count = toInt(text);
+    if (count !== null && count >= 0) exact.push(count);
+  }
+  return { exact: [...new Set(exact)], atLeast };
+}
+
+/** Amenity slugs: lowercase words and hyphens only, at most 20 of them. */
+export function parseAmenities(values) {
+  return [...new Set(asArray(values).map((value) => String(value).trim().toLowerCase()))]
+    .filter((slug) => /^[a-z0-9][a-z0-9-]{0,99}$/.test(slug))
+    .slice(0, 20);
+}
+
 const PURPOSE_SLUGS = { sale: "for-sale", buy: "for-sale", rent: "for-rent", charter: "for-charter", lease: "for-lease", auction: "auction" };
 
 /** Normalises whatever the frontend sent into a validated, typed filter set. */
@@ -195,8 +229,11 @@ export function normalizeSearchInput(input = {}) {
     projectRef: cleanString(input.project, 220),
     organizationId: input.organizationId ?? null,
     agentId: input.agentId ?? null,
-    bedrooms: asArray(input.bedrooms ?? input.beds).map(toInt).filter((value) => value !== null),
-    bathrooms: asArray(input.bathrooms ?? input.baths).map(toInt).filter((value) => value !== null),
+    bedrooms: parseCountChips(input.bedrooms ?? input.beds),
+    bathrooms: parseCountChips(input.bathrooms ?? input.baths),
+    rentPeriod: RENT_PERIODS[String(input.rentPeriod || "").toLowerCase()] || null,
+    propertySegment: isPropertySegment(input.propertySegment ?? input.segment) ? input.propertySegment ?? input.segment : null,
+    amenities: parseAmenities(input.amenities),
     ranges: Object.fromEntries(
       (RANGE_FILTERS[listingType] || []).flatMap((range) => [
         [range.min, toNumber(input[range.min])],

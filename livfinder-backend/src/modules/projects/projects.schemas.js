@@ -29,6 +29,9 @@ export const projectSearchQuery = z.object({
   paymentPlan: repeatable(40),
   beds: repeatable(8),
   bedrooms: repeatable(8),
+  // The listing search's amenity and Residential / Commercial filters, applied to developments.
+  amenities: repeatable(100),
+  propertySegment: z.enum(["residential", "commercial"]).optional().or(z.literal("").transform(() => undefined)),
 
   handoverFrom: optionalString(10),
   handoverTo: optionalString(10),

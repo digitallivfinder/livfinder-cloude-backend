@@ -24,9 +24,9 @@ describe("search filter normalisation", () => {
   });
 
   it("takes bedroom chips as a list, whatever the caller sent", () => {
-    expect(normalizeSearchInput({ beds: "3,4,5" }).bedrooms).toEqual([3, 4, 5]);
-    expect(normalizeSearchInput({ bedrooms: ["3", "4"] }).bedrooms).toEqual([3, 4]);
-    expect(normalizeSearchInput({}).bedrooms).toEqual([]);
+    expect(normalizeSearchInput({ beds: "3,4,5" }).bedrooms).toEqual({ exact: [3, 4, 5], atLeast: null });
+    expect(normalizeSearchInput({ bedrooms: ["3", "4"] }).bedrooms).toEqual({ exact: [3, 4], atLeast: null });
+    expect(normalizeSearchInput({}).bedrooms).toEqual({ exact: [], atLeast: null });
   });
 
   it("collects every supplied location level into one list", () => {
