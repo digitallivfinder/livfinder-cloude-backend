@@ -1,4 +1,5 @@
 import { query, queryOne, queryValue, execute } from "../../db/query.js";
+import { alignRentPeriod } from "./rentPeriod.js";
 import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
 import { ownAgentClause } from "../../utils/tenantScope.js";
@@ -547,9 +548,11 @@ export async function syncOwnerListingCounters({ agentIds = [], organizationId =
   }
 }
 
-export async function createListing({ payload, accountId, userId, organizationId, agentId, ip }) {
-  const definition = resolveCategory(payload.category);
+export async function createListing({ payload: rawPayload, accountId, userId, organizationId, agentId, ip }) {
+  const definition = resolveCategory(rawPayload.category);
   if (!definition) throw AppError.validation("Some information is invalid.", { category: "Unknown category." });
+  // A rental's "Rent period" and the price period it is quoted per are one value; see rentPeriod.js.
+  const payload = alignRentPeriod(definition.listingType, rawPayload);
 
   return withTransaction(async (connection) => {
     const { categoryId, rootCategoryId } = await resolveCategoryRow(definition, payload.categorySlug, connection);
@@ -727,11 +730,20 @@ function detailYear(listingType, detail = {}) {
   );
 }
 
-export async function updateListing({ listing, payload, userId, accountId, organizationId }) {
+export async function updateListing({ listing, payload: rawPayload, userId, accountId, organizationId }) {
   const definition = categoryByRootId(listing.root_category_id);
   if (!definition) throw AppError.internal();
 
   await withTransaction(async (connection) => {
+    // A rental's "Rent period" and its price period are one value (rentPeriod.js). An edit that
+    // does not resend the purpose is checked against the stored one.
+    const touchesPeriod = rawPayload.pricePeriod !== undefined || rawPayload.detail?.rentPeriod !== undefined;
+    const storedPurpose =
+      definition.listingType === "real-estate" && touchesPeriod && rawPayload.purpose === undefined
+        ? await queryValue("SELECT p.code FROM listings l JOIN purposes p ON p.id = l.purpose_id WHERE l.id = ?", [listing.id], connection)
+        : null;
+    const payload = alignRentPeriod(definition.listingType, rawPayload, storedPurpose);
+
     const assignments = [];
     const params = [];
     const set = (column, value) => {
@@ -851,7 +863,7 @@ export async function updateListing({ listing, payload, userId, accountId, organ
   });
 
   // Reassigning the agent moves a listing from one agent's counters to another's.
-  if (payload.agentId !== undefined) {
+  if (rawPayload.agentId !== undefined) {
     await syncAccountListingUsageForListing(listing.id, undefined, { previousAgentId: listing.agent_id ?? null });
   }
   await refreshListingSearch(listing.id);
