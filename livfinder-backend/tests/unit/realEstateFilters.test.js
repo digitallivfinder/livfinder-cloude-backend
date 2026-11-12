@@ -93,7 +93,14 @@ describe("off plan", () => {
       const built = await buildSearchQuery({ category: "real-estate", completionStatus: value });
       expect(built.where).toContain("ls.facet_b IN ('off_plan', 'under_construction')");
     }
-    const ready = await buildSearchQuery({ category: "real-estate", completionStatus: "ready" });
-    expect(ready.where).toContain("ls.facet_b = ?");
+  });
+});
+
+describe("ready", () => {
+  it("includes shell and core, which is never a status of its own", async () => {
+    for (const value of ["ready", "shell_and_core"]) {
+      const built = await buildSearchQuery({ category: "real-estate", completionStatus: value });
+      expect(built.where).toContain("ls.facet_b IN ('ready', 'shell_and_core')");
+    }
   });
 });

@@ -290,6 +290,12 @@ export async function buildSearchQuery(rawFilters = {}) {
       conditions.push(`ls.${column} IN ('off_plan', 'under_construction')`);
       continue;
     }
+    // Shell and core (a commercial building finished outside, bare inside) is ready to occupy:
+    // the website's Ready includes it, and it is never offered as a status of its own.
+    if (filters.listingType === "real-estate" && key === "completionStatus" && ["ready", "shell_and_core"].includes(value)) {
+      conditions.push(`ls.${column} IN ('ready', 'shell_and_core')`);
+      continue;
+    }
     conditions.push(`ls.${column} = ?`);
     params.push(value);
   }

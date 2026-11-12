@@ -1,5 +1,6 @@
 import { query, queryOne, queryValue, execute } from "../../db/query.js";
 import { alignRentPeriod } from "./rentPeriod.js";
+import { alignCompletionStatus } from "./completionStatus.js";
 import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
 import { ownAgentClause } from "../../utils/tenantScope.js";
@@ -552,7 +553,7 @@ export async function createListing({ payload: rawPayload, accountId, userId, or
   const definition = resolveCategory(rawPayload.category);
   if (!definition) throw AppError.validation("Some information is invalid.", { category: "Unknown category." });
   // A rental's "Rent period" and the price period it is quoted per are one value; see rentPeriod.js.
-  const payload = alignRentPeriod(definition.listingType, rawPayload);
+  const payload = alignCompletionStatus(definition.listingType, alignRentPeriod(definition.listingType, rawPayload));
 
   return withTransaction(async (connection) => {
     const { categoryId, rootCategoryId } = await resolveCategoryRow(definition, payload.categorySlug, connection);
@@ -742,7 +743,16 @@ export async function updateListing({ listing, payload: rawPayload, userId, acco
       definition.listingType === "real-estate" && touchesPeriod && rawPayload.purpose === undefined
         ? await queryValue("SELECT p.code FROM listings l JOIN purposes p ON p.id = l.purpose_id WHERE l.id = ?", [listing.id], connection)
         : null;
-    const payload = alignRentPeriod(definition.listingType, rawPayload, storedPurpose);
+    // Shell and core only for a commercial type; checked against the stored type when not resent.
+    const storedCategory =
+      definition.listingType === "real-estate" && rawPayload.detail?.completionStatus === "shell_and_core" && rawPayload.categorySlug === undefined
+        ? await queryValue("SELECT c.slug FROM listings l JOIN categories c ON c.id = l.category_id WHERE l.id = ?", [listing.id], connection)
+        : null;
+    const payload = alignCompletionStatus(
+      definition.listingType,
+      alignRentPeriod(definition.listingType, rawPayload, storedPurpose),
+      storedCategory
+    );
 
     const assignments = [];
     const params = [];

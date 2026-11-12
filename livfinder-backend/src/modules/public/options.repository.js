@@ -434,7 +434,11 @@ export async function filterOptions(category, filterKey, { q = null, parent = nu
   if (column) {
     let values = await facetValues(listingType, column, { limit });
     // Under Construction is folded into Off Plan; it is no longer offered as its own status.
-    if (listingType === "real-estate" && column === "facet_b") values = values.filter((option) => option.value !== "under_construction");
+    // The website's status toggle is All / Ready / Off Plan: Under Construction is folded into Off
+    // Plan and Shell and core is counted as Ready, so neither is offered on its own.
+    if (listingType === "real-estate" && column === "facet_b") {
+      values = values.filter((option) => !["under_construction", "shell_and_core"].includes(option.value));
+    }
     return q ? values.filter((option) => option.label.toLowerCase().startsWith(q.toLowerCase())) : values;
   }
 
