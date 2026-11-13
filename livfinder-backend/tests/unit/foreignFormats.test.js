@@ -147,3 +147,60 @@ describe("an export that lacks LivFinder's required fields", () => {
     expect(entry.errors.parkingSpaces).toBe("This is required.");
   });
 });
+
+// The variant LuxuryProperty.com exports (2026-11-13): spelled-out types and offering, a
+// <category> for Residential / Commercial, and the place in location_lv1 … location_lv5.
+const LEVELLED = `<?xml version="1.0" encoding="UTF-8"?>
+<list last_update="2024-07-15 04:25:35" listing_count="2">
+  <property last_update="2025-11-24 10:30:16">
+    <reference_number>LP0001</reference_number><offering_type>Purchase</offering_type><property_type>Apartment</property_type>
+    <price_on_application>No</price_on_application><price>1131296</price><currency_code>AED</currency_code>
+    <title_en>One bedroom in District One</title_en><description_en>&lt;p&gt;Calm and bright.&lt;/p&gt;</description_en>
+    <size>761</size><size_measure>Square Foot</size_measure><bedroom>1</bedroom><bathroom>1</bathroom>
+    <agent><id>34</id><name>Jason Hayes</name><email>jason@luxuryproperty.com</email><photo><url>https://example.com/a.webp</url></photo></agent>
+    <listing_status>Y</listing_status><furnished>Unfurnished</furnished><category>Residential</category>
+    <location_lv1>UAE</location_lv1><location_lv2>Dubai</location_lv2><location_lv3>Mohammed Bin Rashid City</location_lv3>
+    <location_lv4>District One</location_lv4><location_lv5>The Residences</location_lv5>
+    <completion_status>off_plan_primary</completion_status><parking>1</parking>
+  </property>
+  <property>
+    <reference_number>LP0002</reference_number><offering_type>Rental</offering_type><property_type>Office</property_type>
+    <price><yearly>0</yearly></price><currency_code>AED</currency_code><title_en>Office</title_en><description_en>Desk space.</description_en>
+    <size>120</size><size_measure>Square Meter</size_measure><category>Commercial</category><cheques>4</cheques>
+    <availability_date>2024-10-10 00:00:00</availability_date>
+    <location_lv1>UAE</location_lv1><location_lv2>Dubai</location_lv2><location_lv3>Business Bay</location_lv3>
+  </property>
+</list>`;
+
+describe("Property Finder with location levels", () => {
+  it("reads location_lv1 … lv5, spelled-out types, <category> and a 0 price as no price", () => {
+    const { source, entries } = readForeignXml(LEVELLED);
+    expect(source).toBe("property_finder");
+    const [sale, rent] = entries;
+    expect(sale).toMatchObject({
+      externalId: "LP0001",
+      purpose: "sale",
+      propertyType: "Apartment",
+      propertySegment: "residential",
+      price: "1131296",
+      currency: "AED",
+      country: "AE",
+      city: "Dubai",
+      community: "Mohammed Bin Rashid City",
+      subCommunity: "District One",
+      buildingName: "The Residences",
+      builtAreaSqft: "761",
+      completionStatus: "off_plan",
+      agentEmail: "jason@luxuryproperty.com",
+    });
+    // The agent's own photo is not a listing image.
+    expect(sale.images).toBeUndefined();
+    expect(rent).toMatchObject({ purpose: "rent", propertySegment: "commercial", rentPeriod: "yearly", chequesAccepted: "4", availableFrom: "2024-10-10", builtAreaSqm: "120" });
+    expect(rent.price).toBeUndefined();
+  });
+
+  it("asks for a price when the export gives 0", () => {
+    const [, rent] = parseFeed({ category: "real-estate", format: "xml", content: LEVELLED }).items;
+    expect(rent.errors.price).toMatch(/Give a price/);
+  });
+});

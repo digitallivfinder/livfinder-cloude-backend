@@ -6,7 +6,7 @@ vi.mock("../../src/db/query.js", () => ({ query, queryValue }));
 
 const { buildSearchQuery } = await import("../../src/modules/search/search.repository.js");
 const { normalizeSearchInput, parseCountChips, parseAmenities } = await import("../../src/modules/search/searchFilters.js");
-const { propertyTypeInSegment, segmentCondition } = await import("../../src/modules/search/propertySegments.js");
+const { segmentCondition } = await import("../../src/modules/search/propertySegments.js");
 
 beforeEach(() => {
   query.mockReset();
@@ -45,26 +45,16 @@ describe("rent duration", () => {
 });
 
 describe("residential / commercial", () => {
-  it("groups types with plots and whole buildings in both", () => {
-    expect(propertyTypeInSegment("offices", "commercial")).toBe(true);
-    expect(propertyTypeInSegment("offices", "residential")).toBe(false);
-    expect(propertyTypeInSegment("villas", "residential")).toBe(true);
-    expect(propertyTypeInSegment("villas", "commercial")).toBe(false);
-    expect(propertyTypeInSegment("plots", "residential")).toBe(true);
-    expect(propertyTypeInSegment("plots", "commercial")).toBe(true);
-  });
-
-  it("builds a closed list for commercial and an exclusion for residential", () => {
-    expect(segmentCondition("commercial").params).toEqual(["offices", "retail", "buildings", "plots"]);
-    const residential = segmentCondition("residential");
-    expect(residential.sql).toContain("IS NULL OR");
-    expect(residential.params).toEqual(["offices", "retail"]);
+  it("searches the segment each listing stores", () => {
+    expect(segmentCondition("commercial")).toEqual({ sql: "ls.property_segment = ?", params: ["commercial"] });
+    expect(segmentCondition("residential")).toEqual({ sql: "ls.property_segment = ?", params: ["residential"] });
     expect(segmentCondition("industrial")).toBeNull();
   });
 
   it("filters the search on the segment, from either spelling", async () => {
     const built = await buildSearchQuery({ category: "real-estate", segment: "commercial" });
-    expect(built.where).toContain("ls.category_slug IN (?, ?, ?, ?)");
+    expect(built.where).toContain("ls.property_segment = ?");
+    expect(built.params).toContain("commercial");
     expect(normalizeSearchInput({ category: "real-estate", propertySegment: "nope" }).propertySegment).toBeNull();
   });
 });

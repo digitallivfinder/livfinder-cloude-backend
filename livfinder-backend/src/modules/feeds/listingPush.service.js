@@ -98,7 +98,8 @@ async function pushedEntries(ctx) {
     [ctx.connectionId]
   );
   const statuses = await query(
-    `SELECT er.external_id, er.entity_type, er.entity_id, COALESCE(l.status, p.moderation_status) AS status
+    `SELECT er.external_id, er.entity_type, er.entity_id, COALESCE(l.status, p.moderation_status) AS status,
+            l.property_segment
        FROM external_references er
        LEFT JOIN listings l ON er.entity_type = 'listing' AND l.id = er.entity_id AND l.deleted_at IS NULL
        LEFT JOIN projects p ON er.entity_type = 'project' AND p.id = er.entity_id AND p.deleted_at IS NULL
@@ -119,6 +120,11 @@ async function pushedEntries(ctx) {
       if (!reference) continue; // deleted on LivFinder since
       const record = typeof row.raw_payload === "string" ? JSON.parse(row.raw_payload) : row.raw_payload;
       const category = row.entity_type === "project" ? "developments" : record?.category;
+      // A real-estate record sent without Residential / Commercial (its type decided it) goes back
+      // out with the segment the listing was saved with, so the file says what LivFinder holds.
+      if (category === "real-estate" && record && !record.propertySegment && reference.property_segment) {
+        record.propertySegment = reference.property_segment;
+      }
       if (feedFormat(category)) entries.push({ category, record, status: reference.status, entityId: reference.entity_id });
     }
   }
@@ -141,6 +147,8 @@ function recordFromListing(row, { detail, images, features }) {
     category: definition.category,
     purpose: row.purpose_code,
     propertyType: row.category_code,
+    // Real estate's Residential / Commercial, so sending the file back keeps it.
+    ...(definition.category === "real-estate" ? { propertySegment: row.property_segment ?? null } : {}),
     title: row.title,
     subtitle: row.subtitle,
     description: row.description,

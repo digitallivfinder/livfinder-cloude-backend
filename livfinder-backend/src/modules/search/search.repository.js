@@ -21,7 +21,7 @@ const CARD_COLUMNS = `
   ls.is_featured, ls.is_premium, ls.is_verified, ls.is_exclusive, ls.has_virtual_tour,
   ls.spec_a, ls.spec_b, ls.spec_c, ls.spec_d, ls.spec_e, ls.spec_f, ls.spec_labels,
   ls.brand_id, ls.brand_model_id, ls.project_id, ls.quality_score, ls.published_at,
-  ls.source_updated_at,
+  ls.source_updated_at, ls.property_segment,
   co.slug AS country_slug, co.name AS country_name,
   st.slug AS state_slug,
   ct.slug AS city_slug,   ct.name AS city_name,

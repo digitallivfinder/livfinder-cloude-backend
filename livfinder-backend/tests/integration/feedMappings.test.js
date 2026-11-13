@@ -29,7 +29,8 @@ const file = () =>
     }),
   ]);
 const push = () => pushFile(key, "/listings/real-estate.csv", file(), "text/csv");
-const queued = async () => (await listMappings({ status: "unmapped", pageSize: 100 })).rows.filter((row) => row.value.includes(String(suffix)));
+// Searched by this run's suffix: the shared queue can hold thousands of real names ahead of these.
+const queued = async () => (await listMappings({ status: "unmapped", pageSize: 100, sent: String(suffix) })).rows.filter((row) => row.value.includes(String(suffix)));
 
 beforeAll(async () => {
   owner = await createDisposablePortalOwner({ prefix: "feed-mappings" });
@@ -120,5 +121,88 @@ describe("the mapping queue", () => {
     const [row] = await queued();
     await dismissMapping(Number(row.id));
     expect(await queued()).toEqual([]);
+  });
+});
+
+describe("an unknown sub-community", () => {
+  const unknownSub = `QA Tower ${suffix}`;
+
+  it("takes the listing in under its community, keeps the name as its building, and queues it", async () => {
+    const csv = completeCsv("real-estate", [
+      completeRecord("real-estate", "RE-SUB-1", {
+        title: "Apartment in a tower LivFinder does not list yet",
+        propertyType: "apartment",
+        location: { country: "AE", city: "Dubai", community: community.name, subCommunity: unknownSub },
+      }),
+    ]);
+    const { imports: [result] } = await pushFile(key, "/listings/real-estate.csv", csv, "text/csv");
+    expect(result.status, JSON.stringify(result)).toBe("completed");
+    const listing = await queryOne(
+      `SELECT loc.public_id AS community, l.sub_community_id, d.building_name
+         FROM listings l LEFT JOIN locations loc ON loc.id = l.community_id
+         LEFT JOIN listing_real_estate d ON d.listing_id = l.id
+        WHERE l.account_id = ? AND l.source_reference = 'RE-SUB-1' AND l.deleted_at IS NULL`,
+      [accountId]
+    );
+    expect(listing).toMatchObject({ community: community.public_id, sub_community_id: null, building_name: unknownSub });
+    const item = await queryOne(
+      "SELECT fi.status, fi.warnings FROM feed_import_items fi JOIN feed_imports r ON r.id = fi.import_id WHERE r.public_id = ?",
+      [result.id]
+    );
+    expect(item.status).toBe("warning");
+    expect(JSON.stringify(item.warnings)).toContain(unknownSub);
+    expect((await queued()).find((row) => row.value === unknownSub.toLowerCase())).toMatchObject({ type: "location", mapped: false });
+  });
+});
+
+describe("a sub-community named like one elsewhere", () => {
+  it("is taken in under its own community, with a warning that says where LivFinder has that name", async () => {
+    const other = await queryOne(
+      `SELECT s.name FROM locations s JOIN locations c ON c.id = s.community_id
+        WHERE s.level = 'sub_community' AND s.deleted_at IS NULL AND c.id <> (SELECT id FROM locations WHERE public_id = ?)
+          AND s.name NOT IN (SELECT name FROM locations WHERE community_id = (SELECT id FROM locations WHERE public_id = ?))
+        ORDER BY s.id LIMIT 1`,
+      [community.public_id, community.public_id]
+    );
+    const csv = completeCsv("real-estate", [
+      completeRecord("real-estate", "RE-SUB-2", {
+        title: "Apartment in a building that shares a name with a place elsewhere",
+        propertyType: "apartment",
+        location: { country: "AE", city: "Dubai", community: community.name, subCommunity: other.name },
+      }),
+    ]);
+    const { imports: [result] } = await pushFile(key, "/listings/real-estate.csv", csv, "text/csv");
+    expect(result.status, JSON.stringify(result)).toBe("completed");
+    const item = await queryOne(
+      "SELECT fi.status, fi.warnings FROM feed_import_items fi JOIN feed_imports r ON r.id = fi.import_id WHERE r.public_id = ?",
+      [result.id]
+    );
+    expect(item.status).toBe("warning");
+    expect(JSON.stringify(item.warnings)).toContain("LivFinder has it in");
+    await execute("DELETE FROM feed_value_mappings WHERE external_value = ? AND scope_key = ?", [other.name.toLowerCase(), String(await queryOne("SELECT id FROM locations WHERE public_id = ?", [community.public_id]).then((r) => r.id))]);
+  });
+});
+
+describe("an import stopped between creating a listing and linking it", () => {
+  it("adopts that listing on the next push instead of creating a second copy", async () => {
+    const csv = completeCsv("real-estate", [
+      completeRecord("real-estate", "RE-HALF-1", {
+        title: "Apartment whose first import was cut short",
+        propertyType: "apartment",
+        location: { country: "AE", city: "Dubai", community: community.name, subCommunity: community.sub_community },
+      }),
+    ]);
+    const first = (await pushFile(key, "/listings/real-estate.csv", csv, "text/csv")).imports[0];
+    expect(first.status, JSON.stringify(first)).toBe("completed");
+    const made = await queryOne("SELECT id, source, source_reference FROM listings WHERE account_id = ? AND source_reference = 'RE-HALF-1' AND deleted_at IS NULL", [accountId]);
+    // Written with the listing itself, not afterwards.
+    expect(made).toMatchObject({ source: "feed", source_reference: "RE-HALF-1" });
+    // What a stop at that moment leaves behind: the listing, without its link.
+    await execute("DELETE FROM external_references WHERE entity_type = 'listing' AND entity_id = ?", [made.id]);
+
+    const again = (await pushFile(key, "/listings/real-estate.csv", csv, "text/csv")).imports[0];
+    expect(again.status, JSON.stringify(again)).toBe("completed");
+    const rows = await query("SELECT id FROM listings WHERE account_id = ? AND source_reference = 'RE-HALF-1' AND deleted_at IS NULL", [accountId]);
+    expect(rows.map((row) => Number(row.id))).toEqual([Number(made.id)]);
   });
 });

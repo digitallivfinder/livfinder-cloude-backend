@@ -65,3 +65,13 @@ describe("the CSV a client reads back", () => {
     expect(lines[1].endsWith(",active")).toBe(true);
   });
 });
+
+describe("a very large read-back file", () => {
+  it("is written without overflowing the call stack (16,000+ listings)", async () => {
+    const { listingsXml } = await import("../../src/modules/feeds/feedTemplates.js");
+    const record = { externalId: "X", title: "A listing", description: "Text", features: ["Pool"], images: ["https://e.x/1.jpg"], detail: { bedrooms: 1 } };
+    const entries = Array.from({ length: 20_000 }, (_, i) => ({ record: { ...record, externalId: `X-${i}` }, status: "draft" }));
+    const xml = listingsXml([{ category: "real-estate", entries }]);
+    expect(xml.match(/<listing[ >]/g)).toHaveLength(20_000);
+  });
+});

@@ -1,5 +1,6 @@
 import { parse as parseCsv } from "csv-parse/sync";
 import { XMLParser } from "fast-xml-parser";
+import { FEED_XML_ENTITIES } from "./xmlEntities.js";
 import { AppError } from "../../utils/errors.js";
 import { DETAIL_SCHEMAS } from "../listings/listings.schemas.js";
 import { parseListingRecord } from "../imports/listingImport.service.js";
@@ -22,7 +23,8 @@ import { missingRequired } from "./listingRequirements.js";
  * their own validation happens where they are saved.
  */
 
-export const MAX_FEED_BYTES = 50 * 1024 * 1024;
+// A large agency's full portal export runs to 75 MB and more (LuxuryProperty.com: 16,529 listings).
+export const MAX_FEED_BYTES = 150 * 1024 * 1024;
 export const MAX_FEED_ROWS = 20_000;
 
 function fileError(message, fields) {
@@ -201,7 +203,7 @@ const xml = new XMLParser({
   parseTagValue: false,
   parseAttributeValue: false,
   trimValues: true,
-  processEntities: true,
+  processEntities: FEED_XML_ENTITIES,
   isArray: (name, jpath) => ARRAY_PATHS.has(jpath) || Object.values(LIST_ITEM).includes(name),
 });
 

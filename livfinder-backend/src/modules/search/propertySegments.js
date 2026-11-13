@@ -1,54 +1,38 @@
 /**
- * Residential / Commercial, as the API defines it over real estate's leaf categories.
+ * Residential / Commercial.
  *
- * The category tree has no segment column, so the grouping lives here: one definition that the
- * filter-options menu (which types to offer for a segment) and the search (which listings a
- * segment matches) both read, so the two cannot disagree. A type may belong to both — a plot or a
- * whole building can be either. Every type not named under Commercial is Residential.
+ * A real-estate listing stores its own segment (`listings.property_segment`, copied into
+ * `listing_search` by the projection), chosen before its property type. Each property type says
+ * which segment it belongs to (`categories.property_segment`: residential, commercial, or both for
+ * Plot and Whole Building), and the types offered follow the chosen segment. Both lists are read
+ * from the database (migration 0077); nothing here is a list of types.
  */
-export const PROPERTY_SEGMENTS = [
-  { value: "residential", label: "Residential" },
-  { value: "commercial", label: "Commercial" },
-];
 
-/** Leaf categories (slugs) that are commercial. */
-export const COMMERCIAL_TYPES = ["offices", "retail", "buildings", "plots"];
-
-/** Commercial types that are also residential. */
-export const BOTH_SEGMENT_TYPES = ["buildings", "plots"];
-
-const COMMERCIAL = new Set(COMMERCIAL_TYPES);
-const BOTH = new Set(BOTH_SEGMENT_TYPES);
-const COMMERCIAL_ONLY = COMMERCIAL_TYPES.filter((slug) => !BOTH.has(slug));
+/** Mirrors the `listings.property_segment` ENUM; used to validate input, never to build menus. */
+export const PROPERTY_SEGMENT_VALUES = ["residential", "commercial"];
 
 export function isPropertySegment(value) {
-  return PROPERTY_SEGMENTS.some((segment) => segment.value === value);
+  return PROPERTY_SEGMENT_VALUES.includes(value);
 }
 
-export function propertyTypeInSegment(slug, segment) {
-  if (!segment) return true;
-  if (segment === "commercial") return COMMERCIAL.has(slug);
-  if (segment === "residential") return !COMMERCIAL.has(slug) || BOTH.has(slug);
-  return false;
+/** Accepts "Residential", "commercial", "R", "C" (feeds and CSVs spell it many ways). */
+export function normalizeSegment(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (!text) return null;
+  if (text === "r" || text.startsWith("resid")) return "residential";
+  if (text === "c" || text.startsWith("commer")) return "commercial";
+  return text;
 }
 
-/**
- * The search condition for a segment, on `listing_search.category_slug`.
- *
- * Commercial is a closed list. Residential is "everything that is not commercial-only", so a new
- * residential type is matched the day it is added; a listing with no category stays residential.
- */
-export function segmentCondition(segment, column = "ls.category_slug") {
-  if (segment === "commercial") {
-    return { sql: `${column} IN (${COMMERCIAL_TYPES.map(() => "?").join(", ")})`, params: [...COMMERCIAL_TYPES] };
-  }
-  if (segment === "residential") {
-    return {
-      sql: `(${column} IS NULL OR ${column} NOT IN (${COMMERCIAL_ONLY.map(() => "?").join(", ")}))`,
-      params: [...COMMERCIAL_ONLY],
-    };
-  }
-  return null;
+/** Whether a property type (its `categories.property_segment`) may be listed under `segment`. */
+export function typeFitsSegment(typeSegment, segment) {
+  return !typeSegment || typeSegment === "both" || typeSegment === segment;
+}
+
+/** The search condition for a segment, on the projection's stored copy. */
+export function segmentCondition(segment, column = "ls.property_segment") {
+  if (!isPropertySegment(segment)) return null;
+  return { sql: `${column} = ?`, params: [segment] };
 }
 
 /**

@@ -41,7 +41,7 @@ async function importPortalListing(accountId, userId, title) {
   );
   const portal = client();
   await portal.login(owner.email);
-  const response = await portal.send("post", "/v1/portal/listings", { category: "real-estate", title, status: "draft", locationId: "1231", price: 100000, currency: "AED", purpose: "sale" });
+  const response = await portal.send("post", "/v1/portal/listings", { category: "real-estate", propertySegment: "residential", title, status: "draft", locationId: "1231", price: 100000, currency: "AED", purpose: "sale" });
   expect(response.status, JSON.stringify(response.body)).toBe(201);
   return queryOne("SELECT reference FROM listings WHERE account_id = ? AND title = ?", [accountId, title]);
 }

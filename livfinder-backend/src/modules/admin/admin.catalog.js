@@ -14,6 +14,7 @@ import * as options from "./admin.options.js";
 import { CATEGORY_DEFINITIONS } from "../../utils/categories.js";
 import { AppError } from "../../utils/errors.js";
 import { isAddonActive, listAccountAddons, planAddonsByPlan, serializePlanAddons } from "../accounts/addons.service.js";
+import { qualityBand } from "../quality/listingQuality.js";
 import {
   LAUNCH_STATUSES,
   OWNERSHIP_TYPES,
@@ -95,6 +96,7 @@ function listingColumnFilterSpec(definition) {
     { type: "in", key: "propertyType", column: "(SELECT COALESCE(pc.code, pc.id) FROM categories pc WHERE pc.id = l.category_id)" },
     { type: "in", key: "brand", column: "l.brand_id", map: (value) => (/^\d+$/.test(value) ? value : null) },
     { type: "range", keys: ["priceMin", "priceMax"], column: "l.price", decimal: true },
+    { type: "range", keys: ["qualityMin", "qualityMax"], column: "l.quality_score" },
     { type: "range", keys: ["bedsMin", "bedsMax"], column: detailColumn("listing_real_estate", "bedrooms") },
     { type: "range", keys: ["bathsMin", "bathsMax"], column: detailColumn("listing_real_estate", "bathrooms") },
     ...(year ? [{ type: "range", keys: ["yearMin", "yearMax"], column: year }] : []),
@@ -166,14 +168,14 @@ export async function listAdminListings({
   const { page: safePage, pageSize: safeSize, offset } = adminPagination({ page, pageSize });
   // The id breaks ties, so a page boundary never repeats or skips a listing.
   const orderBy = `${
-    { newest: "l.created_at DESC", oldest: "l.created_at ASC", priceDesc: "l.price DESC", priceAsc: "l.price ASC", views: "l.view_count DESC" }[sort] ||
+    { newest: "l.created_at DESC", oldest: "l.created_at ASC", priceDesc: "l.price DESC", priceAsc: "l.price ASC", views: "l.view_count DESC", qualityAsc: "l.quality_score ASC", qualityDesc: "l.quality_score DESC" }[sort] ||
     "l.created_at DESC"
   }, l.id DESC`;
 
   const [rows, total, summary] = await Promise.all([
     query(
       `SELECT l.id, l.public_id, l.reference, l.title, l.status, l.moderation_status, l.price,
-              l.currency_code, l.created_at, l.published_at, l.updated_at,
+              l.currency_code, l.created_at, l.published_at, l.updated_at, l.quality_score,
               (SELECT r.status FROM listing_revisions r WHERE r.id = l.pending_revision_id) AS pending_changes,
               -- Fall back to the first gallery image, then to any image file on the
               -- listing (a photo uploaded as a floor plan or document), so the admin
@@ -432,6 +434,9 @@ export function serializeAdminListingRow(row) {
     propertyType: row.category_name,
     views: int(row.view_count) ?? 0,
     inquiries: int(row.inquiry_count) ?? 0,
+    // 0–100 (0078); red under 50, yellow under 80, green from 80.
+    qualityScore: int(row.quality_score) ?? 0,
+    qualityTone: qualityBand(row.quality_score).tone,
     dateAdded: isoDate(row.created_at),
     publishedAt: isoDate(row.published_at),
     updatedAt: isoDate(row.updated_at),
@@ -1818,10 +1823,16 @@ export async function listAdminAgents({ status = "all", search = "", organizatio
     return map;
   }, new Map());
 
+  // Each agent's quality score (70% live listings, 30% profile) and Verified Agent tick.
+  const { agentQualities } = await import("../quality/profileQuality.js");
+  const qualities = await agentQualities(rows.map((row) => row.id));
   return adminList({
     items: rows.map((row) => ({
       id: row.public_id,
       agentId: String(row.id),
+      qualityScore: qualities.get(Number(row.id))?.score ?? 0,
+      qualityTone: qualityBand(qualities.get(Number(row.id))?.score ?? 0).tone,
+      verified: row.verification_status === "verified",
       reference: `AGT-${String(row.id).padStart(5, "0")}`,
       firstName: row.first_name,
       lastName: row.last_name,
@@ -2111,7 +2122,7 @@ export async function listAdminCategories({ search = "", status = "all", parent 
     query(
       `SELECT c.id, c.public_id, c.name, c.name_plural, c.slug, c.code, c.description, c.status,
               c.sort_order, c.parent_id, c.root_category_id, c.listing_count, c.active_listing_count,
-              c.created_at, c.updated_at, p.name AS parent_name
+              c.property_segment, c.created_at, c.updated_at, p.name AS parent_name
          FROM categories c LEFT JOIN categories p ON p.id = c.parent_id
          ${where} ORDER BY c.sort_order ASC, c.name ASC, c.id ASC LIMIT ${safeSize} OFFSET ${offset}`,
       params
@@ -2133,6 +2144,8 @@ export async function listAdminCategories({ search = "", status = "all", parent 
       parentId: row.parent_id ? String(row.parent_id) : null,
       parentName: row.parent_name,
       rootCategory: frontendCategoryId(row.root_category_id),
+      // Real estate types: residential | commercial | both (0077).
+      propertySegment: row.property_segment ?? null,
       listings: int(row.active_listing_count) ?? 0,
       totalListings: int(row.listing_count) ?? 0,
       dateAdded: isoDate(row.created_at),
@@ -2295,7 +2308,7 @@ export async function listOwnerListings({ ownerType, ownerId, page = 1, pageSize
   const [rows, total] = await Promise.all([
     query(
       `SELECT l.id, l.public_id, l.reference, l.title, l.status, l.moderation_status, l.price,
-              l.currency_code, l.created_at, l.published_at, l.updated_at,
+              l.currency_code, l.created_at, l.published_at, l.updated_at, l.quality_score,
               (SELECT r.status FROM listing_revisions r WHERE r.id = l.pending_revision_id) AS pending_changes,
               COALESCE(
                 l.cover_image_url,

@@ -166,6 +166,8 @@ router.get(
         // An owner's changes to this live listing waiting for approval, with the comparison
         // against the approved version the site still shows (0060).
         pendingChanges: await revisionForReview(result.raw.id),
+        // The quality score and its breakdown, as the owner sees it in the portal.
+        quality: await (await import("../quality/listingQuality.js")).computeListingQuality(result.raw.id),
       })
     );
   })

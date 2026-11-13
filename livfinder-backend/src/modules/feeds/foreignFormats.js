@@ -1,4 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
+import { FEED_XML_ENTITIES } from "./xmlEntities.js";
 
 /**
  * Property Finder and Bayut XML, read into LivFinder's real-estate fields (Phase 5).
@@ -20,7 +21,7 @@ const parser = new XMLParser({
   attributeNamePrefix: "@_",
   parseTagValue: false,
   trimValues: true,
-  processEntities: true,
+  processEntities: FEED_XML_ENTITIES,
   isArray: (name) => ["property", "listing", "url", "image", "photo", "feature", "amenity", "facility"].includes(String(name).toLowerCase()),
 });
 
@@ -36,8 +37,34 @@ const PF_TYPES = {
   RE: "retail",
   WB: "whole-building",
   HA: "hotel-apartment",
-  BU: "villa",
+  // Commercial types (0077). Bulk units are commercial on Property Finder, not villas.
+  BU: "bulk-unit",
+  SH: "shop",
+  SR: "showroom",
+  WH: "warehouse",
+  FA: "factory",
+  LC: "labour-camp",
+  FF: "commercial-floor",
+  HF: "commercial-floor",
 };
+
+/** Property Finder's offering type: RS / RR residential, CS / CR commercial. */
+function pfSegment(offering) {
+  if (/^R[SR]$/.test(offering)) return "residential";
+  if (/^C[SR]$/.test(offering)) return "commercial";
+  return undefined;
+}
+
+/** Bayut names some types with their segment: "Commercial Plot", "Residential Building". */
+function bayutType(value) {
+  const match = /^(residential|commercial)\s+(.+)$/i.exec(String(value || "").trim());
+  if (!match) return { propertyType: value || undefined, propertySegment: undefined };
+  const type = match[2].trim();
+  return {
+    propertyType: /^building$/i.test(type) ? "whole-building" : type,
+    propertySegment: match[1].toLowerCase(),
+  };
+}
 
 const lowerKeys = (node) =>
   node && typeof node === "object" && !Array.isArray(node)
@@ -95,6 +122,41 @@ function compact(values) {
 /* Property Finder                                                             */
 /* -------------------------------------------------------------------------- */
 
+/** A price of 0 (or less) is how some exports leave a price out; it is read as no price. */
+const realPrice = (value) => (value !== undefined && Number(String(value).replace(/[\s,]/g, "")) > 0 ? value : undefined);
+
+// Some exports name the UAE in words rather than by code.
+const COUNTRY_WORDS = { uae: "AE", "u.a.e": "AE", "u.a.e.": "AE", "united arab emirates": "AE" };
+
+/**
+ * Where the listing is. The common export has `city` / `community` / `sub_community`; another
+ * (LuxuryProperty.com and others built on the same CRM) has `location_lv1` … `location_lv5`:
+ * country, emirate, community, sub-community, building. In LivFinder the emirate is both the
+ * state and its city (Dubai → Dubai), so lv2 is given as the city.
+ */
+function pfLocation(node) {
+  const levels = [1, 2, 3, 4, 5].map((level) => pick(node, `location_lv${level}`));
+  if (!levels.some(Boolean)) {
+    return { country: pick(node, "country") || "AE", city: pick(node, "city"), community: pick(node, "community"), subCommunity: pick(node, "sub_community") };
+  }
+  const [country, city, community, subCommunity, building] = levels;
+  return {
+    country: (country && COUNTRY_WORDS[country.toLowerCase()]) || country || "AE",
+    city,
+    community,
+    subCommunity,
+    building,
+  };
+}
+
+/** `Square Foot` / `sqft` or `Square Meter` / `sqm`: which of the two area fields a size goes in. */
+const inSquareMetres = (unit) => /(met|sqm|m2|m²)/i.test(String(unit || ""));
+
+/** A date or date-time as YYYY-MM-DD, or nothing. */
+const dateOnly = (value) => (/^\d{4}-\d{2}-\d{2}/.test(String(value || "")) ? String(value).slice(0, 10) : undefined);
+
+const RENT_PERIODS = { year: "yearly", month: "monthly", week: "weekly", day: "daily" };
+
 function propertyFinderEntry(node) {
   const offering = String(pick(node, "offering_type") || "").toUpperCase();
   const isRent = /R$/.test(offering) || /rent/i.test(offering);
@@ -111,7 +173,16 @@ function propertyFinderEntry(node) {
       }
     }
   }
-  const typeCode = String(pick(node, "property_type") || "").toUpperCase();
+  price = realPrice(price);
+  // Two-letter codes (AP, VH…) on Property Finder's own format; some exports spell the type out.
+  const typeText = pick(node, "property_type") || "";
+  const typeCode = typeText.toUpperCase();
+  // Residential / Commercial: from the offering code (RS, CR…) or a <category> element.
+  const segment = pfSegment(offering) ?? (/^(residential|commercial)$/i.test(pick(node, "category") || "") ? pick(node, "category").toLowerCase() : undefined);
+  const location = pfLocation(node);
+  const sizeInMetres = inSquareMetres(pick(node, "size_measure", "size_unit"));
+  const plotInMetres = inSquareMetres(pick(node, "plot_size_measure", "plot_size_unit", "size_measure"));
+  const rentPeriod = isRent ? RENT_PERIODS[pricePeriod || "year"] : undefined;
   const agent = lowerKeys(node).agent;
   const photoNode = lowerKeys(node).photo;
   const photos = (Array.isArray(photoNode) ? photoNode : photoNode ? [photoNode] : []).flatMap((photo) => list(lowerKeys(photo).url ?? photo));
@@ -123,30 +194,34 @@ function propertyFinderEntry(node) {
   return compact({
     externalId: pick(node, "reference_number", "reference"),
     purpose: isRent ? "rent" : "sale",
-    propertyType: PF_TYPES[typeCode] || typeCode || undefined,
+    propertyType: PF_TYPES[typeCode] || typeText || undefined,
+    propertySegment: segment,
     title: pick(node, "title_en", "title"),
     description: pick(node, "description_en", "description"),
     price: onRequest ? undefined : price,
     pricePeriod: isRent ? pricePeriod || "year" : undefined,
     isPriceHidden: onRequest ? "yes" : undefined,
-    currency: pick(node, "currency") || "AED",
-    country: pick(node, "country") || "AE",
-    city: pick(node, "city"),
-    community: pick(node, "community"),
-    subCommunity: pick(node, "sub_community"),
+    currency: pick(node, "currency", "currency_code") || "AED",
+    country: location.country,
+    city: location.city,
+    community: location.community,
+    subCommunity: location.subCommunity,
     ...geopoints(pick(node, "geopoints")),
     agentEmail: agent ? pick(agent, "email") : undefined,
     images: photos.filter(Boolean),
     features: amenities,
     bedrooms: bedrooms(pick(node, "bedroom", "bedrooms")),
     bathrooms: pick(node, "bathroom", "bathrooms"),
-    builtAreaSqft: pick(node, "size"),
-    plotAreaSqft: pick(node, "plot_size"),
+    ...(sizeInMetres ? { builtAreaSqm: pick(node, "size") } : { builtAreaSqft: pick(node, "size") }),
+    ...(plotInMetres ? { plotAreaSqm: pick(node, "plot_size") } : { plotAreaSqft: pick(node, "plot_size") }),
     parkingSpaces: pick(node, "parking"),
-    buildingName: pick(node, "property_name"),
+    buildingName: pick(node, "property_name") || location.building,
     permitNumber: pick(node, "permit_number"),
     furnishing: furnishing(pick(node, "furnished")),
     completionStatus: /off/i.test(pick(node, "completion_status") || "") ? "off_plan" : pick(node, "completion_status") ? "ready" : undefined,
+    rentPeriod,
+    chequesAccepted: isRent ? pick(node, "cheques") : undefined,
+    availableFrom: dateOnly(pick(node, "availability_date")),
   });
 }
 
@@ -165,7 +240,7 @@ function bayutEntry(node) {
   return compact({
     externalId: pick(node, "Property_Ref_No", "Reference"),
     purpose: isRent ? "rent" : "sale",
-    propertyType: pick(node, "Property_Type"),
+    ...bayutType(pick(node, "Property_Type")),
     title: pick(node, "Property_Title", "Title"),
     description: pick(node, "Property_Description", "Description"),
     price: pick(node, "Price"),

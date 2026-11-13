@@ -19,6 +19,7 @@ const EXAMPLES = {
   tagline: "A short line about the development",
   purpose: "sale",
   propertyType: "apartments",
+  propertySegment: "residential",
   price: 2500000,
   minPrice: 1200000,
   maxPrice: 4500000,
@@ -71,6 +72,8 @@ const CATEGORY_EXAMPLES = {
   },
   "real-estate": {
     title: "3 bedroom apartment with sea view in Dubai Marina", bedrooms: 3, bathrooms: 3, builtAreaSqft: 2100,
+    // A home's rooms: required for a residential listing, so the sample apartment gives them.
+    halfBathrooms: 1, receptionRooms: 1, maidRooms: 0, parkingSpaces: 2,
     completionStatus: "ready", furnishing: "unfurnished",
   },
 };
@@ -95,7 +98,7 @@ function example(field, category) {
 }
 
 const SAMPLE_KEYS = new Set([
-  "externalId", "title", "name", "tagline", "purpose", "propertyType", "price", "currency", "country", "city",
+  "externalId", "title", "name", "tagline", "purpose", "propertyType", "propertySegment", "price", "currency", "country", "city",
   "community", "subCommunity", "agentEmail", "images", "features", "brand", "model", "minPrice", "status", "launchStatus",
   "handoverDate", "totalUnits", "availableUnits", "highlights", "amenities",
 ]);
@@ -273,7 +276,13 @@ export function listingsXml(sections, baseUrl = "") {
       lines.push(`${open}/>`);
       continue;
     }
-    lines.push(`${open}>`, ...entries.flatMap((entry) => entryXml(format, entry.record, entry.status, 4)), "  </category>");
+    lines.push(`${open}>`);
+    // One listing at a time: spreading every line of a 16,000-listing file into one push() call
+    // overflows the call stack (a million arguments).
+    for (const entry of entries) {
+      for (const line of entryXml(format, entry.record, entry.status, 4)) lines.push(line);
+    }
+    lines.push("  </category>");
   }
   lines.push("</livfinder-feed>", "");
   return lines.join("\n");

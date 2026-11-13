@@ -128,6 +128,12 @@ is_post_seed_migration() {
     # 0068 grants categories from seeded listings, so it runs after those are loaded.
     0068_individual_listing_categories.sql)
       return 0 ;;
+    # 0076 folds the seeded Under Construction listings into Off Plan.
+    0076_fold_under_construction.sql)
+      return 0 ;;
+    # 0077 tags the seeded property types and listings Residential / Commercial.
+    0077_property_segments.sql)
+      return 0 ;;
     # 0071 switches on what the seeded plans include for the seeded subscriptions.
     0071_plan_included_addons.sql)
       return 0 ;;

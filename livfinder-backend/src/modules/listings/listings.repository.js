@@ -244,6 +244,17 @@ export async function getListingOwnership(identifier) {
  */
 export async function refreshListingSearch(listingId, executor) {
   await callProcedure("sp_refresh_listing_search", [listingId], executor);
+  // Every write that can change a listing ends here, so its quality score is recomputed with it.
+  // Inside a transaction the new rows are not visible yet; the maintenance sweep scores those.
+  if (!executor && listingId) {
+    try {
+      const { saveListingQuality } = await import("../quality/listingQuality.js");
+      await saveListingQuality(listingId);
+    } catch (error) {
+      const { default: logger } = await import("../../config/logger.js");
+      logger.warn({ err: error, listingId }, "listing quality score failed");
+    }
+  }
 }
 
 export async function recordStatusChange({ listingId, fromStatus, toStatus, userId, reason }, executor) {

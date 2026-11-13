@@ -1,4 +1,5 @@
 import path from "node:path";
+import { normalizeSegment } from "../search/propertySegments.js";
 import { z } from "zod";
 import env from "../../config/env.js";
 import { getPool } from "../../db/pool.js";
@@ -50,6 +51,9 @@ export const listingRecordSchema = z
     category: z.enum(IMPORT_CATEGORIES, { message: `Use one of: ${IMPORT_CATEGORIES.join(", ")}.` }),
     purpose: optionalText(20),
     propertyType: optionalText(80),
+    // Real estate: Residential or Commercial. Worked out from propertyType when the type belongs
+    // to one; required for a Plot or Whole Building, which can be either.
+    propertySegment: z.enum(["residential", "commercial"], { message: "Use residential or commercial." }).optional().nullable(),
     title: z.string().trim().min(4, "Give a title of at least 4 characters.").max(255),
     subtitle: optionalText(255),
     description: optionalText(50_000),
@@ -121,7 +125,12 @@ export function importValidationError(fields, message = "Some information in thi
 
 /** Parses a raw record; throws a 422 with partner-facing field names. */
 export function parseListingRecord(raw) {
-  const parsed = listingRecordSchema.safeParse(raw ?? {});
+  // Feeds spell the segment many ways ("Commercial", "C"); the schema takes the canonical word.
+  const input =
+    raw && typeof raw === "object" && typeof raw.propertySegment === "string"
+      ? { ...raw, propertySegment: normalizeSegment(raw.propertySegment) ?? undefined }
+      : raw;
+  const parsed = listingRecordSchema.safeParse(input ?? {});
   if (!parsed.success) throw importValidationError(fieldsFromIssues(parsed.error.issues));
   return parsed.data;
 }
@@ -147,10 +156,12 @@ async function resolvePropertyType(definition, value) {
   if (!value) return undefined;
   const slug = slugify(value);
   const row = await queryOne(
+    // By code, slug or name — "Labour Camp" and "labour-camp" both find the labour-camp type.
     `SELECT code FROM categories
-      WHERE root_category_id = ? AND deleted_at IS NULL AND (code = ? OR slug = ? OR LOWER(name) = LOWER(?))
+      WHERE root_category_id = ? AND deleted_at IS NULL
+        AND (code = ? OR code = ? OR slug = ? OR LOWER(name) = LOWER(?) OR LOWER(name_plural) = LOWER(?))
       LIMIT 1`,
-    [definition.rootId, value, slug, value]
+    [definition.rootId, value, slug, slug, value, value]
   );
   if (row) return row.code;
   // A type an admin mapped from a company's own word (Phase 5); otherwise it joins their queue.
@@ -249,7 +260,7 @@ async function assertNamesMatchId(location, id) {
 }
 
 /** `location.id` (ours), or names walked down from the country. Returns our numeric location id. */
-export async function resolveImportLocation(location) {
+export async function resolveImportLocation(location, options = {}) {
   if (!location) {
     throw importValidationError({ location: "Give the listing's location, at least its country." });
   }
@@ -296,9 +307,20 @@ export async function resolveImportLocation(location) {
     const mapped = row ? null : await findMapping({ type: "location", value, scope: current.id });
     const match = row || (mapped?.id ? await queryOne("SELECT id, level, name FROM locations WHERE id = ? AND deleted_at IS NULL", [mapped.id]) : null);
     if (!match) {
+      // A sub-community LivFinder does not have yet (often a building or project name in a portal
+      // export): the listing goes in under its community, and the name waits in the admin's mapping
+      // queue. Owner's choice, 2026-11-13: nothing is held for it, even when the same name is a
+      // sub-community somewhere else (a "Mayfair" building in Dubai Hills is not London's Mayfair).
+      const keepAtCommunity = step.key === "subCommunity" && options.keepUnknownSubCommunity;
       const misplaced = await wrongParent(step, value, current.name);
-      if (misplaced) throw misplaced;
+      if (misplaced && !keepAtCommunity) throw misplaced;
       await recordUnmapped({ type: "location", value, scope: current.id, label: `${value} (${step.label} in ${current.name})` });
+      if (keepAtCommunity) {
+        if (options.notes) {
+          options.notes.unknownSubCommunity = { value, community: current.name, elsewhere: misplaced?.fields?.[`location.${step.key}`] ?? null };
+        }
+        return current.id;
+      }
       throw new AppError("This listing uses a value LivFinder does not recognise.", {
         status: 422,
         code: "UNMAPPED_VALUE",
@@ -495,7 +517,12 @@ const LEVELS_BELOW = {
   district: [{ column: "community_id", levels: ["sub_community"], field: "subCommunity", label: "sub-community" }],
 };
 
-export async function assertLocationComplete(locationId) {
+/**
+ * Throws when the place stops above a level LivFinder lists under it. With `subCommunityOptional`
+ * a missing sub-community is not refused: the listing goes in under its community (owner's
+ * choice, 2026-11-13, the same as for a sub-community LivFinder lacks), and the result says so.
+ */
+export async function assertLocationComplete(locationId, { subCommunityOptional = false } = {}) {
   const place = await queryOne("SELECT id, level, name FROM locations WHERE id = ?", [locationId]);
   for (const below of LEVELS_BELOW[place?.level] ?? []) {
     const child = await queryValue(
@@ -504,9 +531,11 @@ export async function assertLocationComplete(locationId) {
       [place.id, ...below.levels]
     );
     if (child) {
+      if (subCommunityOptional && below.field === "subCommunity") return { missingSubCommunity: place.name };
       throw importValidationError({ [below.field]: `Give the ${below.label} in ${place.name}. See the LivFinder location files.` });
     }
   }
+  return {};
 }
 
 /**
@@ -532,7 +561,7 @@ async function ensureFeatures(rootId, names) {
 async function buildPayload({ record, definition, client }) {
   const warnings = [];
   // Imported here, not at the top: the feed formats are built from this module's schema.
-  const { missingRequired } = await import("../feeds/listingRequirements.js");
+  const { missingRequired, roomFieldsRequired } = await import("../feeds/listingRequirements.js");
   const missing = missingRequired(record.category, record);
   if (Object.keys(missing).length) throw importValidationError(missing);
 
@@ -549,10 +578,15 @@ async function buildPayload({ record, definition, client }) {
   }
 
   // Settled together, so a listing with an unknown type and an unknown place reports both at once.
+  const locationNotes = {};
   const settled = await Promise.allSettled([
     resolvePropertyType(definition, record.propertyType),
-    resolveImportLocation(record.location).then(async (id) => {
-      await assertLocationComplete(id);
+    resolveImportLocation(record.location, { keepUnknownSubCommunity: true, notes: locationNotes }).then(async (id) => {
+      // An unknown sub-community was given, so the community is as deep as this listing can go.
+      if (!locationNotes.unknownSubCommunity) {
+        const { missingSubCommunity } = await assertLocationComplete(id, { subCommunityOptional: true });
+        if (missingSubCommunity) locationNotes.missingSubCommunity = missingSubCommunity;
+      }
       return id;
     }),
     resolveAgent(client.organizationId, record.agentEmail, warnings),
@@ -568,10 +602,46 @@ async function buildPayload({ record, definition, client }) {
     });
   }
   const [categorySlug, locationId, agentId] = settled.map((result) => result.value);
+  if (locationNotes.missingSubCommunity) {
+    warnings.push(
+      `No sub-community was given, so this listing is under ${locationNotes.missingSubCommunity}. Add its sub-community to place it exactly.`
+    );
+  }
+  const unknownSub = locationNotes.unknownSubCommunity;
+  if (unknownSub) {
+    warnings.push(
+      unknownSub.elsewhere
+        ? `${unknownSub.elsewhere} This listing is under ${unknownSub.community}; LivFinder has been asked to map the name.`
+        : `The sub-community "${unknownSub.value}" is not on LivFinder yet, so this listing is under ${unknownSub.community}. LivFinder has been asked to add it.`
+    );
+    // The name is still where the home is: kept as its building when the record names none.
+    if (definition.listingType === "real-estate" && !record.detail?.buildingName) {
+      record.detail = { ...(record.detail ?? {}), buildingName: String(unknownSub.value).slice(0, 180) };
+    }
+  }
+
+  // Rooms, now the type is known: bedrooms for homes, bathrooms and parking for any building, none
+  // for land. The segment is the record's own, or the type's when it belongs to only one.
+  if (definition.listingType === "real-estate" && categorySlug) {
+    const type = await queryOne(
+      "SELECT code, property_segment FROM categories WHERE code = ? AND root_category_id = ? LIMIT 1",
+      [categorySlug, definition.rootId]
+    );
+    const single = ["residential", "commercial"].includes(type?.property_segment) ? type.property_segment : null;
+    const segment = record.propertySegment || single;
+    const land = ["plot", "industrial-land"].includes(type?.code);
+    const blankDetail = (key) => record.detail?.[key] === undefined || record.detail?.[key] === null || record.detail?.[key] === "";
+    const missingRooms = Object.fromEntries(
+      roomFieldsRequired({ segment, land }).filter(blankDetail).map((key) => [key, "This is required."])
+    );
+    if (Object.keys(missingRooms).length) throw importValidationError(missingRooms);
+  }
 
   const payload = {
     category: definition.dbCode,
     categorySlug,
+    // Checked against the type by createListing (listings/propertySegment.js).
+    propertySegment: definition.listingType === "real-estate" ? record.propertySegment ?? undefined : undefined,
     purpose,
     title: record.title,
     subtitle: record.subtitle ?? undefined,
@@ -665,9 +735,14 @@ export async function importListing({ client, ctx, record, source = "api", impor
     // A listing made in the portal shows on the link under its reference. Sent back with that id
     // it is the same listing, from now on tied to this client's system, never a second copy.
     if (!reference) {
+      // Also one this client's import created but did not finish linking (the process stopped
+      // between the two): it carries the externalId from birth, so it is adopted, not copied.
       const own = await queryOne(
-        "SELECT id FROM listings WHERE reference = ? AND (account_id = ? OR organization_id <=> ?) AND deleted_at IS NULL LIMIT 1",
-        [record.externalId, client.accountId, client.organizationId ?? -1]
+        `SELECT id FROM listings
+          WHERE (reference = ? OR (source_reference = ? AND source <> 'manual'))
+            AND (account_id = ? OR organization_id <=> ?) AND deleted_at IS NULL
+          ORDER BY reference = ? DESC, id ASC LIMIT 1`,
+        [record.externalId, record.externalId.slice(0, 120), client.accountId, client.organizationId ?? -1, record.externalId]
       );
       if (own) {
         listing = await loadListing(own.id);
@@ -743,6 +818,7 @@ export async function importListing({ client, ctx, record, source = "api", impor
         organizationId: client.organizationId,
         agentId: null,
         ip,
+        origin: { source, sourceReference: record.externalId, apiClientId: client.id },
       });
       listing = await loadListing(created.listingId);
       operation = "create";

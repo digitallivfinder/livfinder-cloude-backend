@@ -98,7 +98,15 @@ function describe(schema) {
 // listing's status is chosen in the portal (a feed only syncs).
 const ENVELOPE_SKIP = new Set(["category", "detail", "status", "location"]);
 // Real estate has no make and model.
-const ENVELOPE_SKIP_BY_CATEGORY = { "real-estate": new Set(["brand", "model"]) };
+// Residential / Commercial is real estate's alone.
+const ENVELOPE_SKIP_BY_CATEGORY = {
+  "real-estate": new Set(["brand", "model"]),
+  cars: new Set(["propertySegment"]),
+  yachts: new Set(["propertySegment"]),
+  jets: new Set(["propertySegment"]),
+  helicopters: new Set(["propertySegment"]),
+  watches: new Set(["propertySegment"]),
+};
 
 const LOCATION_KEYS = { id: "locationId", country: "country", state: "state", city: "city", community: "community", subCommunity: "subCommunity" };
 
@@ -108,6 +116,7 @@ const DESCRIPTIONS = {
   description: "Plain text or simple HTML.",
   purpose: "sale, rent or charter, as the category allows.",
   propertyType: "The listing's type within the category, by its LivFinder code or name.",
+  propertySegment: "residential or commercial. The property type must belong to it.",
   price: "A number without separators.",
   currency: "3-letter code, such as AED.",
   country: "2-letter code or the country's name.",

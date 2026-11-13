@@ -69,7 +69,13 @@ export async function runListingMaintenance() {
   await callProcedure("sp_refresh_entity_counters", []);
   const refreshed = await refreshStaleProjections();
   const pruned = await pruneSitemapEntries();
-  return { expired, refreshed, pruned };
+  // Quality scores for listings never scored or changed since (0078).
+  const { refreshDueQualityScores } = await import("../quality/listingQuality.js");
+  const scored = await refreshDueQualityScores().catch((error) => {
+    logger.warn({ err: error }, "quality score sweep failed");
+    return 0;
+  });
+  return { expired, refreshed, pruned, scored };
 }
 
 export function startListingMaintenance({ intervalMs = 10 * 60 * 1000 } = {}) {
@@ -79,7 +85,7 @@ export function startListingMaintenance({ intervalMs = 10 * 60 * 1000 } = {}) {
     running = true;
     try {
       const result = await runListingMaintenance();
-      if (result.expired || result.refreshed || result.pruned) logger.info(result, "listing maintenance");
+      if (result.expired || result.refreshed || result.pruned || result.scored) logger.info(result, "listing maintenance");
     } catch (error) {
       logger.error({ err: error }, "listing maintenance failed");
     } finally {

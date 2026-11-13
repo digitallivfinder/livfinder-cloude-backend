@@ -27,8 +27,30 @@ const OPTIONAL_DETAILS = {
 
 const notElectric = (record) => record.detail?.fuelType !== "electric";
 
+/**
+ * Rooms belong to homes, and land has none. Whether a listing is a home depends on its type in
+ * LivFinder's list and its Residential / Commercial, so these are checked once the type has been
+ * looked up (`roomFieldsRequired`, from listingImport.service), not from the record alone.
+ */
+const HOME_ROOMS = ["bedrooms", "receptionRooms", "maidRooms"];
+const BUILT_ROOMS = ["bathrooms", "halfBathrooms", "parkingSpaces"];
+// What the record alone can show: a type word that reads as land has no rooms, and a record that
+// says it is residential has bedrooms. Everything else waits for the type lookup.
+const landWord = (record) => /(^|[^a-z])(plot|land)/i.test(String(record.propertyType || ""));
+const saysResidential = (record) => /^(r|resid)/i.test(String(record.propertySegment || "").trim());
+const homeRoomsFromRecord = (record) => saysResidential(record) && !landWord(record);
+const builtRoomsFromRecord = (record) => !landWord(record);
+
+/** The room fields a real-estate listing must give, once its type and segment are known. */
+export function roomFieldsRequired({ segment, land }) {
+  if (land) return [];
+  return segment === "commercial" ? [...BUILT_ROOMS] : [...HOME_ROOMS, ...BUILT_ROOMS];
+}
+
 const REQUIRED_WHEN = {
   "real-estate": {
+    ...Object.fromEntries(HOME_ROOMS.map((key) => [key, homeRoomsFromRecord])),
+    ...Object.fromEntries(BUILT_ROOMS.map((key) => [key, builtRoomsFromRecord])),
     handoverDate: (record) => record.detail?.completionStatus && record.detail.completionStatus !== "ready",
     rentPeriod: (record) => record.purpose === "rent",
     chequesAccepted: (record) => record.purpose === "rent",
@@ -67,10 +89,13 @@ export function requirementNote(category, field) {
   if (field.key in (REQUIRED_WHEN[category] || {})) return "Required when it applies to this listing.";
   if (field.key === "images") return `At least ${MIN_IMAGES} images.`;
   if (field.key === "country") return "Required unless locationId is given.";
+  if (field.key === "propertySegment") return "Required for a plot or a whole building; otherwise taken from propertyType.";
   if (field.key === "state") return "Required only if the country has states but no cities on LivFinder.";
   if (field.key === "city") return "Required where the country has cities on LivFinder.";
   if (field.key === "community") return "Required where the city has communities on LivFinder.";
-  if (field.key === "subCommunity") return "Required where the community has sub-communities on LivFinder.";
+  if (field.key === "subCommunity") {
+    return "Give it where the community has sub-communities on LivFinder. Without it, or with one LivFinder does not have yet, the listing goes in under its community, with a warning.";
+  }
   if (field.key === "price" || field.key === "currency") return "Required unless priceType is on_request.";
   if (field.key === "latitude" || field.key === "longitude") return "Optional, but give both or neither.";
   if (field.key === "agentEmail") return "Required for a company with agents.";

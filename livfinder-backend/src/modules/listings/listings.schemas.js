@@ -9,6 +9,8 @@ const optionalInt = (min = 0, max = 1e9) => z.coerce.number().int().min(min).max
 const commonListing = {
   category: z.string().trim().min(1, "Choose a category.").max(40),
   categorySlug: optionalText(80),
+  // Real estate: Residential / Commercial, chosen before the type (see listings/propertySegment.js).
+  propertySegment: z.enum(["residential", "commercial"]).optional().nullable(),
   purpose: z.string().trim().max(20).optional(),
   title: z.string().trim().min(4, "Enter a title.").max(255),
   subtitle: optionalText(255),

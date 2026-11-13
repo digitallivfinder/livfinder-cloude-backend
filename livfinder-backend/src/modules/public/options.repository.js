@@ -1,7 +1,7 @@
 import { query } from "../../db/query.js";
 import { resolveCategory } from "../../utils/categories.js";
 import { SPEC_MAP } from "../search/searchFilters.js";
-import { PROPERTY_SEGMENTS, propertyTypeInSegment } from "../search/propertySegments.js";
+import { isPropertySegment } from "../search/propertySegments.js";
 import { resolveLocation, searchLocations, toEntity } from "../locations/locations.repository.js";
 
 /**
@@ -173,41 +173,50 @@ export async function listModels(listingType, { brandSlug = null, q = null, limi
 }
 
 /** Sub-categories, e.g. the real-estate property types or the yacht types. */
-export async function listCategoryTypes(listingType, { q = null, limit = 60, segment = null } = {}) {
+export async function listCategoryTypes(listingType, { q = null, limit = 60, segment = null, all = false } = {}) {
   const definition = resolveCategory(listingType);
   if (!definition) return [];
+  const safeLimit = Math.min(200, Math.max(1, Number(limit) || 60));
+  // Real estate's Residential / Commercial: the types tagged with it or with "both" (0077), and
+  // their counts from that segment's listings only.
+  const seg = definition.listingType === "real-estate" && isPropertySegment(segment) ? segment : null;
+  const liveParams = [definition.rootId];
+  let liveFilter = "";
+  if (seg) {
+    liveFilter = " AND property_segment = ?";
+    liveParams.push(seg);
+  }
   const params = [definition.rootId];
   let filter = "";
   if (q) {
-    filter = " AND c.name LIKE ?";
+    filter += " AND c.name LIKE ?";
     params.push(`${q}%`);
   }
-  // A segment narrows the list after the query, so it never changes how the rows are counted.
-  if (segment && definition.listingType === "real-estate") {
-    const rows = await listCategoryTypes(listingType, { q, limit: 200 });
-    return rows.filter((row) => propertyTypeInSegment(row.value, segment)).slice(0, Math.min(200, Math.max(1, Number(limit) || 60)));
+  if (seg) {
+    filter += " AND c.property_segment IN (?, 'both')";
+    params.push(seg);
   }
-  const safeLimit = Math.min(200, Math.max(1, Number(limit) || 60));
   /**
    * Counted from the projection, and ordered by it.
    *
    * `categories.active_listing_count` is a stored rollup that drifts, and the list is what the
    * category strip and the type filter both draw on — a type with nothing behind it is an option
-   * that can only ever return an empty page.
+   * that can only ever return an empty page. `all` (the add / edit forms) lifts that: a listing
+   * may be the first of its type, so every active type is offered, in catalogue order.
    */
   const rows = await query(
-    `SELECT c.id, c.slug, c.name, COALESCE(live.n, 0) AS live_count
+    `SELECT c.id, c.slug, c.name, c.property_segment, COALESCE(live.n, 0) AS live_count
        FROM categories c
-       JOIN (
+       ${all ? "LEFT JOIN" : "JOIN"} (
          SELECT category_slug, COUNT(*) AS n FROM listing_search
-          WHERE root_category_id = ? AND category_slug IS NOT NULL
+          WHERE root_category_id = ? AND category_slug IS NOT NULL${liveFilter}
           GROUP BY category_slug
        ) live ON live.category_slug = c.slug
       WHERE c.root_category_id = ? AND c.id <> c.root_category_id
         AND c.status = 'active' AND c.is_visible = 1 AND c.deleted_at IS NULL${filter}
-      ORDER BY live.n DESC, c.sort_order ASC, c.name ASC
+      ORDER BY ${all ? "c.sort_order ASC, c.name ASC" : "live.n DESC, c.sort_order ASC, c.name ASC"}
       LIMIT ${safeLimit}`,
-    [params[0], ...params]
+    [...liveParams, ...params]
   );
   return rows.map((row) => ({
     id: `category:${row.slug}`,
@@ -222,6 +231,8 @@ export async function listCategoryTypes(listingType, { q = null, limit = 60, seg
     slug: row.slug,
     label: row.name,
     type: "propertyType",
+    // residential | commercial | both, for real estate; lets a form re-check a chosen type.
+    segment: row.property_segment ?? null,
     listingCount: Number(row.live_count || 0),
   }));
 }
@@ -413,13 +424,14 @@ export async function filterOptions(category, filterKey, { q = null, parent = nu
   }
 
   if (["propertyType", "category", "assetType"].includes(filterKey)) {
-    // Real estate's `parent` is the Residential / Commercial segment.
-    const segment = listingType === "real-estate" && PROPERTY_SEGMENTS.some((row) => row.value === parent) ? parent : null;
-    return listCategoryTypes(listingType, { q, limit, segment });
+    // Real estate's `parent` is the Residential / Commercial segment; `all` is the forms' full list.
+    const segment = listingType === "real-estate" && isPropertySegment(parent) ? parent : null;
+    return listCategoryTypes(listingType, { q, limit, segment, all });
   }
 
   if (listingType === "real-estate" && filterKey === "propertySegment") {
-    return PROPERTY_SEGMENTS.map((row) => ({ id: `segment:${row.value}`, ...row, slug: row.value, type: "propertySegment" }));
+    // The values of the `listings.property_segment` column, in its order.
+    return enumOptions("listings", "property_segment", "propertySegment");
   }
 
   if (listingType === "real-estate" && filterKey === "rentPeriod") {

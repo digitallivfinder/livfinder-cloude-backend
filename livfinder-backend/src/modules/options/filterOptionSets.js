@@ -124,6 +124,8 @@ registerOptionSets({
   },
   "location.status": enumSet("locations", "status"),
   "category.status": enumSet("categories", "status"),
+  // A real-estate property type's segment (0077): Plot and Whole Building are "both".
+  "category.propertySegment": enumSet("categories", "property_segment", { labels: { both: "Both" } }),
   "feedMapping.kind": fixedSet(MAPPING_TYPES.map((type) => [type, { location: "Place", category: "Property type" }[type] ?? sentenceLabel(type)])),
   "report.status": enumSet("reports", "status", { labels: { in_review: "Under review" } }),
   "report.priority": enumSet("reports", "priority"),

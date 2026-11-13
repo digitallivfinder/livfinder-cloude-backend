@@ -162,6 +162,9 @@ export async function processImport(importId) {
   if (developments) await importDevelopmentsRun({ run, client, ctx });
 
   for (const item of developments ? [] : items) {
+    // Another worker that picked this import up again may have done this one already.
+    const still = await queryOne("SELECT status FROM feed_import_items WHERE id = ?", [item.id]);
+    if (still?.status !== "queued") continue;
     try {
       // A key revoked, or a company suspended, after the batch was accepted stops the rest of it.
       if (!client || client.status !== "active" || client.organizationStatus !== "active") {
@@ -189,16 +192,31 @@ export async function processImport(importId) {
   return status;
 }
 
+// A running import with no listing processed for this long is taken to have stopped (a restart).
+const STALLED_MINUTES = 5;
+
+/** Puts back in the queue any running import that has stopped making progress (a restart). */
+export async function requeueStalledImports(providerId) {
+  // Stranded = nothing processed for a while, not merely started long ago: a 16,000-listing file
+  // runs for half an hour or more, and must not get a second worker while the first is busy.
+  const result = await execute(
+    `UPDATE feed_imports fi SET fi.status = 'queued'
+      WHERE fi.provider_id = ? AND fi.status = 'running' AND fi.started_at < DATE_SUB(NOW(3), INTERVAL ${STALLED_MINUTES} MINUTE)
+        AND EXISTS (SELECT 1 FROM feed_import_items fii WHERE fii.import_id = fi.id AND fii.status = 'queued')
+        AND NOT EXISTS (
+          SELECT 1 FROM feed_import_items done
+           WHERE done.import_id = fi.id AND done.status <> 'queued' AND done.processed_at > DATE_SUB(NOW(3), INTERVAL ${STALLED_MINUTES} MINUTE)
+        )`,
+    [providerId]
+  );
+  return result.affectedRows;
+}
+
 /** Picks up imports left queued, or stranded mid-run by a restart, and processes them. */
 export async function runQueuedImports() {
   const providerId = await importProviderId().catch(() => null);
   if (!providerId) return 0;
-  await execute(
-    `UPDATE feed_imports fi SET fi.status = 'queued'
-      WHERE fi.provider_id = ? AND fi.status = 'running' AND fi.started_at < DATE_SUB(NOW(3), INTERVAL 15 MINUTE)
-        AND EXISTS (SELECT 1 FROM feed_import_items fii WHERE fii.import_id = fi.id AND fii.status = 'queued')`,
-    [providerId]
-  );
+  await requeueStalledImports(providerId);
   const due = await query(
     `SELECT id FROM feed_imports
       WHERE provider_id = ? AND status = 'queued' AND created_at < DATE_SUB(NOW(3), INTERVAL 10 SECOND)

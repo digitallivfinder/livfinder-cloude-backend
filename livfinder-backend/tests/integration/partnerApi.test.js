@@ -332,7 +332,8 @@ describe("single push", () => {
       location: { country: location.country_name, city: location.city_name },
     });
     expect(response.status).toBe(422);
-    expect(Object.keys(response.body.error.fields)).toEqual(expect.arrayContaining(["purpose", "description", "bedrooms", "features", "images"]));
+    // Bedrooms wait for Residential / Commercial (none given here); bathrooms apply to any building.
+    expect(Object.keys(response.body.error.fields)).toEqual(expect.arrayContaining(["purpose", "description", "bathrooms", "features", "images"]));
   });
 
   it("refuses a company's listing with no agent", async () => {
@@ -342,12 +343,13 @@ describe("single push", () => {
     expect(response.body.error.fields.agentEmail).toBeTruthy();
   });
 
-  it("asks for the sub-community where the community has them", async () => {
-    const bad = ext("no-sub");
-    const whole = listing(bad);
-    const response = await as(writeKey).put(`/v1/partner/listings/${bad}`, { ...whole, location: { country: "AE", city: "Dubai", community: "Dubai Marina" } });
-    expect(response.status).toBe(422);
-    expect(response.body.error.fields.subCommunity).toMatch(/sub-community in Dubai Marina/);
+  it("takes a listing with no sub-community in under its community, and says the sub-community is missing", async () => {
+    // Owner's choice, 2026-11-13: a missing sub-community holds nothing, like an unknown one.
+    const id = ext("no-sub");
+    const whole = listing(id);
+    const response = await as(writeKey).put(`/v1/partner/listings/${id}`, { ...whole, location: { country: "AE", city: "Dubai", community: "Dubai Marina" } });
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    expect(JSON.stringify(response.body.data.warnings)).toMatch(/No sub-community was given, so this listing is under Dubai Marina/);
   });
 
   describe("a location goes as deep as LivFinder's list, and no deeper", () => {

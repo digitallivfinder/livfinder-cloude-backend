@@ -2,6 +2,7 @@ import { query, queryOne, queryValue } from "../../db/query.js";
 import { agentIn, applyColumnFilters, locationAtAnyTier } from "../../utils/columnFilters.js";
 import { bool, int, isoDate, isoDay, num } from "../../serializers/primitives.js";
 import { frontendCategoryId, categoryByRootId } from "../../utils/categories.js";
+import { qualityBand } from "../quality/listingQuality.js";
 
 /**
  * Portal read model.
@@ -125,6 +126,9 @@ export function serializePortalListing(row) {
     imageSrc: row.cover_image_url || null,
     image: { src: row.cover_image_url || "/images/realestate-bg.jpeg", alt: row.cover_image_alt || row.title },
     imageCount: int(row.image_count) ?? 0,
+    // 0–100 (0078); red under 50, yellow under 80, green from 80.
+    qualityScore: int(row.quality_score) ?? 0,
+    qualityTone: qualityBand(row.quality_score).tone,
     specs: specsFor(row),
     views: int(row.view_count) ?? 0,
     inquiries: int(row.inquiry_count) ?? 0,
@@ -181,7 +185,7 @@ function categoryLabel(listingType) {
 const PORTAL_LISTING_COLUMNS = `
   l.id, l.public_id, l.reference, l.title, l.slug, l.canonical_path, l.status, l.moderation_status,
   l.root_category_id, l.category_id, l.price, l.currency_code, l.cover_image_url, l.cover_image_alt,
-  l.image_count, l.view_count, l.inquiry_count, l.favourite_count,
+  l.image_count, l.view_count, l.inquiry_count, l.favourite_count, l.quality_score,
   l.created_at, l.updated_at, l.published_at, l.expires_at,
   (SELECT r.status FROM listing_revisions r WHERE r.id = l.pending_revision_id) AS pending_changes,
   cat.name AS category_name,
@@ -228,6 +232,7 @@ export async function listAccountListings({
     locationAtAnyTier("locationId", "l"),
     agentIn("agent", "l.agent_id"),
     { type: "range", keys: ["viewsMin", "viewsMax"], column: "l.view_count" },
+    { type: "range", keys: ["qualityMin", "qualityMax"], column: "l.quality_score" },
     { type: "range", keys: ["inquiriesMin", "inquiriesMax"], column: "l.inquiry_count" },
     { type: "date", keys: ["updatedFrom", "updatedTo"], column: "l.updated_at" },
   ], columnFilters, conditions, params);
@@ -274,6 +279,8 @@ export async function listAccountListings({
       views: "l.view_count DESC",
       inquiries: "l.inquiry_count DESC",
       updated: "l.updated_at DESC",
+      qualityAsc: "l.quality_score ASC, l.id DESC",
+      qualityDesc: "l.quality_score DESC, l.id DESC",
     }[sort] || "l.created_at DESC, l.id DESC";
 
   const safePage = Math.max(1, Number(page) || 1);
@@ -399,7 +406,16 @@ export async function accountDashboard({ accountId, organizationId }) {
       avatar: row.cover_image_url || null,
     })),
     recentListings: recentListings.map(serializePortalListing),
+    // The company's quality score, or the seller's own listings score with no company.
+    quality: await dashboardQuality({ accountId, organizationId }),
   };
+}
+
+async function dashboardQuality({ accountId, organizationId }) {
+  const { organizationQuality, accountListingQuality } = await import("../quality/profileQuality.js");
+  const organization = organizationId ? await organizationQuality(organizationId) : null;
+  if (organization) return { scope: "organization", ...organization };
+  return { scope: "account", ...(await accountListingQuality(accountId)) };
 }
 
 const PERFORMANCE_BUCKETS = 8;

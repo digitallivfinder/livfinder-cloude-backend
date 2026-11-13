@@ -38,6 +38,8 @@ import { createInvoiceCheckout } from "../system/payments.service.js";
 import env from "../../config/env.js";
 import { API_SCOPES } from "../../middleware/apiClient.js";
 import * as importsRepo from "../imports/imports.repository.js";
+import { computeListingQuality } from "../quality/listingQuality.js";
+import { agentQualities } from "../quality/profileQuality.js";
 import { loadOptionSets } from "../options/optionSets.js";
 import { rootIdFor } from "../admin/admin.shared.js";
 import "../options/filterOptionSets.js";
@@ -57,7 +59,8 @@ const scope = (req) => ({
 
 const listQuery = z
   .object({
-    page: z.coerce.number().int().min(1).max(2000).optional(),
+    // 10,000 like the other portal lists: a 16,529-listing account has 3,306 pages at 5 a page.
+    page: z.coerce.number().int().min(1).max(10_000).optional(),
     pageSize: z.coerce.number().int().min(1).max(100).optional(),
     status: z.string().trim().max(40).optional(),
     category: z.string().trim().max(40).optional(),
@@ -208,6 +211,8 @@ router.get(
         gallery: media,
         summary: summary ? portalRepo.serializePortalListing(summary) : null,
         pendingChanges: await openRevisionSummary(listing.id),
+        // The quality score and what would raise it (the Quality Score tab).
+        quality: await computeListingQuality(listing.id),
       })
     );
   })
@@ -798,7 +803,13 @@ router.get(
     const organizationId = requireOrganizationId(req);
     const params = q(req);
     const result = await organizationService.listAgents({ organizationId, ...params });
-    return res.json(listResponse(result.data, { page: result.page, pageSize: result.pageSize, total: result.total }));
+    // Each agent's quality score (70% live listings, 30% profile) and Verified Agent tick.
+    const qualities = await agentQualities(result.data.map((agent) => agent.agentId ?? agent.internalId).filter(Boolean));
+    const data = result.data.map((agent) => {
+      const quality = qualities.get(Number(agent.agentId ?? agent.internalId));
+      return quality ? { ...agent, qualityScore: quality.score, qualityTone: quality.band.tone, verified: quality.verified } : agent;
+    });
+    return res.json(listResponse(data, { page: result.page, pageSize: result.pageSize, total: result.total }));
   })
 );
 

@@ -1,6 +1,7 @@
 import { query, queryOne, queryValue, execute } from "../../db/query.js";
 import { alignRentPeriod } from "./rentPeriod.js";
 import { alignCompletionStatus } from "./completionStatus.js";
+import { decideSegment } from "./propertySegment.js";
 import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
 import { ownAgentClause } from "../../utils/tenantScope.js";
@@ -108,9 +109,9 @@ const BRAND_KIND = {
 const AIRCRAFT_SEGMENT = { jets: "fixed_wing", helicopters: "rotorcraft" };
 
 async function resolveCategoryRow(definition, categorySlug, executor) {
-  if (!categorySlug) return { categoryId: definition.rootId, rootCategoryId: definition.rootId };
+  if (!categorySlug) return { categoryId: definition.rootId, rootCategoryId: definition.rootId, typeSegment: null, typeName: null };
   const row = await queryOne(
-    `SELECT id, root_category_id FROM categories
+    `SELECT id, root_category_id, property_segment, name FROM categories
       WHERE (slug = ? OR code = ?) AND root_category_id = ? AND deleted_at IS NULL LIMIT 1`,
     [categorySlug, categorySlug, definition.rootId],
     executor
@@ -122,7 +123,13 @@ async function resolveCategoryRow(definition, categorySlug, executor) {
       categorySlug: "That type is not available in this category.",
     });
   }
-  return { categoryId: row.id, rootCategoryId: row.root_category_id || definition.rootId };
+  return {
+    categoryId: row.id,
+    rootCategoryId: row.root_category_id || definition.rootId,
+    // Real estate's Residential / Commercial for this type (0077); null elsewhere.
+    typeSegment: row.property_segment ?? null,
+    typeName: row.name ?? null,
+  };
 }
 
 async function resolvePurposeId(purpose, executor) {
@@ -549,14 +556,23 @@ export async function syncOwnerListingCounters({ agentIds = [], organizationId =
   }
 }
 
-export async function createListing({ payload: rawPayload, accountId, userId, organizationId, agentId, ip }) {
+/**
+ * `origin` is for imports only: the listing is written with its source and the client's own id in
+ * the same transaction, so a process stopped mid-import never leaves a listing it cannot recognise.
+ */
+export async function createListing({ payload: rawPayload, accountId, userId, organizationId, agentId, ip, origin = null }) {
   const definition = resolveCategory(rawPayload.category);
   if (!definition) throw AppError.validation("Some information is invalid.", { category: "Unknown category." });
   // A rental's "Rent period" and the price period it is quoted per are one value; see rentPeriod.js.
-  const payload = alignCompletionStatus(definition.listingType, alignRentPeriod(definition.listingType, rawPayload));
+  const payload = alignRentPeriod(definition.listingType, rawPayload);
 
   return withTransaction(async (connection) => {
-    const { categoryId, rootCategoryId } = await resolveCategoryRow(definition, payload.categorySlug, connection);
+    const { categoryId, rootCategoryId, typeSegment, typeName } = await resolveCategoryRow(definition, payload.categorySlug, connection);
+    // Residential / Commercial: chosen first, and the type must belong to it (propertySegment.js).
+    const propertySegment =
+      definition.listingType === "real-estate"
+        ? decideSegment({ requested: payload.propertySegment, typeSegment, typeName })
+        : null;
     await assertStorageAvailable(accountId, connection);
     if (payload.status === "pending_review") await assertLiveSlotAvailable({ accountId, rootCategoryId }, connection);
     const purposeId = await resolvePurposeId(payload.purpose, connection);
@@ -607,7 +623,7 @@ export async function createListing({ payload: rawPayload, accountId, userId, or
           status, moderation_status,
           contact_name, contact_phone, contact_whatsapp, contact_email,
           allow_call, allow_whatsapp, allow_email,
-          seo_title, seo_description, source, created_at)
+          seo_title, seo_description, source, source_reference, source_api_client_id, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                ?, ?, ?, ?, ?, ?,
                -- A listing created with "Submit for review" is submitted: it was written as
@@ -615,7 +631,7 @@ export async function createListing({ payload: rawPayload, accountId, userId, or
                -- listing waiting in the admin queue. MySQL lets a value refer to a column set
                -- earlier in the same row, so this follows the status just inserted.
                IF(status = 'pending_review', 'pending', 'not_submitted'),
-               ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NOW(3))`,
+               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))`,
       [
         publicId,
         reference,
@@ -662,6 +678,9 @@ export async function createListing({ payload: rawPayload, accountId, userId, or
         payload.allowEmail === false ? 0 : 1,
         payload.seoTitle ?? null,
         payload.seoDescription ?? null,
+        origin?.source ?? "manual",
+        origin?.sourceReference ? String(origin.sourceReference).slice(0, 120) : null,
+        origin?.apiClientId ?? null,
       ],
       connection
     );
@@ -677,12 +696,16 @@ export async function createListing({ payload: rawPayload, accountId, userId, or
       year: detailYear(definition.listingType, payload.detail),
     });
     await execute(
-      "UPDATE listings SET slug = ?, canonical_path = ? WHERE id = ?",
-      [slug, canonicalPath, listingId],
+      "UPDATE listings SET slug = ?, canonical_path = ?, property_segment = ? WHERE id = ?",
+      [slug, canonicalPath, propertySegment, listingId],
       connection
     );
 
-    await writeDetail({ listingType: definition.listingType, listingId, detail: payload.detail }, connection);
+    // Shell and core belongs to a commercial listing (completionStatus.js).
+    await writeDetail(
+      { listingType: definition.listingType, listingId, detail: alignCompletionStatus(definition.listingType, payload.detail, propertySegment) },
+      connection
+    );
     if (definition.listingType === "real-estate") {
       await ensurePropertyUnit({
         listingId,
@@ -743,16 +766,7 @@ export async function updateListing({ listing, payload: rawPayload, userId, acco
       definition.listingType === "real-estate" && touchesPeriod && rawPayload.purpose === undefined
         ? await queryValue("SELECT p.code FROM listings l JOIN purposes p ON p.id = l.purpose_id WHERE l.id = ?", [listing.id], connection)
         : null;
-    // Shell and core only for a commercial type; checked against the stored type when not resent.
-    const storedCategory =
-      definition.listingType === "real-estate" && rawPayload.detail?.completionStatus === "shell_and_core" && rawPayload.categorySlug === undefined
-        ? await queryValue("SELECT c.slug FROM listings l JOIN categories c ON c.id = l.category_id WHERE l.id = ?", [listing.id], connection)
-        : null;
-    const payload = alignCompletionStatus(
-      definition.listingType,
-      alignRentPeriod(definition.listingType, rawPayload, storedPurpose),
-      storedCategory
-    );
+    const payload = alignRentPeriod(definition.listingType, rawPayload, storedPurpose);
 
     const assignments = [];
     const params = [];
@@ -793,9 +807,19 @@ export async function updateListing({ listing, payload: rawPayload, userId, acco
       set("currency_code", payload.currency);
     }
 
-    if (payload.categorySlug !== undefined) {
-      const { categoryId } = await resolveCategoryRow(definition, payload.categorySlug, connection);
-      set("category_id", categoryId);
+    if (payload.categorySlug !== undefined || (definition.listingType === "real-estate" && payload.propertySegment !== undefined)) {
+      // The type to check the segment against: the new one, or the stored one when only the
+      // segment changes.
+      const typeSlug =
+        payload.categorySlug !== undefined
+          ? payload.categorySlug
+          : await queryValue("SELECT c.slug FROM listings l JOIN categories c ON c.id = l.category_id WHERE l.id = ?", [listing.id], connection);
+      const { categoryId, typeSegment, typeName } = await resolveCategoryRow(definition, typeSlug, connection);
+      if (payload.categorySlug !== undefined) set("category_id", categoryId);
+      if (definition.listingType === "real-estate") {
+        const stored = await queryValue("SELECT property_segment FROM listings WHERE id = ?", [listing.id], connection);
+        set("property_segment", decideSegment({ requested: payload.propertySegment, typeSegment, typeName, stored }));
+      }
     }
     if (payload.purpose !== undefined) {
       set("purpose_id", await resolvePurposeId(payload.purpose, connection));
@@ -837,7 +861,15 @@ export async function updateListing({ listing, payload: rawPayload, userId, acco
     }
 
     if (payload.detail !== undefined) {
-      await writeDetail({ listingType: definition.listingType, listingId: listing.id, detail: payload.detail }, connection);
+      // Shell and core belongs to a commercial listing; the segment as just saved decides.
+      const segment =
+        definition.listingType === "real-estate" && payload.detail?.completionStatus === "shell_and_core"
+          ? await queryValue("SELECT property_segment FROM listings WHERE id = ?", [listing.id], connection)
+          : null;
+      await writeDetail(
+        { listingType: definition.listingType, listingId: listing.id, detail: alignCompletionStatus(definition.listingType, payload.detail, segment) },
+        connection
+      );
     }
     if (payload.featureIds !== undefined || payload.features !== undefined) {
       await writeFeatures({ listingId: listing.id, featureIds: payload.featureIds, featureSlugs: payload.features }, connection);

@@ -1292,15 +1292,27 @@ export const categorySchema = z.object({
   parentCategory: z.string().trim().max(40).optional(),
   status: z.enum(["active", "inactive", "draft"]).optional(),
   sortOrder: z.coerce.number().int().min(0).max(10000).optional(),
+  // Real estate types only: which segment the type belongs to (Plot and Whole Building are both).
+  propertySegment: z.enum(["residential", "commercial", "both"]).optional(),
 });
 
 export async function upsertCategory({ identifier, payload, userId }) {
   return withTransaction(async (connection) => {
     if (identifier) {
-      const category = await queryOne("SELECT id, public_id FROM categories WHERE public_id = ? AND deleted_at IS NULL", [identifier], connection);
+      const category = await queryOne(
+        `SELECT c.id, c.public_id, c.parent_id, root.code AS root_code FROM categories c
+           JOIN categories root ON root.id = c.root_category_id
+          WHERE c.public_id = ? AND c.deleted_at IS NULL`,
+        [identifier],
+        connection
+      );
       if (!category) throw AppError.notFound("That category was not found.");
       const assignments = [];
       const params = [];
+      if (payload.propertySegment !== undefined && category.root_code === "real-estate" && category.parent_id) {
+        assignments.push("property_segment = ?");
+        params.push(payload.propertySegment);
+      }
       if (payload.name !== undefined) {
         assignments.push("name = ?");
         params.push(payload.name);
@@ -1333,14 +1345,20 @@ export async function upsertCategory({ identifier, payload, userId }) {
 
     const parent = resolveCategory(payload.parentCategory);
     if (!parent) throw AppError.validation("Some information is invalid.", { parentCategory: "Choose a marketplace category." });
+    // A real-estate type must say whether it is residential, commercial or both, or it would be
+    // offered under neither in the listing forms and the website's search.
+    const realEstate = parent.listingType === "real-estate";
+    if (realEstate && !payload.propertySegment) {
+      throw AppError.validation("Some information is invalid.", { propertySegment: "Choose Residential, Commercial or Both." });
+    }
     const publicId = ulid();
     const slug = slugify(payload.slug || payload.namePlural || payload.name);
     const parentRow = await queryOne("SELECT id, path FROM categories WHERE id = ?", [parent.rootId], connection);
     const result = await execute(
       `INSERT INTO categories
          (public_id, parent_id, root_category_id, code, slug, name, name_plural, depth, path,
-          description, status, is_visible, sort_order, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1, ?, NOW(3))`,
+          description, status, is_visible, sort_order, property_segment, detail_table, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1, ?, ?, ?, NOW(3))`,
       [
         publicId,
         parent.rootId,
@@ -1353,6 +1371,8 @@ export async function upsertCategory({ identifier, payload, userId }) {
         payload.description || null,
         payload.status || "active",
         payload.sortOrder ?? 100,
+        realEstate ? payload.propertySegment : null,
+        realEstate ? "real_estate" : null,
       ],
       connection
     );
