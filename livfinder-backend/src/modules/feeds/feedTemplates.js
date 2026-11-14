@@ -267,48 +267,62 @@ function entryXml(format, record, status, indent) {
  * The all-categories file for one client: `sections` is `[{ category, entries }]`, an entry being
  * `{ record, status }`. It can be pushed straight back: `livfinderStatus` is ignored on the way in.
  */
-export function listingsXml(sections, baseUrl = "") {
-  const lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<livfinder-feed version="1">'];
+/**
+ * The client's own file, piece by piece: one string per listing (lines ending "\n"). The read-back
+ * link writes these straight to the response, so a 16,000-listing file (90 MB) is never held
+ * as one string.
+ */
+export function* listingsXmlChunks(sections, baseUrl = "") {
+  yield '<?xml version="1.0" encoding="UTF-8"?>\n<livfinder-feed version="1">\n';
   for (const { category, entries } of sections) {
     const format = feedFormat(category);
     const open = `  <category name="${category}" version="${format.version}" label="${escapeXml(format.label)}" count="${entries.length}" format="${escapeXml(`${baseUrl}/v1/public/feed-formats/${category}`)}"`;
     if (!entries.length) {
-      lines.push(`${open}/>`);
+      yield `${open}/>\n`;
       continue;
     }
-    lines.push(`${open}>`);
-    // One listing at a time: spreading every line of a 16,000-listing file into one push() call
-    // overflows the call stack (a million arguments).
-    for (const entry of entries) {
-      for (const line of entryXml(format, entry.record, entry.status, 4)) lines.push(line);
-    }
-    lines.push("  </category>");
+    yield `${open}>\n`;
+    for (const entry of entries) yield `${entryXml(format, entry.record, entry.status, 4).join("\n")}\n`;
+    yield "  </category>\n";
   }
-  lines.push("</livfinder-feed>", "");
-  return lines.join("\n");
+  yield "</livfinder-feed>\n";
+}
+
+/** Every category's pushed entries as one LivFinder XML file (see listingsXmlChunks). */
+export function listingsXml(sections, baseUrl = "") {
+  return [...listingsXmlChunks(sections, baseUrl)].join("");
 }
 
 const csvValue = (field, value) => csvCell(field.list && Array.isArray(value) ? value.join(LIST_SEPARATOR) : value);
 
-/** One category's pushed entries as a CSV file, with `livfinderStatus` as its last column. */
-export function listingsCsv(category, entries) {
+/** One category's pushed entries as CSV, piece by piece: the header, then one string per entry. */
+export function* listingsCsvChunks(category, entries) {
   const format = feedFormat(category);
   const columns = [...csvColumns(category), "livfinderStatus"];
   const line = (cells) => columns.map((column) => cells[column] ?? "").join(",");
-  const rows = entries.flatMap(({ record, status }) => {
+  yield `${columns.join(",")}\r\n`;
+  for (const { record, status } of entries) {
     const own = Object.fromEntries(format.fields.map((field) => [field.key, csvValue(field, pathValue(record, field.path ?? field.key))]));
-    if (format.entity !== "development") return [line({ ...own, livfinderStatus: csvCell(status) })];
+    if (format.entity !== "development") {
+      yield `${line({ ...own, livfinderStatus: csvCell(status) })}\r\n`;
+      continue;
+    }
     // A development is one row per unit type and payment plan; rows after the first repeat only its id.
     const units = record.unitTypes || [];
     const plans = record.paymentPlans || [];
-    return Array.from({ length: Math.max(units.length, plans.length, 1) }, (_, index) => {
+    const rows = Array.from({ length: Math.max(units.length, plans.length, 1) }, (_, index) => {
       const cells = index ? { externalId: own.externalId } : { ...own, livfinderStatus: csvCell(status) };
       for (const field of format.unitTypeFields) cells[`unit.${field.key}`] = units[index] ? csvCell(pathValue(units[index], field.path ?? field.key)) : "";
       for (const field of format.paymentPlanFields) cells[`plan.${field.key}`] = plans[index] ? csvCell(pathValue(plans[index], field.path ?? field.key)) : "";
       return line(cells);
     });
-  });
-  return [columns.join(","), ...rows].join("\r\n") + "\r\n";
+    yield `${rows.join("\r\n")}\r\n`;
+  }
+}
+
+/** One category's pushed entries as a CSV file, with `livfinderStatus` as its last column. */
+export function listingsCsv(category, entries) {
+  return [...listingsCsvChunks(category, entries)].join("");
 }
 
 /* -------------------------------------------------------------------------- */

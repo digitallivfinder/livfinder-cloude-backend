@@ -12,7 +12,7 @@ import * as repo from "../imports/imports.repository.js";
 import { FEED_CATEGORIES } from "../feeds/feedFormats.js";
 import { MAX_FEED_BYTES } from "../feeds/feedParser.js";
 import { acceptPush, pushedInCategory, pushedSections } from "../feeds/listingPush.service.js";
-import { listingsCsv, listingsXml } from "../feeds/feedTemplates.js";
+import { listingsCsvChunks, listingsXmlChunks } from "../feeds/feedTemplates.js";
 import { mountPartnerLeads } from "../leads/leads.routes.js";
 import { MAX_BULK_LISTINGS, createBulkImport, runSingleImport, runWithdrawal } from "../imports/importRunner.js";
 import {
@@ -138,6 +138,28 @@ function askForLogin(req, res, next) {
 
 const fileBody = express.raw({ type: () => true, limit: MAX_FEED_BYTES });
 
+/**
+ * Sends a file piece by piece, waiting whenever the connection's buffer is full, so a 90 MB
+ * read-back file is never held in memory as one string. Stops if the caller hangs up.
+ */
+async function sendChunks(res, chunks) {
+  for (const chunk of chunks) {
+    if (res.destroyed) return;
+    if (!res.write(chunk)) {
+      await new Promise((resolve) => {
+        const done = () => {
+          res.off("drain", done);
+          res.off("close", done);
+          resolve();
+        };
+        res.on("drain", done);
+        res.on("close", done);
+      });
+    }
+  }
+  if (!res.destroyed) res.end();
+}
+
 async function acceptFile(req, res, category) {
   if (!Buffer.isBuffer(req.body) || !req.body.length) throw AppError.badRequest("Send the file as the request body.");
   const { ip, userAgent } = sourceOf(req);
@@ -152,7 +174,8 @@ router.get(
   asyncHandler(async (req, res) => {
     const sections = await pushedSections({ accountId: req.apiClient.accountId, organizationId: req.apiClient.organizationId, ctx: await connectionFor(req) });
     res.setHeader("Cache-Control", "no-store");
-    return res.type("application/xml").send(listingsXml(sections, `${req.protocol}://${req.get("host")}`));
+    res.setHeader("Content-Type", "application/xml; charset=utf-8");
+    return sendChunks(res, listingsXmlChunks(sections, `${req.protocol}://${req.get("host")}`));
   })
 );
 
@@ -174,7 +197,8 @@ for (const category of FEED_CATEGORIES) {
       const entries = await pushedInCategory({ accountId: req.apiClient.accountId, organizationId: req.apiClient.organizationId, ctx: await connectionFor(req), category });
       res.setHeader("Cache-Control", "no-store");
       // A browser would download text/csv; as plain text the link opens like the XML one.
-      return res.type(req.accepts(["text/csv", "text/html"]) === "text/html" ? "text/plain" : "text/csv").send(listingsCsv(category, entries));
+      res.type(req.accepts(["text/csv", "text/html"]) === "text/html" ? "text/plain" : "text/csv");
+      return sendChunks(res, listingsCsvChunks(category, entries));
     })
   );
 

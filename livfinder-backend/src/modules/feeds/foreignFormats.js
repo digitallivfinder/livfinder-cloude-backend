@@ -1,5 +1,6 @@
 import { XMLParser } from "fast-xml-parser";
 import { FEED_XML_ENTITIES } from "./xmlEntities.js";
+import { childElements, rootElement, textOf, toBytes } from "./xmlChunks.js";
 
 /**
  * Property Finder and Bayut XML, read into LivFinder's real-estate fields (Phase 5).
@@ -267,27 +268,68 @@ function bayutEntry(node) {
 
 /* -------------------------------------------------------------------------- */
 
+// How many entries are looked at to recognise the file: a real export has the key on every one.
+const SNIFF = 50;
+
+/** One top-level entry of the file, parsed on its own (see xmlChunks.js). */
+function entryNode(bytes, element) {
+  const doc = parser.parse(textOf(bytes, element.start, element.end));
+  const value = doc[element.name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+/**
+ * Recognises a Property Finder or Bayut file without reading it whole: `{ source, count, entries }`
+ * where `entries` yields each entry's LivFinder field values in file order, or null for anything
+ * else. The file is scanned, and each entry parsed as it is reached, so a 75 MB export never sits
+ * in memory as one object tree.
+ */
+export function foreignEntries(content) {
+  const bytes = toBytes(content);
+  let root;
+  try {
+    root = rootElement(bytes);
+  } catch {
+    return null;
+  }
+  if (!root || root.selfClosing) return null;
+  const children = [...childElements(bytes, root.openEnd, root.contentEnd)];
+  const named = (name) => children.filter((element) => element.name.toLowerCase() === name);
+  const has = (elements, key) => {
+    for (const element of elements.slice(0, SNIFF)) {
+      try {
+        if (pick(entryNode(bytes, element), key) !== undefined) return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  };
+  const read = (source, elements, toValues) => ({
+    source,
+    count: elements.length,
+    entries: (function* entries() {
+      for (const element of elements) yield toValues(entryNode(bytes, element));
+    })(),
+  });
+
+  const properties = named("property");
+  if (properties.length && has(properties, "reference_number")) return read("property_finder", properties, propertyFinderEntry);
+  const listings = named("listing").length ? named("listing") : properties;
+  if (listings.length && has(listings, "Property_Ref_No")) return read("bayut", listings, bayutEntry);
+  return null;
+}
+
 /**
  * Recognises a Property Finder or Bayut file and returns its entries as LivFinder field values:
  * `{ source: "property_finder" | "bayut", entries: [values] }`, or null for anything else.
  */
 export function readForeignXml(text) {
-  let doc;
+  const found = foreignEntries(text);
+  if (!found) return null;
   try {
-    doc = parser.parse(text);
+    return { source: found.source, entries: [...found.entries] };
   } catch {
     return null;
   }
-  const root = lowerKeys(doc);
-  for (const container of Object.values(root)) {
-    const keys = lowerKeys(container);
-    if (Array.isArray(keys.property) && keys.property.some((item) => pick(item, "reference_number") !== undefined)) {
-      return { source: "property_finder", entries: keys.property.map(propertyFinderEntry) };
-    }
-    const listings = keys.listing || keys.property;
-    if (Array.isArray(listings) && listings.some((item) => pick(item, "Property_Ref_No") !== undefined)) {
-      return { source: "bayut", entries: listings.map(bayutEntry) };
-    }
-  }
-  return null;
 }

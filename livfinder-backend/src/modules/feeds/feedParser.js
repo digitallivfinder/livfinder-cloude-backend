@@ -6,7 +6,8 @@ import { DETAIL_SCHEMAS } from "../listings/listings.schemas.js";
 import { parseListingRecord } from "../imports/listingImport.service.js";
 import { FORMAT_VERSIONS, LIST_SEPARATOR, feedFormat } from "./feedFormats.js";
 import { LIST_ITEM, csvColumns } from "./feedTemplates.js";
-import { readForeignXml } from "./foreignFormats.js";
+import { foreignEntries, readForeignXml } from "./foreignFormats.js";
+import { XmlShapeError, childElements, contentEnd, entityDeclarations, rootElement, textOf, toBytes } from "./xmlChunks.js";
 import { missingRequired } from "./listingRequirements.js";
 
 /**
@@ -207,6 +208,64 @@ const xml = new XMLParser({
   isArray: (name, jpath) => ARRAY_PATHS.has(jpath) || Object.values(LIST_ITEM).includes(name),
 });
 
+// One entry parsed on its own (see xmlChunks.js): its paths start at the entry, not the root.
+const ENTRY_ARRAYS = new Set(ENTRY_PATHS);
+const entryXml = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+  parseTagValue: false,
+  parseAttributeValue: false,
+  trimValues: true,
+  processEntities: FEED_XML_ENTITIES,
+  isArray: (name, jpath) => ENTRY_ARRAYS.has(jpath) || Object.values(LIST_ITEM).includes(name),
+});
+
+/** The file's root element. A tag that does not close, or closes the wrong element, refuses the file. */
+function wellFormedRoot(bytes) {
+  let root;
+  try {
+    root = rootElement(bytes);
+  } catch (error) {
+    if (error instanceof XmlShapeError) throw fileError("The XML file could not be read.", { file: error.message.slice(0, 300) });
+    throw error;
+  }
+  if (!root) throw fileError("The XML file could not be read.", { file: "The file has no root element." });
+  return root;
+}
+
+/** A start tag's attributes, as the whole-file parser gives them (`@_name`…). */
+function startTagAttributes(bytes, element) {
+  const tag = textOf(bytes, element.start, element.openEnd);
+  let doc;
+  try {
+    doc = xml.parse(element.selfClosing ? tag : `${tag}</${element.name}>`, true);
+  } catch (error) {
+    throw fileError("The XML file could not be read.", { file: String(error.message || error).slice(0, 300) });
+  }
+  const node = doc?.[element.name];
+  return node && typeof node === "object" && !Array.isArray(node) ? node : {};
+}
+
+/**
+ * The `entity` entries directly inside an element, each decoded and parsed (and checked for
+ * well-formedness) on its own as it is reached.
+ */
+function* entryNodes(bytes, parent, entity) {
+  if (parent.selfClosing) return;
+  let position = 0;
+  for (const element of childElements(bytes, parent.openEnd, contentEnd(bytes, parent))) {
+    if (element.name !== entity) continue;
+    position++;
+    let doc;
+    try {
+      doc = entryXml.parse(textOf(bytes, element.start, element.end), true);
+    } catch (error) {
+      throw fileError("The XML file could not be read.", { file: `Entry ${position}: ${String(error.message || error)}`.slice(0, 300) });
+    }
+    yield doc?.[entity]?.[0] ?? "";
+  }
+}
+
 /** An entity element's values, with `<location>` and `<details>` flattened and lists unwrapped. */
 function flattenNode(node, format) {
   const values = {};
@@ -229,7 +288,49 @@ function unknownKeys(values, format) {
   return Object.keys(values).filter((key) => !known.has(key) && !key.startsWith("@_"));
 }
 
-function readXml(category, format, text) {
+/**
+ * A LivFinder, Property Finder or Bayut XML file for one category, read one entry at a time: the
+ * text is checked for well-formedness, then scanned, and each entry parsed as it is reached.
+ */
+function readXml(category, format, bytes) {
+  const root = wellFormedRoot(bytes);
+  if (entityDeclarations(bytes, root.start)) return readXmlWhole(category, format, bytes.toString("utf8"));
+  if (root.name !== "livfinder-feed") {
+    // A Property Finder or Bayut export, read into LivFinder's real-estate fields (Phase 5).
+    const foreign = category === "real-estate" ? foreignEntries(bytes) : null;
+    if (foreign) {
+      const items = [];
+      for (const values of foreign.entries) {
+        if (items.length >= MAX_FEED_ROWS) break;
+        items.push(listingItem(category, format, values, items.length + 1));
+      }
+      return {
+        version: FORMAT_VERSIONS[category],
+        source: foreign.source,
+        items,
+        warnings: foreign.count > MAX_FEED_ROWS ? [`Only the first ${MAX_FEED_ROWS} entries were read.`] : [],
+      };
+    }
+    throw fileError(
+      category === "real-estate"
+        ? "The XML file must be a LivFinder feed (<livfinder-feed>), or a Property Finder or Bayut export."
+        : "The XML file must have a <livfinder-feed> root element."
+    );
+  }
+  const attributes = startTagAttributes(bytes, root);
+  if (attributes["@_category"] !== category) {
+    throw fileError(`This feed is set up for ${category}; the file says category="${attributes["@_category"] ?? ""}".`, {
+      category: `Send a ${category} file to this feed.`,
+    });
+  }
+  return readEntries(category, format, { attributes, nodes: entryNodes(bytes, root, format.entity) });
+}
+
+/**
+ * The whole-file reader, kept for a file whose DOCTYPE declares its own entities: those apply to
+ * the whole document, so its entries cannot be parsed one by one. No portal export does this.
+ */
+function readXmlWhole(category, format, text) {
   let doc;
   try {
     doc = xml.parse(text, true);
@@ -259,17 +360,24 @@ function readXml(category, format, text) {
       category: `Send a ${category} file to this feed.`,
     });
   }
-  return readEntries(category, format, root);
+  return readEntries(category, format, { attributes: root, nodes: root[format.entity] || [] });
 }
 
 /** The entries of one category, from the root of a one-category file or a <category> section. */
-function readEntries(category, format, parent) {
-  const version = Number(parent["@_version"] ?? FORMAT_VERSIONS[category]);
+function readEntries(category, format, { attributes, nodes }) {
+  const version = Number(attributes["@_version"] ?? FORMAT_VERSIONS[category]);
   const entity = format.entity;
-  const nodes = parent[entity] || [];
-  if (nodes.length > MAX_FEED_ROWS) throw fileError(`A feed file can hold at most ${MAX_FEED_ROWS} entries.`);
   const warnings = new Set();
-  const items = nodes.map((node, index) => {
+  const items = [];
+  let index = -1;
+  for (const node of nodes) {
+    index++;
+    if (index >= MAX_FEED_ROWS) throw fileError(`A feed file can hold at most ${MAX_FEED_ROWS} entries.`);
+    items.push(readEntry(node, index));
+  }
+  return { version, items, warnings: [...warnings] };
+
+  function readEntry(node, index) {
     const values = flattenNode(node, format);
     for (const key of unknownKeys(values, format)) warnings.add(`Unknown element <${key}> was ignored.`);
     if (entity === "development") {
@@ -281,8 +389,7 @@ function readEntries(category, format, parent) {
       return developmentItem(format, { values, unitTypes, paymentPlans }, index + 1);
     }
     return listingItem(category, format, values, index + 1);
-  });
-  return { version, items, warnings: [...warnings] };
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -342,20 +449,29 @@ function readCsv(category, format, text) {
 
 /* -------------------------------------------------------------------------- */
 
-function fileText(content) {
-  const bytes = Buffer.isBuffer(content) ? content.length : Buffer.byteLength(String(content ?? ""));
-  if (!bytes) throw fileError("The feed file is empty.");
-  if (bytes > MAX_FEED_BYTES) throw fileError(`A feed file can be at most ${MAX_FEED_BYTES / 1024 / 1024} MB.`);
-  return Buffer.isBuffer(content) ? content.toString("utf8") : String(content);
+/** The file's bytes, after the empty-file and size checks. A pushed body arrives as a Buffer. */
+function fileBytes(content) {
+  const bytes = toBytes(content);
+  if (!bytes.length) throw fileError("The feed file is empty.");
+  if (bytes.length > MAX_FEED_BYTES) throw fileError(`A feed file can be at most ${MAX_FEED_BYTES / 1024 / 1024} MB.`);
+  return bytes;
+}
+
+/** Whether the first thing in the file, past a byte-order mark and white space, is a "<". */
+function startsWithTag(bytes) {
+  let i = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0;
+  while (i < bytes.length && (bytes[i] === 0x20 || bytes[i] === 0x09 || bytes[i] === 0x0a || bytes[i] === 0x0d)) i++;
+  return bytes[i] === 0x3c;
 }
 
 /** Parses one feed file. Throws a 422 `FEED_INVALID` for a file that cannot be read at all. */
 export function parseFeed({ category, format, content }) {
   const spec = feedFormat(category);
   if (!spec) throw fileError(`There is no feed format for "${category}".`, { category: "Unknown category." });
-  const text = fileText(content);
-  const kind = format || (text.trimStart().startsWith("<") ? "xml" : "csv");
-  const result = kind === "xml" ? readXml(category, spec, text) : readCsv(category, spec, text);
+  const bytes = fileBytes(content);
+  const kind = format || (startsWithTag(bytes) ? "xml" : "csv");
+  // XML is read straight from the bytes, one entry at a time (xmlChunks.js); CSV as text.
+  const result = kind === "xml" ? readXml(category, spec, bytes) : readCsv(category, spec, bytes.toString("utf8"));
   if (result.version !== FORMAT_VERSIONS[category]) {
     throw fileError(`Version ${result.version} of the ${category} format is not supported; use version ${FORMAT_VERSIONS[category]}.`, {
       version: `Use version ${FORMAT_VERSIONS[category]}.`,
@@ -369,7 +485,39 @@ export function parseFeed({ category, format, content }) {
  * in the file, or the single category of a one-category file or a Property Finder or Bayut export.
  */
 export function parsePushedXml(content) {
-  const text = fileText(content);
+  const bytes = fileBytes(content);
+  const root = wellFormedRoot(bytes);
+  if (entityDeclarations(bytes, root.start)) return parsePushedXmlWhole(bytes.toString("utf8"));
+  if (root.name !== "livfinder-feed") return [parseFeed({ category: "real-estate", format: "xml", content: bytes })];
+  const rootAttributes = startTagAttributes(bytes, root);
+  if (rootAttributes["@_category"]) return [parseFeed({ category: rootAttributes["@_category"], format: "xml", content: bytes })];
+
+  const sections = root.selfClosing ? [] : [...childElements(bytes, root.openEnd, root.contentEnd)].filter((element) => element.name === "category");
+  if (!sections.length) throw fileError('The file has no <category name="…"> sections.');
+  const seen = new Set();
+  let total = 0;
+  const results = sections.map((section) => {
+    const attributes = startTagAttributes(bytes, section);
+    const category = attributes["@_name"];
+    const spec = feedFormat(category);
+    if (!spec) throw fileError(`There is no feed format for "${category ?? ""}".`, { category: "Unknown category." });
+    if (seen.has(category)) throw fileError(`The ${category} section appears twice. Put all its entries in one section.`);
+    seen.add(category);
+    const result = readEntries(category, spec, { attributes, nodes: entryNodes(bytes, section, spec.entity) });
+    if (result.version !== FORMAT_VERSIONS[category]) {
+      throw fileError(`Version ${result.version} of the ${category} format is not supported; use version ${FORMAT_VERSIONS[category]}.`, {
+        version: `Use version ${FORMAT_VERSIONS[category]}.`,
+      });
+    }
+    total += result.items.length;
+    if (total > MAX_FEED_ROWS) throw fileError(`A feed file can hold at most ${MAX_FEED_ROWS} entries.`);
+    return { category, entity: spec.entity, format: "xml", source: "livfinder", ...result, items: markDuplicates(result.items) };
+  });
+  return results;
+}
+
+/** The whole-file version of parsePushedXml, for a file whose DOCTYPE declares entities (see readXmlWhole). */
+function parsePushedXmlWhole(text) {
   let doc;
   try {
     doc = xml.parse(text, true);
@@ -389,7 +537,7 @@ export function parsePushedXml(content) {
     if (!spec) throw fileError(`There is no feed format for "${category ?? ""}".`, { category: "Unknown category." });
     if (seen.has(category)) throw fileError(`The ${category} section appears twice. Put all its entries in one section.`);
     seen.add(category);
-    const result = readEntries(category, spec, section);
+    const result = readEntries(category, spec, { attributes: section, nodes: section[spec.entity] || [] });
     if (result.version !== FORMAT_VERSIONS[category]) {
       throw fileError(`Version ${result.version} of the ${category} format is not supported; use version ${FORMAT_VERSIONS[category]}.`, {
         version: `Use version ${FORMAT_VERSIONS[category]}.`,
