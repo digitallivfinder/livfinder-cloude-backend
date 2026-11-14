@@ -65,27 +65,45 @@ export async function createImportRun({ client, ctx, type, total, status, ip, us
 }
 
 /** `items`: `{ row, externalId, raw, error? }`. An item with `error` is stored as already failed. */
+const ITEM_COLUMNS = "(import_id, source_row, external_id, entity_type, operation, status, raw_payload, errors, error_message, processed_at)";
+const ITEM_PLACEHOLDERS = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+// Rows per INSERT when a whole file is queued. Saving 16,529 rows one at a time took 49 s on the
+// test server, past nginx's 60 s wait for the push's answer; in batches it takes about two.
+// One fixed batch size keeps it to one prepared statement; the remainder goes row by row.
+const ITEM_BATCH = 250;
+
+function itemValues(importId, item, entityType) {
+  const failed = Boolean(item.error);
+  return [
+    importId,
+    item.row ?? null,
+    item.externalId ? String(item.externalId).slice(0, 191) : null,
+    entityType,
+    failed ? "fail" : "create",
+    failed ? "failed" : "queued",
+    JSON.stringify(item.raw ?? null),
+    failed ? JSON.stringify(errorBody(item.error)) : null,
+    failed ? String(item.error.message || "").slice(0, 1000) : null,
+    failed ? new Date() : null,
+  ];
+}
+
+/**
+ * Queues a run's items. Returns each item's id for the rows saved one at a time (a single item
+ * always is); rows saved in a batch are found by their import and row number.
+ */
 export async function addImportItems(importId, items, { entityType = "listing" } = {}) {
   const ids = [];
-  for (const item of items) {
-    const failed = Boolean(item.error);
-    const result = await execute(
-      `INSERT INTO feed_import_items
-         (import_id, source_row, external_id, entity_type, operation, status, raw_payload, errors, error_message, processed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        importId,
-        item.row ?? null,
-        item.externalId ? String(item.externalId).slice(0, 191) : null,
-        entityType,
-        failed ? "fail" : "create",
-        failed ? "failed" : "queued",
-        JSON.stringify(item.raw ?? null),
-        failed ? JSON.stringify(errorBody(item.error)) : null,
-        failed ? String(item.error.message || "").slice(0, 1000) : null,
-        failed ? new Date() : null,
-      ]
+  let next = 0;
+  for (; next + ITEM_BATCH <= items.length; next += ITEM_BATCH) {
+    const batch = items.slice(next, next + ITEM_BATCH);
+    await execute(
+      `INSERT INTO feed_import_items ${ITEM_COLUMNS} VALUES ${batch.map(() => ITEM_PLACEHOLDERS).join(", ")}`,
+      batch.flatMap((item) => itemValues(importId, item, entityType))
     );
+  }
+  for (const item of items.slice(next)) {
+    const result = await execute(`INSERT INTO feed_import_items ${ITEM_COLUMNS} VALUES ${ITEM_PLACEHOLDERS}`, itemValues(importId, item, entityType));
     ids.push(result.insertId);
   }
   return ids;
