@@ -1,6 +1,7 @@
 import logger from "../../config/logger.js";
 import env from "../../config/env.js";
 import { execute, query, queryOne } from "../../db/query.js";
+import { retryTransient } from "../../db/retry.js";
 import { AppError } from "../../utils/errors.js";
 import { notifyRejectedListings } from "./rejectionNotice.service.js";
 import { importProviderId } from "./importConnection.js";
@@ -27,7 +28,7 @@ export async function runSingleImport({ client, ctx, record, ip, userAgent, requ
   const importRun = await repo.createImportRun({ client, ctx, type: "single", total: 1, status: "running", ip, userAgent });
   const [itemId] = await repo.addImportItems(importRun.id, [{ row: 1, externalId: record.externalId, raw: record }]);
   try {
-    const outcome = await importListing({ client, ctx, record, source: "api", importId: importRun.publicId, ip, requestId });
+    const outcome = await retryTransient(() => importListing({ client, ctx, record, source: "api", importId: importRun.publicId, ip, requestId }), { label: "listing import" });
     await repo.recordItemSuccess(itemId, importRun.id, outcome);
     await repo.finalizeImport(importRun.id);
     return { importRun, outcome };
@@ -43,7 +44,7 @@ export async function runWithdrawal({ client, ctx, externalId, ip, userAgent, re
   const importRun = await repo.createImportRun({ client, ctx, type: "single", total: 1, status: "running", ip, userAgent });
   const [itemId] = await repo.addImportItems(importRun.id, [{ row: 1, externalId, raw: { externalId, action: "withdraw" } }]);
   try {
-    const outcome = await withdrawImportedListing({ client, ctx, externalId, importId: importRun.publicId, ip, requestId });
+    const outcome = await retryTransient(() => withdrawImportedListing({ client, ctx, externalId, importId: importRun.publicId, ip, requestId }), { label: "listing withdrawal" });
     await repo.recordItemSuccess(itemId, importRun.id, { ...outcome, warnings: [] });
     await repo.finalizeImport(importRun.id);
     return { importRun, outcome };
@@ -175,9 +176,14 @@ export async function processImport(importId) {
       }
       await assertAddonActive(client.accountId, "integrations");
       const raw = typeof item.raw_payload === "string" ? JSON.parse(item.raw_payload) : item.raw_payload;
-      const outcome = raw.withdraw
-        ? await withdrawImportedListing({ client, ctx, externalId: raw.externalId, importId: run.public_id, ip: run.source_ip })
-        : await importListing({ client, ctx, record: parseListingRecord(raw), source, importId: run.public_id, ip: run.source_ip });
+      // A deadlock with the photo downloader (writing the same listings' media) is run again.
+      const outcome = await retryTransient(
+        () =>
+          raw.withdraw
+            ? withdrawImportedListing({ client, ctx, externalId: raw.externalId, importId: run.public_id, ip: run.source_ip })
+            : importListing({ client, ctx, record: parseListingRecord(raw), source, importId: run.public_id, ip: run.source_ip }),
+        { label: "listing import item" }
+      );
       await repo.recordItemSuccess(item.id, importId, outcome);
     } catch (error) {
       if (!(error instanceof AppError) || error.status >= 500) {
