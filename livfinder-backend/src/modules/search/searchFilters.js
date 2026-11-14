@@ -150,7 +150,7 @@ export const SORT_MAP = {
 };
 
 /** Rent duration as the filter spells it → `listing_search.price_period` as the projection stores it. */
-export const RENT_PERIODS = { yearly: "year", monthly: "month", weekly: "week", daily: "day" };
+export const RENT_PERIODS = { yearly: "year", half_yearly: "half_year", quarterly: "quarter", monthly: "month", weekly: "week", daily: "day" };
 
 /**
  * Bedroom / bathroom chips: exact counts, plus "8+" meaning eight or more.

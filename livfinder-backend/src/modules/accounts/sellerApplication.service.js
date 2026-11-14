@@ -9,6 +9,7 @@ import { slugify } from "../../utils/slug.js";
 import { resolveLocation } from "../locations/locations.repository.js";
 import { assertRegistrationAvailable, createVerificationRequest, organizationKindFor } from "./accounts.service.js";
 import { attachUploadedDocuments } from "./verification.service.js";
+import { assertApplicationCategory } from "./sellerType.js";
 
 /**
  * A Member asking to become a seller.
@@ -198,6 +199,11 @@ export async function submitApplication(req, input) {
   const open = await latestApplication(accountId, { organizationOnly: fromType === "lister" });
   if (open && OPEN.includes(open.status)) throw AppError.conflict("Your application is already being reviewed.");
   requireDocuments(input);
+  // Individual, Company or Developer: a Developer lists developments, and only a Developer may.
+  if (input.organizationType === "developer" && input.accountType === "organization") {
+    input = { ...input, categoryId: "real-estate-developments" };
+  }
+  assertApplicationCategory(input);
   const definition = resolveCategory(input.categoryId);
   if (!definition) throw AppError.validation("Some information is invalid.", { categoryId: "Choose a marketplace category." });
   const place = await location(input.countryId, input.cityId);

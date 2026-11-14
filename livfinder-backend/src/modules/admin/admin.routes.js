@@ -28,6 +28,7 @@ import { createFeedToken, revokeFeedToken } from "../leads/leadFeedTokens.servic
 import { WEBHOOK_EVENTS, createWebhook, deleteWebhook, listDeliveries, rotateWebhookSecret, sendTestEvent, updateWebhook } from "../leads/webhooks.service.js";
 import { createApiClient, revokeApiClient, updateApiClient } from "../portal/organization.service.js";
 import { sendLeadDocument } from "../leads/leads.routes.js";
+import { sellerTypeChangePreview, setSellerType } from "../accounts/sellerType.js";
 import * as teamInvitations from "../accounts/teamInvitation.service.js";
 import { adminPermissionUniverse } from "../auth/adminPermissions.js";
 import { toAdminPermissions } from "../auth/adminPermissions.js";
@@ -485,6 +486,46 @@ router.patch(
   asyncHandler(async (req, res) => {
     const result = await mutations.updateOrganizationProfile({ identifier: req.params.id, payload: req.body });
     await auditFromRequest(req, { action: "company.updated", subjectType: "organization", subjectLabel: req.params.id, changes: req.body });
+    return res.json(detailResponse(result));
+  })
+);
+
+/*
+ * Account type: Company or Developer (sellerType.js). Developments access follows the type —
+ * a company leaving Developer loses it and its projects go back to draft, off the website. The
+ * GET says how many projects that would hide, for the confirm dialog.
+ */
+async function companyAccountId(identifier) {
+  const id = await queryValue("SELECT account_id FROM organizations WHERE (public_id = ? OR slug = ?) AND deleted_at IS NULL LIMIT 1", [identifier, identifier]);
+  if (!id) throw AppError.notFound("That company was not found.");
+  return Number(id);
+}
+
+router.get(
+  "/companies/:id/seller-type",
+  requirePermission("companies.view"),
+  asyncHandler(async (req, res) => {
+    const accountId = await companyAccountId(req.params.id);
+    const sellerType = await queryValue("SELECT seller_type FROM accounts WHERE id = ?", [accountId]);
+    return res.json(detailResponse({ sellerType, ...(await sellerTypeChangePreview(accountId)) }));
+  })
+);
+
+router.patch(
+  "/companies/:id/seller-type",
+  writeLimiter,
+  requirePermission("companies.edit"),
+  validate({ body: z.object({ sellerType: z.enum(["company", "developer"]) }) }),
+  asyncHandler(async (req, res) => {
+    const accountId = await companyAccountId(req.params.id);
+    const result = await setSellerType({ accountId, sellerType: req.body.sellerType, userId: req.auth.user.id });
+    await auditFromRequest(req, {
+      action: "company.seller_type_changed",
+      subjectType: "organization",
+      subjectLabel: req.params.id,
+      changes: req.body,
+      metadata: { projectsHidden: result.projectsHidden },
+    });
     return res.json(detailResponse(result));
   })
 );

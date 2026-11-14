@@ -6,6 +6,7 @@ import * as importsRepo from "../imports/imports.repository.js";
 import { assertLocationComplete, importImages, payloadHash, resolveImportLocation } from "../imports/listingImport.service.js";
 import { developmentSchema, upsertDevelopment } from "../admin/admin.mutations.js";
 import { beginDeveloperChange } from "../projects/projectRevisions.service.js";
+import { assertSellerTypeAllowsCategory } from "../accounts/sellerType.js";
 
 /**
  * Developments from a feed (0063): each entry is a project with its unit types and payment plans.
@@ -105,6 +106,7 @@ export async function importDevelopment({ client, ctx, record, importId = null }
   if (!approved) {
     throw new AppError("This account is not approved to list developments.", { status: 403, code: "CATEGORY_NOT_APPROVED" });
   }
+  await assertSellerTypeAllowsCategory(client.accountId, DEVELOPMENTS_ROOT_ID);
 
   const hash = payloadHash(record);
   let reference = await findReference(ctx, record.externalId);

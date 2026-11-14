@@ -1,4 +1,5 @@
 import { feedFormat } from "./feedFormats.js";
+import { OFF_PLAN_RENT_MESSAGE, OFF_PLAN_STATUSES } from "../listings/completionStatus.js";
 
 /**
  * What a listing must carry to come in by XML, CSV or the API, so it is a proper listing from the
@@ -145,6 +146,10 @@ export function missingRequired(category, record) {
       if (blank(record.currency)) say("currency");
     }
     if (!record.features?.length) say("features", "Give at least one amenity or feature.");
+    // Off plan is for sale only (completionStatus.js).
+    if (category === "real-estate" && record.purpose === "rent" && OFF_PLAN_STATUSES.includes(record.detail?.completionStatus)) {
+      say("completionStatus", OFF_PLAN_RENT_MESSAGE);
+    }
   }
 
   // How deep the place must go depends on LivFinder's list, so it is checked when the place is

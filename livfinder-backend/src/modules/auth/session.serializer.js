@@ -98,7 +98,7 @@ export async function serializeSession(userId, { sessionId = null, activeAccount
   if (membership) {
     const accountRow = await queryOne(
       `SELECT a.id, a.public_id, a.name, a.status, a.verification_status, a.created_at, a.updated_at, a.seller_intent,
-              at.code AS account_type_code
+              a.seller_type, at.code AS account_type_code
          FROM accounts a JOIN account_types at ON at.id = a.account_type_id
         WHERE a.id = ?`,
       [membership.account_id]
@@ -202,6 +202,8 @@ export async function serializeSession(userId, { sessionId = null, activeAccount
       name: accountRow?.name ?? null,
       accountType,
       accountTypeCode: membership.account_type_code,
+      // Individual, Company or Developer (0079); null for a Member.
+      sellerType: accountRow?.seller_type ?? null,
       // What the portal is for this person. A `personal` account is a Member, who cannot list.
       memberType:
         membership.account_type_code === "personal"

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { alignCompletionStatus } from "../../src/modules/listings/completionStatus.js";
+import { OFF_PLAN_RENT_MESSAGE, alignCompletionStatus, assertOffPlanForSale } from "../../src/modules/listings/completionStatus.js";
 
 describe("shell and core belongs to a commercial listing", () => {
   it("is kept for a commercial listing, whatever its type", () => {
@@ -19,5 +19,22 @@ describe("shell and core belongs to a commercial listing", () => {
     expect(alignCompletionStatus("real-estate", undefined, "residential")).toBeUndefined();
     const car = { completionStatus: "shell_and_core" };
     expect(alignCompletionStatus("cars", car, null)).toBe(car);
+  });
+});
+
+describe("off plan is for sale only", () => {
+  it("refuses an off-plan or under-construction rental", () => {
+    for (const completionStatus of ["off_plan", "under_construction"]) {
+      expect(() => assertOffPlanForSale("real-estate", { purpose: "rent", completionStatus })).toThrow(
+        expect.objectContaining({ fields: { "detail.completionStatus": OFF_PLAN_RENT_MESSAGE } })
+      );
+    }
+  });
+
+  it("accepts an off-plan sale, a ready rental, and every other marketplace", () => {
+    expect(() => assertOffPlanForSale("real-estate", { purpose: "sale", completionStatus: "off_plan" })).not.toThrow();
+    expect(() => assertOffPlanForSale("real-estate", { purpose: "rent", completionStatus: "ready" })).not.toThrow();
+    expect(() => assertOffPlanForSale("real-estate", { purpose: "rent", completionStatus: undefined })).not.toThrow();
+    expect(() => assertOffPlanForSale("cars", { purpose: "rent", completionStatus: "off_plan" })).not.toThrow();
   });
 });

@@ -53,7 +53,7 @@ export const listingSearchQuery = z
     // Real estate: every chosen amenity must be present; repeatable like the chips above.
     amenities: z.union([z.string().max(100), z.array(z.string().max(100)).max(20)]).optional(),
     // An unknown duration or segment is a 422, not a silently ignored filter.
-    rentPeriod: z.enum(["yearly", "monthly", "weekly", "daily"]).optional().or(z.literal("").transform(() => undefined)),
+    rentPeriod: z.enum(["yearly", "half_yearly", "quarterly", "monthly", "weekly", "daily"]).optional().or(z.literal("").transform(() => undefined)),
     propertySegment: z.enum(["residential", "commercial"]).optional().or(z.literal("").transform(() => undefined)),
     segment: z.enum(["residential", "commercial"]).optional().or(z.literal("").transform(() => undefined)),
     page: z.coerce.number().int().min(1).max(2000).optional(),

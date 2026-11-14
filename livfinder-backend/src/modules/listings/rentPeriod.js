@@ -12,7 +12,11 @@
  *
  * Sales and every other marketplace are returned unchanged.
  */
-export const RENT_TO_PRICE_PERIOD = { yearly: "year", monthly: "month", weekly: "week", daily: "day" };
+// Half-yearly and Quarterly since 0080 (owner decision, 2026-11-14).
+export const RENT_TO_PRICE_PERIOD = {
+  yearly: "year", half_yearly: "half_year", quarterly: "quarter", monthly: "month", weekly: "week", daily: "day",
+};
+export const RENT_PERIODS = Object.keys(RENT_TO_PRICE_PERIOD);
 export const PRICE_TO_RENT_PERIOD = Object.fromEntries(
   Object.entries(RENT_TO_PRICE_PERIOD).map(([rent, price]) => [price, rent])
 );

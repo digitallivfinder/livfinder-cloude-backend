@@ -18,6 +18,7 @@ import env from "../../config/env.js";
 import { issueToken, normalizeEmail } from "../auth/auth.service.js";
 import { splitPhone } from "../../utils/phone.js";
 import { isoDay } from "../../serializers/primitives.js";
+import { assertApplicationCategory } from "./sellerType.js";
 
 async function assertEmailAvailable(email, executor) {
   const existing = await queryValue(
@@ -167,6 +168,8 @@ export async function signupPersonal(input, { ip, userAgent } = {}) {
 
   await assertEmailAvailable(input.email);
   await assertPhoneAvailable(input.phone);
+  // An individual never lists developments: those come from developer companies (sellerType.js).
+  if (input.intendsToList !== false && input.categoryId) assertApplicationCategory({ accountType: "personal", categoryId: input.categoryId });
 
   const result = await withTransaction(async (connection) => {
     await assertEmailAvailable(input.email, connection);
@@ -207,13 +210,14 @@ export async function signupPersonal(input, { ip, userAgent } = {}) {
     const typeCode = input.intendsToList === false ? "personal" : "lister";
     const accountResult = await execute(
       `INSERT INTO accounts
-         (public_id, account_type_id, owner_user_id, name, slug, status, verification_status,
+         (public_id, account_type_id, seller_type, owner_user_id, name, slug, status, verification_status,
           listing_quota, listing_used, billing_email, country_id, created_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', 'pending',
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', 'pending',
                (SELECT default_listing_quota FROM account_types WHERE code = ?), 0, ?, ?, NOW(3))`,
       [
         ulid(),
         await accountTypeId(typeCode, connection),
+        typeCode === "lister" ? "individual" : null,
         userId,
         displayName,
         await uniqueSlug("accounts", displayName, connection),
@@ -352,6 +356,9 @@ export async function signupOrganization(input, { ip, userAgent } = {}) {
       categoryId: "Choose a marketplace category.",
     });
   }
+  const organizationKind = organizationKindFor(input.organizationType, definition.listingType);
+  // A Developer lists Real Estate Developments, and only a Developer may (sellerType.js).
+  assertApplicationCategory({ accountType: "organization", organizationType: organizationKind, categoryId: definition.frontendId });
   await assertRegistrationAvailable(input.registrationNumber);
 
   const result = await withTransaction(async (connection) => {
@@ -388,13 +395,14 @@ export async function signupOrganization(input, { ip, userAgent } = {}) {
 
     const accountResult = await execute(
       `INSERT INTO accounts
-         (public_id, account_type_id, owner_user_id, name, slug, status, verification_status,
+         (public_id, account_type_id, seller_type, owner_user_id, name, slug, status, verification_status,
           listing_quota, listing_used, billing_email, country_id, created_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', 'pending',
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', 'pending',
                (SELECT default_listing_quota FROM account_types WHERE code = 'company'), 0, ?, ?, NOW(3))`,
       [
         ulid(),
         await accountTypeId("company", connection),
+        organizationKind === "developer" ? "developer" : "company",
         userId,
         input.publicName || input.legalName,
         await uniqueSlug(
@@ -433,7 +441,7 @@ export async function signupOrganization(input, { ip, userAgent } = {}) {
       [
         ulid(),
         accountId,
-        organizationKindFor(input.organizationType, definition.listingType),
+        organizationKind,
         input.publicName || input.legalName,
         input.legalName,
         await uniqueSlug(

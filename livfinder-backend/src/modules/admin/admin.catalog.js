@@ -1118,10 +1118,16 @@ const placeholders = (list) => list.map(() => "?").join(", ");
 export async function listAdminCompanies({
   status = "all", search = "", company = "", category = "", categories = "", primary = "", country = "", place = "", packageId = "",
   api = "", agentsMin = "", agentsMax = "", listingsMin = "", listingsMax = "",
-  from = "", to = "", activeFrom = "", activeTo = "", page = 1, pageSize = 10,
+  from = "", to = "", activeFrom = "", activeTo = "", sellerType = "", page = 1, pageSize = 10,
 } = {}) {
   const conditions = ["o.deleted_at IS NULL"];
   const params = [];
+  // Account type: Company or Developer (accounts.seller_type, 0079).
+  const sellerTypes = csvList(sellerType).filter((value) => ["company", "developer"].includes(value));
+  if (sellerTypes.length) {
+    conditions.push(`o.account_id IN (SELECT id FROM accounts WHERE seller_type IN (${placeholders(sellerTypes)}))`);
+    params.push(...sellerTypes);
+  }
   // Status arrives as one value from the old select or several from the column filter.
   // "pending" and "rejected" are derived states, not raw `o.status` values.
   const statuses = csvList(status).filter((value) => value !== "all");
@@ -1212,7 +1218,7 @@ export async function listAdminCompanies({
               co.id AS country_id, co.name AS country_name,
               st.id AS state_id, st.name AS state_name,
               ct.id AS city_id, ct.name AS city_name,
-              a.public_id AS account_public_id, o.account_id,
+              a.public_id AS account_public_id, o.account_id, a.seller_type,
               (SELECT COUNT(*) FROM inquiries i WHERE i.organization_id = o.id AND i.deleted_at IS NULL) AS inquiry_count,
               (SELECT MAX(l.updated_at) FROM listings l WHERE l.organization_id = o.id) AS last_activity_at,
               (SELECT p.public_id FROM subscriptions s JOIN plans p ON p.id = s.plan_id
@@ -1277,6 +1283,8 @@ export async function listAdminCompanies({
         legalName: row.legal_name,
         slug: row.slug,
         businessType: row.kind,
+        // Company or Developer; a company with no type yet reads by its business type.
+        sellerType: row.seller_type || (row.kind === "developer" ? "developer" : "company"),
         type: "company",
         status: row.status === "pending" && row.verification_status === "rejected" ? "rejected" : row.status,
         applicationOpen: Boolean(row.application_open),

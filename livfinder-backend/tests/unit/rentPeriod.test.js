@@ -31,4 +31,11 @@ describe("a rental's rent period and price period are one value", () => {
     const hourly = { purpose: "rent", pricePeriod: "hour" };
     expect(alignRentPeriod("real-estate", hourly)).toBe(hourly);
   });
+
+  it("maps Half-yearly and Quarterly both ways (0080)", () => {
+    expect(alignRentPeriod("real-estate", { purpose: "rent", detail: { rentPeriod: "half_yearly" } }).pricePeriod).toBe("half_year");
+    expect(alignRentPeriod("real-estate", { purpose: "rent", detail: { rentPeriod: "quarterly" } }).pricePeriod).toBe("quarter");
+    expect(alignRentPeriod("real-estate", { purpose: "rent", pricePeriod: "quarter" }).detail.rentPeriod).toBe("quarterly");
+    expect(alignRentPeriod("real-estate", { purpose: "rent", pricePeriod: "half_year" }).detail.rentPeriod).toBe("half_yearly");
+  });
 });

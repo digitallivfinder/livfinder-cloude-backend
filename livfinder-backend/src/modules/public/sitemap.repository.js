@@ -97,11 +97,17 @@ async function listingEntries(rootCategoryId = null, limit = 20000) {
 export async function hubEntries(kind) {
   const rootId = KIND_TO_ROOT[kind];
   if (!rootId) return [];
-  const rows = await listingRows(rootId, 50000);
+  return hubsFromPaths(await listingRows(rootId, 50000));
+}
+
+/**
+ * The location pages above a set of canonical paths. segments[0] is the root (already in the
+ * static sitemap); the last segment is the listing or project itself.
+ */
+function hubsFromPaths(rows) {
   const hubs = new Map();
   for (const row of rows) {
     const segments = String(row.canonical_path || "").split("/").filter(Boolean);
-    // segments[0] is the category root (already in the static sitemap); the last is the listing.
     for (let depth = 2; depth < segments.length; depth += 1) {
       const url = `/${segments.slice(0, depth).join("/")}`;
       const lastModified = iso(row.source_updated_at);
@@ -232,14 +238,19 @@ export async function sitemapEntries(kind = "all", { category } = {}) {
         ORDER BY is_featured DESC, published_at DESC
         LIMIT 20000`
     );
-    return rows.map((row) => ({
-      url: row.canonical_path,
-      title: row.name,
-      images: images(row.cover_image_url, row.name),
-      lastModified: iso(row.source_updated_at),
-      changeFrequency: "weekly",
-      priority: row.is_featured ? 0.9 : 0.75,
-    }));
+    // The Developments location pages (/projects/{country}/…) are real results pages again
+    // since 2026-11-14; they used to redirect into Real Estate Off Plan.
+    return [
+      ...hubsFromPaths(rows),
+      ...rows.map((row) => ({
+        url: row.canonical_path,
+        title: row.name,
+        images: images(row.cover_image_url, row.name),
+        lastModified: iso(row.source_updated_at),
+        changeFrequency: "weekly",
+        priority: row.is_featured ? 0.9 : 0.75,
+      })),
+    ];
   }
 
   /**

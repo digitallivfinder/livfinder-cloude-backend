@@ -134,6 +134,12 @@ is_post_seed_migration() {
     # 0077 tags the seeded property types and listings Residential / Commercial.
     0077_property_segments.sql)
       return 0 ;;
+    # 0079 types the seeded accounts and aligns their Developments access with it.
+    0079_seller_type.sql)
+      return 0 ;;
+    # 0080 moves the seeded off-plan rentals to Ready.
+    0080_rent_periods_and_off_plan_sale_only.sql)
+      return 0 ;;
     # 0071 switches on what the seeded plans include for the seeded subscriptions.
     0071_plan_included_addons.sql)
       return 0 ;;

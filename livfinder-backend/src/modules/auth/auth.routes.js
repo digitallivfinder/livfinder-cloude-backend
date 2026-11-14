@@ -329,7 +329,8 @@ router.post(
 const OAUTH_STATE_COOKIE = "livfinder_oauth_state";
 const OAUTH_RETURN_COOKIE = "livfinder_oauth_return";
 const OAUTH_SELLER_COOKIE = "livfinder_oauth_seller";
-const SELLER_TYPES = ["personal", "organization"];
+// The seller intent a social signup carries until it applies: Individual, Company or Developer (0079).
+const SELLER_TYPES = ["personal", "organization", "developer"];
 
 router.get(
   "/oauth/providers",

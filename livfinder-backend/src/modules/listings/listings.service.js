@@ -1,6 +1,6 @@
 import { query, queryOne, queryValue, execute } from "../../db/query.js";
 import { alignRentPeriod } from "./rentPeriod.js";
-import { alignCompletionStatus } from "./completionStatus.js";
+import { alignCompletionStatus, assertOffPlanForSale } from "./completionStatus.js";
 import { decideSegment } from "./propertySegment.js";
 import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
@@ -565,6 +565,7 @@ export async function createListing({ payload: rawPayload, accountId, userId, or
   if (!definition) throw AppError.validation("Some information is invalid.", { category: "Unknown category." });
   // A rental's "Rent period" and the price period it is quoted per are one value; see rentPeriod.js.
   const payload = alignRentPeriod(definition.listingType, rawPayload);
+  assertOffPlanForSale(definition.listingType, { purpose: payload.purpose, completionStatus: payload.detail?.completionStatus });
 
   return withTransaction(async (connection) => {
     const { categoryId, rootCategoryId, typeSegment, typeName } = await resolveCategoryRow(definition, payload.categorySlug, connection);
@@ -767,6 +768,23 @@ export async function updateListing({ listing, payload: rawPayload, userId, acco
         ? await queryValue("SELECT p.code FROM listings l JOIN purposes p ON p.id = l.purpose_id WHERE l.id = ?", [listing.id], connection)
         : null;
     const payload = alignRentPeriod(definition.listingType, rawPayload, storedPurpose);
+
+    // Off plan is for sale only (completionStatus.js): checked against what the listing will be.
+    const touchesOffPlan = rawPayload.purpose !== undefined || rawPayload.detail?.completionStatus !== undefined;
+    if (definition.listingType === "real-estate" && touchesOffPlan) {
+      const stored = await queryOne(
+        `SELECT p.code AS purpose, lre.completion_status
+           FROM listings l JOIN purposes p ON p.id = l.purpose_id
+           LEFT JOIN listing_real_estate lre ON lre.listing_id = l.id
+          WHERE l.id = ?`,
+        [listing.id],
+        connection
+      );
+      assertOffPlanForSale(definition.listingType, {
+        purpose: payload.purpose ?? stored?.purpose,
+        completionStatus: payload.detail?.completionStatus ?? stored?.completion_status,
+      });
+    }
 
     const assignments = [];
     const params = [];

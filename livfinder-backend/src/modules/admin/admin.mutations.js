@@ -23,6 +23,7 @@ import { assignPlanToAccount, cancelScheduledPlanChange, schedulePlanChange } fr
 import { approveRevision, closeOpenRevision, rejectRevision } from "../listings/listingRevisions.service.js";
 import { approveProjectRevision, closeOpenProjectRevision, rejectProjectRevision } from "../projects/projectRevisions.service.js";
 import { ADDON_CODES, disableAddon, enableAddon, listAccountAddons, syncPlanSubscribers, upsertPlanAddons } from "../accounts/addons.service.js";
+import { DEVELOPMENTS_ROOT_ID, assertSellerTypeAllowsCategory, sellerTypeAllowsCategory, sellerTypeFor } from "../accounts/sellerType.js";
 
 /**
  * Admin write operations.
@@ -298,6 +299,11 @@ async function applyApproval({ subjectType, subjectId, requestId, payload, membe
     subjectType === "organization"
       ? await queryValue("SELECT account_id FROM organizations WHERE id = ?", [subjectId])
       : subjectId;
+  // What the seller is: an Individual, a Company or a Developer (from the business type applied with).
+  // Read from the account itself, so re-verifying an existing company never makes it an individual.
+  const kind = await queryValue("SELECT kind FROM organizations WHERE account_id = ? AND deleted_at IS NULL LIMIT 1", [accountId]);
+  const sellerType = sellerTypeFor({ accountTypeCode: kind ? "company" : "lister", organizationKind: kind });
+  await execute("UPDATE accounts SET seller_type = ? WHERE id = ?", [sellerType, accountId]);
   if (memberApplication) {
     const typeCode = memberApplication === "organization" ? "company" : "lister";
     await execute(
@@ -318,8 +324,9 @@ async function applyApproval({ subjectType, subjectId, requestId, payload, membe
     );
   }
   await publishApplicationImages({ requestId, accountId, organizationId: subjectType === "organization" ? subjectId : null });
-  const category = resolveCategory(payload?.categoryId);
-  if (!category) return;
+  // A developer always gets Developments; any category its type may not hold is not granted.
+  const category = sellerType === "developer" ? resolveCategory(DEVELOPMENTS_ROOT_ID) : resolveCategory(payload?.categoryId);
+  if (!category || !sellerTypeAllowsCategory(sellerType, category.rootId)) return;
   await execute(
     `INSERT INTO account_category_access (account_id, category_id, status, listing_used, requested_at, reviewed_at, reviewed_by_user_id, created_at)
      VALUES (?, ?, 'approved', 0, NOW(3), NOW(3), ?, NOW(3))
@@ -629,6 +636,9 @@ export async function decideCategoryAccess({ accountId, organizationPublicId, us
   accountId = resolvedAccountId;
   const definition = resolveCategory(categoryId);
   if (!definition) throw AppError.validation("Some information is invalid.", { categoryId: "Unknown category." });
+
+  // Developments are for developer accounts only; the account type decides (sellerType.js).
+  if (decision === "approve") await assertSellerTypeAllowsCategory(accountId, definition.rootId);
 
   const status = decision === "approve" ? "approved" : decision === "reject" ? "rejected" : "revoked";
   const result = await execute(

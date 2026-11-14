@@ -15,6 +15,7 @@ import { resolveLocation } from "../locations/locations.repository.js";
 import { serializeAgent } from "../../serializers/organization.js";
 import { getAssetByPublicId } from "../media/media.service.js";
 import { isoDate, int, bool, num } from "../../serializers/primitives.js";
+import { assertSellerTypeAllowsCategory, categoryRefusal, sellerTypeAllowsCategory, sellerTypeOf } from "../accounts/sellerType.js";
 
 export const organizationUpdateSchema = z.object({
   name: z.string().trim().min(1).max(200).optional(),
@@ -479,9 +480,24 @@ export async function categoryAccess(organizationId) {
     [accountId]
   );
   const byCategory = new Map(rows.map((row) => [frontendCategoryId(row.root_category_id), row]));
+  const sellerType = await sellerTypeOf(accountId);
 
   return CATEGORY_DEFINITIONS.map((definition) => {
     const row = byCategory.get(definition.frontendId);
+    // A category this account type cannot hold (developments for a non-developer) cannot be requested.
+    if (!sellerTypeAllowsCategory(sellerType, definition.rootId) && row?.status !== "approved") {
+      return {
+        id: row ? `ac_${row.id}` : `cat_${definition.frontendId}`,
+        categoryId: definition.frontendId,
+        label: row?.name ?? definition.listingType,
+        status: "unavailable",
+        unavailableReason: categoryRefusal(sellerType, definition.rootId),
+        requestedAt: null,
+        approvedAt: null,
+        listingQuota: null,
+        listingUsed: 0,
+      };
+    }
     return {
       id: row ? `ac_${row.id}` : `cat_${definition.frontendId}`,
       categoryId: definition.frontendId,
@@ -512,6 +528,8 @@ export async function assertCategoryAccess({ organizationId, accountId: ownAccou
   if (!approved) {
     throw AppError.forbidden("This account has not been approved to list in that category.");
   }
+  // The account type still decides, even over a stale grant (sellerType.js).
+  await assertSellerTypeAllowsCategory(accountId, definition.rootId);
   return true;
 }
 
@@ -520,6 +538,7 @@ export async function requestCategoryAccess({ organizationId, categoryId, note, 
   if (!definition) throw AppError.validation("Some information is invalid.", { categoryId: "Unknown category." });
   const accountId = await accountIdForOrganization(organizationId);
   if (!accountId) throw AppError.notFound("That account was not found.");
+  await assertSellerTypeAllowsCategory(accountId, definition.rootId);
 
   const existing = await queryOne(
     `SELECT aca.id, aca.status FROM account_category_access aca

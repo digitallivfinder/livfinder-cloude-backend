@@ -54,6 +54,11 @@ registerOptionSets(
     "lead.timeframe": enumSet("leads", "timeframe", { labels: { within_1_month: "Within 1 month", within_3_months: "Within 3 months", within_6_months: "Within 6 months", within_12_months: "Within 12 months" } }),
     "lead.priority": enumSet("leads", "priority"),
     "categoryAccess.status": enumSet("account_category_access", "status"),
+    // What a seller account is: Individual, Company or Developer (accounts.seller_type, 0079).
+    "account.sellerType": enumSet("accounts", "seller_type"),
+    // The business types a Company may choose (organizations.kind). A developer is its own seller
+    // type, so it is not offered here.
+    "organization.kind": enumSet("organizations", "kind", { exclude: ["developer"], labels: { agency: "Real estate agency", dealership: "Car dealership" } }),
     // The client lead funnel; "viewing" is called what the category calls it ("lead.funnelStep:cars" → Test drive).
     "lead.funnelStep": async (category) => {
       const rootId = category ? rootIdFor(category) : null;
@@ -101,6 +106,8 @@ registerOptionSets({
   "contact.type": enumSet("crm_contacts", "contact_type"),
   "contact.stage": enumSet("crm_contacts", "lifecycle_stage"),
   "organization.status": enumPlus("organizations", "status", [["rejected", "Rejected"]]),
+  // Companies are a Company or a Developer (accounts.seller_type, 0079).
+  "company.sellerType": enumSet("accounts", "seller_type", { exclude: ["individual"] }),
   "account.status": enumPlus("accounts", "status", [["rejected", "Rejected"]]),
   "user.status": enumSet("users", "status"),
   "plan": tableSet("SELECT id AS value, name AS label FROM plans WHERE is_active = 1 ORDER BY sort_order ASC, id ASC"),

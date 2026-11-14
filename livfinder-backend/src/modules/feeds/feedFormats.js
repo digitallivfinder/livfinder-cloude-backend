@@ -124,6 +124,8 @@ const DESCRIPTIONS = {
   images: `Full image URLs, separated by ${LIST_SEPARATOR}. LivFinder downloads and stores them.`,
   features: `Feature names, separated by ${LIST_SEPARATOR}.`,
   agentEmail: "The email of the agent on your LivFinder account who handles this listing.",
+  completionStatus: "ready, off_plan, or shell_and_core for commercial. Off plan is for sale only; a rental is ready.",
+  rentPeriod: "For a rental: yearly, half_yearly, quarterly, monthly, weekly or daily.",
 };
 
 function envelopeFields(category) {

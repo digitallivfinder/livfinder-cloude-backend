@@ -156,7 +156,7 @@ const inSquareMetres = (unit) => /(met|sqm|m2|m²)/i.test(String(unit || ""));
 /** A date or date-time as YYYY-MM-DD, or nothing. */
 const dateOnly = (value) => (/^\d{4}-\d{2}-\d{2}/.test(String(value || "")) ? String(value).slice(0, 10) : undefined);
 
-const RENT_PERIODS = { year: "yearly", month: "monthly", week: "weekly", day: "daily" };
+const RENT_PERIODS = { year: "yearly", half_year: "half_yearly", quarter: "quarterly", month: "monthly", week: "weekly", day: "daily" };
 
 function propertyFinderEntry(node) {
   const offering = String(pick(node, "offering_type") || "").toUpperCase();
@@ -165,7 +165,7 @@ function propertyFinderEntry(node) {
   let price = pick(node, "price");
   let pricePeriod;
   if (priceNode && typeof priceNode === "object" && !Array.isArray(priceNode)) {
-    for (const [period, key] of [["year", "yearly"], ["month", "monthly"], ["week", "weekly"], ["day", "daily"]]) {
+    for (const [period, key] of [["year", "yearly"], ["half_year", "half_yearly"], ["half_year", "semi_annually"], ["quarter", "quarterly"], ["month", "monthly"], ["week", "weekly"], ["day", "daily"]]) {
       const value = pick(priceNode, key);
       if (value) {
         price = value;
@@ -245,7 +245,7 @@ function bayutEntry(node) {
     title: pick(node, "Property_Title", "Title"),
     description: pick(node, "Property_Description", "Description"),
     price: pick(node, "Price"),
-    pricePeriod: isRent ? ({ yearly: "year", monthly: "month", weekly: "week", daily: "day" }[frequency] || "year") : undefined,
+    pricePeriod: isRent ? ({ yearly: "year", half_yearly: "half_year", "semi-annually": "half_year", quarterly: "quarter", monthly: "month", weekly: "week", daily: "day" }[frequency] || "year") : undefined,
     currency: pick(node, "Currency") || "AED",
     country: pick(node, "Country") || "AE",
     city: pick(node, "City"),
