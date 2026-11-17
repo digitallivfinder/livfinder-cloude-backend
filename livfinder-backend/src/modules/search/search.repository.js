@@ -1,6 +1,7 @@
 import { query, queryValue } from "../../db/query.js";
 import { resolveLocation } from "../locations/locations.repository.js";
 import { segmentCondition } from "./propertySegments.js";
+import { marketCondition, sellerTypeCondition } from "./marketAndSeller.js";
 import { normalizeSearchInput, SORT_MAP, RANGE_FILTERS, FACET_FILTERS, DETAIL_FILTERS, COLOUR_FAMILIES } from "./searchFilters.js";
 import { serializeListingCard } from "../../serializers/listing.js";
 
@@ -246,6 +247,13 @@ export async function buildSearchQuery(rawFilters = {}) {
     if (filters.rentPeriod) {
       conditions.push("ls.price_period = ?");
       params.push(filters.rentPeriod);
+    }
+    // Market (new build or resale) and Listed by (the seller account's type).
+    for (const condition of [marketCondition(filters.market), sellerTypeCondition(filters.sellerTypes)]) {
+      if (condition) {
+        conditions.push(condition.sql);
+        params.push(...condition.params);
+      }
     }
     // Residential / Commercial, from the shared grouping of leaf categories.
     const segment = segmentCondition(filters.propertySegment);

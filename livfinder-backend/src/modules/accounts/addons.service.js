@@ -194,6 +194,8 @@ export async function enableAddon({ accountId, code, userId, byPlatform = false,
       subjectId: accountId,
     }
   ).catch(() => {});
+  const { emailAccount } = await import("../email/send.js");
+  await emailAccount({ accountId, roles: ["owner"] }, "billing.addon", { name: addon.name, enabled: true }).catch(() => 0);
   return listAccountAddons(accountId);
 }
 
@@ -248,6 +250,8 @@ export async function disableAddon({ accountId, code }) {
         subjectId: accountId,
       }
     ).catch(() => {});
+    const { emailAccount } = await import("../email/send.js");
+    await emailAccount({ accountId, roles: ["owner"] }, "billing.addon", { name: addon.name, enabled: false, reason: "Feeds have stopped and leads are no longer sent to your systems. Your listings stay as they are." }).catch(() => 0);
   }
   return listAccountAddons(accountId);
 }

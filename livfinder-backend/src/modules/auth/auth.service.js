@@ -9,7 +9,7 @@ import { hashPassword, verifyPassword, passwordPolicyError } from "./passwords.j
 import { createSession, revokeSession, revokeAllSessions } from "./sessions.js";
 import { requiresMfaAtLogin, verifyMfaCode } from "./mfa.service.js";
 import { recordAudit } from "../system/audit.service.js";
-import { sendMail } from "../system/mail.service.js";
+import { queueEmail } from "../email/send.js";
 
 const TOKEN_TTL = {
   password_reset: 60 * 60 * 1000,
@@ -212,11 +212,7 @@ export async function requestPasswordReset({ email, ip }) {
 
   const token = await issueToken({ userId: user.id, purpose: "password_reset", target: user.email, ip });
   const resetUrl = `${env.FRONTEND_URL}/reset-password?token=${encodeURIComponent(token)}`;
-  await sendMail({
-    to: user.email,
-    subject: "Reset your LivFinder password",
-    text: `Use this link within the hour to choose a new password:\n\n${resetUrl}\n\nIf you did not ask for this, nothing has changed and you can ignore this message.`,
-  });
+  await queueEmail({ template: "auth.password_reset", to: user.email, userId: user.id, data: { url: resetUrl } });
   await recordAudit({ action: "auth.password_reset_requested", subjectType: "user", subjectId: user.id, userId: user.id, ip });
   return { sent: true };
 }
@@ -242,7 +238,18 @@ export async function resetPassword({ token, password, ip }) {
       connection
     );
     return { userId: row.user_id };
+  }).then(async (result) => {
+    await notifyPasswordChanged(result.userId, "reset");
+    return result;
   });
+}
+
+/** Security notice after any password change; the email goes to the account's own address. */
+async function notifyPasswordChanged(userId, how) {
+  const user = await queryOne("SELECT email, display_name FROM users WHERE id = ?", [userId]);
+  if (user?.email) {
+    await queueEmail({ template: "auth.password_changed", to: user.email, toName: user.display_name, userId, data: { how, at: new Date().toISOString() } });
+  }
 }
 
 export async function changePassword({ userId, currentPassword, newPassword, ip, keepSessionId }) {
@@ -265,6 +272,7 @@ export async function changePassword({ userId, currentPassword, newPassword, ip,
     await revokeAllSessions(userId, connection);
     await recordAudit({ action: "auth.password_changed", subjectType: "user", subjectId: userId, userId, ip }, connection);
   });
+  await notifyPasswordChanged(userId, "changed");
 
   // The caller stays signed in on this device; every other session is gone.
   const user2 = await queryOne("SELECT session_epoch, default_account_id FROM users WHERE id = ?", [userId]);
@@ -290,18 +298,14 @@ export async function resendEmailVerification({ email, ip }) {
   }
 }
 
-export async function sendEmailVerification({ userId, ip }) {
+export async function sendEmailVerification({ userId, ip, dedupeKey = null }) {
   const user = await queryOne("SELECT id, email, email_verified_at FROM users WHERE id = ?", [userId]);
   if (!user) throw AppError.notFound();
   if (user.email_verified_at) return { alreadyVerified: true };
 
   const token = await issueToken({ userId, purpose: "email_verification", target: user.email, ip });
   const verifyUrl = `${env.FRONTEND_URL}/verify-email?token=${encodeURIComponent(token)}`;
-  await sendMail({
-    to: user.email,
-    subject: "Confirm your LivFinder email address",
-    text: `Confirm your address to finish setting up your account:\n\n${verifyUrl}`,
-  });
+  await queueEmail({ template: "auth.confirm_email", to: user.email, userId, data: { url: verifyUrl, resend: true }, dedupeKey });
   return { sent: true };
 }
 
@@ -324,7 +328,32 @@ export async function verifyEmail({ token, ip }) {
     return { userId: row.user_id };
   });
   await claimRecordsByEmail(result.userId);
+  await sendWelcome(result.userId);
   return result;
+}
+
+/** Welcome after the address is confirmed: different next steps for members and each seller type. */
+async function sendWelcome(userId) {
+  try {
+    const user = await queryOne(
+      `SELECT u.email, u.display_name, a.id AS account_id, a.seller_type,
+              (SELECT COUNT(*) FROM verification_requests v WHERE v.requested_by_user_id = u.id AND v.status IN ('pending','in_review')) AS pending
+         FROM users u LEFT JOIN accounts a ON a.owner_user_id = u.id
+        WHERE u.id = ? ORDER BY a.id DESC LIMIT 1`,
+      [userId]
+    );
+    if (!user?.email) return;
+    await queueEmail({
+      template: "auth.welcome",
+      to: user.email,
+      toName: user.display_name,
+      userId,
+      data: { sellerType: user.seller_type || null, pendingReview: Number(user.pending) > 0 },
+      dedupeKey: `auth.welcome:${userId}`,
+    });
+  } catch (error) {
+    logger.warn({ err: error, userId }, "welcome email not queued");
+  }
 }
 
 /**

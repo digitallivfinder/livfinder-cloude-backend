@@ -14,6 +14,7 @@ import { isoDate, bool, int } from "../../serializers/primitives.js";
  * `notification_preferences` for channels, `user_consents` and
  * `data_subject_requests` for privacy — rather than a new settings store.
  */
+/** Superseded by the email catalogue (0081); kept only for anything still importing it. */
 const NOTIFICATION_TYPES = [
   { type: "inquiry.received", label: "New inquiries", description: "Someone asks about one of your listings." },
   { type: "message.received", label: "New messages", description: "A reply arrives in your inbox." },
@@ -139,23 +140,37 @@ export const notificationSettingsSchema = z.object({
       z.object({
         type: z.string().trim().min(1).max(80),
         email: z.boolean().optional(),
+        frequency: z.enum(["instant", "daily"]).optional(),
+        inApp: z.boolean().optional(),
         push: z.boolean().optional(),
         sms: z.boolean().optional(),
         whatsapp: z.boolean().optional(),
-        inApp: z.boolean().optional(),
       })
     )
     .max(50),
 });
 
+/**
+ * One row per email category (modules/email/catalog.js). Fixed categories — security, account,
+ * billing, receipts — are shown as always on; staff alerts only to LivFinder staff.
+ */
 export async function getNotificationSettings(userId) {
-  const rows = await query(
-    `SELECT notification_type, email_enabled, push_enabled, sms_enabled, whatsapp_enabled, in_app_enabled
-       FROM notification_preferences WHERE user_id = ?`,
-    [userId]
+  const { CATEGORIES } = await import("../email/catalog.js");
+  const { preferencesFor } = await import("../email/preferences.js");
+  const [emailChoices, rows, staff, seller] = await Promise.all([
+    preferencesFor(userId),
+    query("SELECT notification_type, in_app_enabled FROM notification_preferences WHERE user_id = ?", [userId]),
+    queryValue("SELECT COUNT(*) FROM user_roles ur JOIN roles r ON r.id = ur.role_id AND r.scope = 'platform' WHERE ur.user_id = ?", [userId]),
+    queryValue(
+      `SELECT COUNT(*) FROM account_members m JOIN accounts a ON a.id = m.account_id
+        WHERE m.user_id = ? AND m.status = 'active' AND a.seller_type IS NOT NULL`,
+      [userId]
+    ),
+  ]);
+  const inApp = new Map(rows.map((row) => [row.notification_type, bool(row.in_app_enabled)]));
+  const visible = Object.entries(CATEGORIES).filter(([, category]) =>
+    category.audience === "staff" ? Number(staff) > 0 : category.audience === "seller" ? Number(seller) > 0 || Number(staff) > 0 : true
   );
-  const byType = new Map(rows.map((row) => [row.notification_type, row]));
-
   return {
     channels: [
       { key: "email", label: "Email", status: "active" },
@@ -164,48 +179,38 @@ export async function getNotificationSettings(userId) {
       { key: "sms", label: "SMS", status: "not-connected" },
       { key: "whatsapp", label: "WhatsApp", status: "not-connected" },
     ],
-    preferences: NOTIFICATION_TYPES.map((definition) => {
-      const stored = byType.get(definition.type);
-      return {
-        ...definition,
-        // No stored row means the platform default: email and in-app on.
-        email: stored ? bool(stored.email_enabled) : true,
-        inApp: stored ? bool(stored.in_app_enabled) : true,
-        push: stored ? bool(stored.push_enabled) : false,
-        sms: stored ? bool(stored.sms_enabled) : false,
-        whatsapp: stored ? bool(stored.whatsapp_enabled) : false,
-      };
-    }),
+    preferences: visible.map(([type, category]) => ({
+      type,
+      label: category.label,
+      description: category.description,
+      required: !category.optional,
+      digest: Boolean(category.digest),
+      email: emailChoices[type]?.email ?? true,
+      frequency: emailChoices[type]?.frequency ?? "instant",
+      inApp: inApp.has(type) ? inApp.get(type) : true,
+      push: false,
+      sms: false,
+      whatsapp: false,
+    })),
   };
 }
 
 export async function updateNotificationSettings(userId, payload) {
-  const known = new Set(NOTIFICATION_TYPES.map((definition) => definition.type));
-  await withTransaction(async (connection) => {
-    for (const preference of payload.preferences) {
-      // Only a notification type the platform actually sends can be stored.
-      if (!known.has(preference.type)) continue;
-      await execute(
-        `INSERT INTO notification_preferences
-           (user_id, notification_type, email_enabled, push_enabled, sms_enabled, whatsapp_enabled, in_app_enabled, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(3))
-         ON DUPLICATE KEY UPDATE
-           email_enabled = VALUES(email_enabled), push_enabled = VALUES(push_enabled),
-           sms_enabled = VALUES(sms_enabled), whatsapp_enabled = VALUES(whatsapp_enabled),
-           in_app_enabled = VALUES(in_app_enabled), updated_at = NOW(3)`,
-        [
-          userId,
-          preference.type,
-          preference.email === false ? 0 : 1,
-          preference.push ? 1 : 0,
-          preference.sms ? 1 : 0,
-          preference.whatsapp ? 1 : 0,
-          preference.inApp === false ? 0 : 1,
-        ],
-        connection
-      );
-    }
-  });
+  const { CATEGORIES } = await import("../email/catalog.js");
+  const { savePreferences } = await import("../email/preferences.js");
+  const changes = {};
+  for (const preference of payload.preferences) {
+    // Only a category the platform actually sends can be stored.
+    if (!CATEGORIES[preference.type]) continue;
+    if (CATEGORIES[preference.type].optional) changes[preference.type] = { email: preference.email !== false, frequency: preference.frequency };
+    await execute(
+      `INSERT INTO notification_preferences (user_id, notification_type, email_enabled, in_app_enabled, updated_at)
+       VALUES (?, ?, 1, ?, NOW(3))
+       ON DUPLICATE KEY UPDATE in_app_enabled = VALUES(in_app_enabled), updated_at = NOW(3)`,
+      [userId, preference.type, preference.inApp === false ? 0 : 1]
+    );
+  }
+  await savePreferences(userId, changes);
   return getNotificationSettings(userId);
 }
 
@@ -317,6 +322,14 @@ export async function createDataRequest({ userId, payload }) {
      VALUES (?, ?, ?, 'pending', ?, DATE_ADD(NOW(3), INTERVAL 30 DAY), NOW(3))`,
     [publicId, userId, payload.requestType, payload.notes || null]
   );
+  const { emailUser, emailStaff } = await import("../email/send.js");
+  await emailUser(userId, "privacy.request", { type: payload.requestType, reference: publicId }).catch(() => 0);
+  await emailStaff("users.edit", {
+    title: `Privacy request: ${String(payload.requestType).replace(/_/g, " ")}`,
+    summary: "A user asked for a privacy request. It must be completed within 30 days.",
+    rows: [["Reference", publicId], ["Type", payload.requestType]],
+    url: "/admin/users",
+  }).catch(() => 0);
   return { id: publicId, status: "pending", requestType: payload.requestType };
 }
 

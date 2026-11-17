@@ -2,6 +2,19 @@ import { execute, query, queryOne } from "../../db/query.js";
 import { ulid } from "../../utils/ids.js";
 import logger from "../../config/logger.js";
 
+/** Email for the same events (modules/email). Loaded lazily: email imports nothing from here. */
+const email = () => import("../email/send.js");
+const emailEvents = () => import("../email/events.js");
+const emailAccountQuietly = async (scope, template, data, options) => {
+  try {
+    const { emailAccount } = await email();
+    return await emailAccount(scope, template, data, options);
+  } catch (error) {
+    logger.warn({ err: error, template }, "account email not queued");
+    return 0;
+  }
+};
+
 /**
  * Produces notifications.
  *
@@ -182,6 +195,10 @@ export async function notifyNewOffer({ listing, offer }, connection) {
  * invisible until its owner happens to look, and the reason is the only actionable part.
  */
 export async function notifyListingModeration({ listing, decision, reason }, connection) {
+  if (!connection && listing?.id && ["approve", "reject", "unpublish", "archive", "flag"].includes(decision)) {
+    const { emailListingDecision } = await emailEvents();
+    await emailListingDecision({ listing, decision, reason });
+  }
   const wording = {
     approve: ["listing.approved", "Your listing is live", "check"],
     reject: ["listing.rejected", "Your listing was not approved", "alert"],
@@ -227,6 +244,7 @@ export async function notifyVerificationDecision({ accountId, organizationId, de
 
 /** A public reply to a review the seller wrote, or a new review about them. */
 export async function notifyNewReview({ organizationId, accountId, review }, connection) {
+  await emailAccountQuietly({ accountId, organizationId, roles: ["owner", "manager"] }, "reviews.received", { rating: Number(review.rating) || 0, body: review.body ?? null, author: review.author ?? null });
   return notifyAccount(
     { accountId, organizationId },
     {
@@ -283,7 +301,8 @@ export async function notifyNewMessage({ conversationId, senderUserId, preview }
 // date — the same two moments a real gateway's "payment failed" webhook would
 // fire on, reached here without one.
 
-export async function notifyPlanChanged({ accountId, organizationId, planName }, connection) {
+export async function notifyPlanChanged({ accountId, organizationId, planName, scheduled = false, limits = null }, connection) {
+  await emailAccountQuietly({ accountId, organizationId, roles: ["owner"] }, "billing.plan_changed", { planName, scheduled, limits });
   return notifyAccount(
     { accountId, organizationId },
     {
@@ -299,7 +318,10 @@ export async function notifyPlanChanged({ accountId, organizationId, planName },
   );
 }
 
+const invoiceData = (invoice) => ({ number: invoice.invoice_number, total: invoice.total, currency: invoice.currency_code, issuedAt: invoice.issued_at, dueAt: invoice.due_at });
+
 export async function notifyInvoiceOverdue({ accountId, organizationId, invoice }, connection) {
+  await emailAccountQuietly({ accountId, organizationId, roles: ["owner"] }, "billing.invoice_overdue", { invoice: invoiceData(invoice) }, { dedupeKey: `billing.invoice_overdue:${invoice.id}` });
   return notifyAccount(
     { accountId, organizationId },
     {
@@ -316,6 +338,7 @@ export async function notifyInvoiceOverdue({ accountId, organizationId, invoice 
 }
 
 export async function notifyInvoicePaid({ accountId, organizationId, invoice }, connection) {
+  await emailAccountQuietly({ accountId, organizationId, roles: ["owner"] }, "billing.invoice_paid", { invoice: invoiceData(invoice) }, { dedupeKey: `billing.invoice_paid:${invoice.id}` });
   return notifyAccount(
     { accountId, organizationId },
     {
@@ -332,6 +355,7 @@ export async function notifyInvoicePaid({ accountId, organizationId, invoice }, 
 }
 
 export async function notifySubscriptionPastDue({ accountId, organizationId, subscriptionId }, connection) {
+  await emailAccountQuietly({ accountId, organizationId, roles: ["owner"] }, "billing.subscription_past_due", {}, { dedupeKey: `billing.past_due:${subscriptionId}:${new Date().toISOString().slice(0, 10)}` });
   return notifyAccount(
     { accountId, organizationId },
     {

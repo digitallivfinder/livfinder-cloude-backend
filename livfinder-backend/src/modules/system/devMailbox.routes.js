@@ -82,6 +82,22 @@ devMailboxRouter.get("/:name/invite.ics", async (req, res, next) => {
   }
 });
 
+/** The designed (HTML) version the worker saved beside the text, shown as the recipient sees it. */
+devMailboxRouter.get("/:name/html", async (req, res, next) => {
+  try {
+    const file = mailFilePath(req.params.name);
+    if (!file) throw AppError.notFound();
+    const html = await fs.readFile(file.replace(/\.txt$/, ".html"), "utf8").catch(() => {
+      throw AppError.notFound("This email has no designed version.");
+    });
+    res.setHeader("Content-Security-Policy", "default-src 'none'; img-src * data:; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; frame-ancestors 'self'");
+    res.setHeader("Cache-Control", "no-store");
+    return res.type("html").send(html);
+  } catch (error) {
+    return next(error);
+  }
+});
+
 devMailboxRouter.get("/:name", async (req, res, next) => {
   try {
     const text = await readMail(req.params.name);
@@ -89,7 +105,14 @@ devMailboxRouter.get("/:name", async (req, res, next) => {
     const invite = text.includes("BEGIN:VCALENDAR")
       ? `<p><a href="/dev/mailbox/${encodeURIComponent(req.params.name)}/invite.ics">Download calendar invite</a></p>`
       : "";
-    return send(res, page("Email", `<p><a href="/dev/mailbox">Back to mailbox</a></p><pre>${linkify(escapeHtml(visible))}</pre>${invite}`));
+    const htmlFile = mailFilePath(req.params.name)?.replace(/\.txt$/, ".html");
+    const hasHtml = htmlFile ? await fs.access(htmlFile).then(() => true, () => false) : false;
+    const designed = hasHtml
+      ? `<p><a href="/dev/mailbox/${encodeURIComponent(req.params.name)}/html" target="_blank">Open the designed email</a></p><iframe title="Designed email" src="/dev/mailbox/${encodeURIComponent(req.params.name)}/html" style="width:100%;height:760px;border:1px solid #e2e5ea;border-radius:8px;background:#fff"></iframe><h2 style="font-size:16px;margin:24px 0 8px">Plain-text part</h2>`
+      : "";
+    res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-src 'self'");
+    res.setHeader("Cache-Control", "no-store");
+    return res.type("html").send(page("Email", `<p><a href="/dev/mailbox">Back to mailbox</a> · <a href="/dev/emails">All email designs</a></p>${designed}<pre>${linkify(escapeHtml(visible))}</pre>${invite}`));
   } catch (error) {
     return next(error);
   }

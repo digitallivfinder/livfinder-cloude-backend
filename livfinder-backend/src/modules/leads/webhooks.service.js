@@ -316,6 +316,13 @@ async function deliverOne(delivery) {
         subjectId: delivery.webhook_id,
       }
     ).catch(() => {});
+    const { emailAccount } = await import("../email/send.js");
+    await emailAccount(
+      { accountId: delivery.account_id, roles: ["owner", "manager"] },
+      "integrations.webhook_disabled",
+      { name: delivery.webhook_name, failures, error, url: delivery.target_url ?? null },
+      { dedupeKey: `webhook.disabled:${delivery.webhook_id}:${new Date().toISOString().slice(0, 13)}` }
+    ).catch(() => 0);
   }
   return { delivered: false, status, error, willRetry: !giveUp };
 }

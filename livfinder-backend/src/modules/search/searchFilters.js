@@ -1,6 +1,7 @@
 import { resolveCategory } from "../../utils/categories.js";
 import { asArray, toInt, toNumber, toBool, cleanString } from "../../utils/http.js";
 import { isPropertySegment } from "./propertySegments.js";
+import { isMarket, parseSellerTypes } from "./marketAndSeller.js";
 
 /**
  * The listing_search spec/facet slots, per root category. Mirrors the mapping
@@ -234,6 +235,9 @@ export function normalizeSearchInput(input = {}) {
     rentPeriod: RENT_PERIODS[String(input.rentPeriod || "").toLowerCase()] || null,
     propertySegment: isPropertySegment(input.propertySegment ?? input.segment) ? input.propertySegment ?? input.segment : null,
     amenities: parseAmenities(input.amenities),
+    // Real estate's Market (new_launch | resale) and Listed by (seller types); see marketAndSeller.js.
+    market: isMarket(String(input.market || "").toLowerCase()) ? String(input.market).toLowerCase() : null,
+    sellerTypes: parseSellerTypes(asArray(input.listedBy ?? input.sellerType)),
     ranges: Object.fromEntries(
       (RANGE_FILTERS[listingType] || []).flatMap((range) => [
         [range.min, toNumber(input[range.min])],

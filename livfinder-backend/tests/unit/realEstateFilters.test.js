@@ -94,3 +94,46 @@ describe("ready", () => {
     }
   });
 });
+
+describe("market and listed by", () => {
+  it("reads market and seller types from the query, ignoring anything unknown", () => {
+    expect(normalizeSearchInput({ category: "real-estate", market: "New_Launch" }).market).toBe("new_launch");
+    expect(normalizeSearchInput({ category: "real-estate", market: "secondhand" }).market).toBeNull();
+    expect(normalizeSearchInput({ category: "real-estate", listedBy: "developer,company" }).sellerTypes).toEqual(["developer", "company"]);
+    expect(normalizeSearchInput({ category: "real-estate", listedBy: ["owner; DROP", "individual"] }).sellerTypes).toEqual(["individual"]);
+  });
+
+  it("filters New Launch and Resale on the new-build flag", async () => {
+    const launch = await buildSearchQuery({ category: "real-estate", market: "new_launch" });
+    expect(launch.where).toContain("d_mkt.is_new_build = ?");
+    expect(launch.params).toContain(1);
+    const resale = await buildSearchQuery({ category: "real-estate", market: "resale" });
+    expect(resale.params).toContain(0);
+  });
+
+  it("filters on the seller account's type", async () => {
+    const built = await buildSearchQuery({ category: "real-estate", listedBy: "developer,individual" });
+    expect(built.where).toContain("a_seller.seller_type IN (?, ?)");
+    expect(built.params).toEqual(expect.arrayContaining(["developer", "individual"]));
+  });
+
+  it("applies neither outside real estate", async () => {
+    const built = await buildSearchQuery({ category: "cars", market: "resale", listedBy: "company" });
+    expect(built.where).not.toContain("is_new_build");
+    expect(built.where).not.toContain("seller_type");
+  });
+});
+
+describe("listed by options", () => {
+  it("names the seller types as buyers do, in the menu's order, keeping newer values", async () => {
+    const { sellerTypeOptions } = await import("../../src/modules/search/marketAndSeller.js");
+    const options = sellerTypeOptions(["individual", "company", "developer", "family_office"]);
+    expect(options.map((option) => [option.value, option.label])).toEqual([
+      ["developer", "Developer"],
+      ["company", "Agency"],
+      ["individual", "Owner"],
+      ["family_office", "Family Office"],
+    ]);
+    expect(options[0].hint).toBe("New launches");
+  });
+});

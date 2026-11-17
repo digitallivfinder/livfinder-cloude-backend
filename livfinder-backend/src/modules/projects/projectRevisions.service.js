@@ -5,7 +5,7 @@ import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
 import { ulid } from "../../utils/ids.js";
 import { serializeProjectDetail } from "../../serializers/project.js";
-import { sendMail } from "../system/mail.service.js";
+import { developmentSummary, emailAccount } from "../email/send.js";
 import { notifyAccount } from "../system/notifications.service.js";
 import * as searchRepo from "../search/search.repository.js";
 import { compareDetails, json, ownerEmails, serializeRevision } from "../listings/listingRevisions.service.js";
@@ -145,7 +145,12 @@ export async function projectRevisionForReview(projectId) {
   return { ...serializeRevision(row), changes: compareDetails(before, after) };
 }
 
-async function tellDeveloper(project, { type, title, body, emailSubject, emailText }) {
+
+/** Field-by-field reasons as the email's issue list. */
+const issueList = (fields) =>
+  fields && Object.keys(fields).length ? [{ label: "What to fix", reasons: Object.entries(fields).map(([field, message]) => `${field}: ${message}`) }] : [];
+
+async function tellDeveloper(project, { type, title, body, fields = null }) {
   const portalUrl = `/portal/developments/${project.public_id}`;
   await notifyAccount(
     { accountId: project.account_id, organizationId: project.organization_id },
@@ -160,13 +165,12 @@ async function tellDeveloper(project, { type, title, body, emailSubject, emailTe
       data: { slug: project.slug },
     }
   );
-  const emails = await ownerEmails(project.account_id).catch(() => []);
-  const link = `${String(env.FRONTEND_URL || "").replace(/\/$/, "")}${portalUrl}`;
-  for (const to of emails) {
-    await sendMail({ to, subject: emailSubject, text: `${emailText}\n\n${link}` }).catch((error) =>
-      logger.warn({ err: error, projectId: project.id }, "development revision email not sent")
-    );
-  }
+  const approved = type.endsWith("approved");
+  await emailAccount(
+    { accountId: project.account_id, organizationId: project.organization_id },
+    "listings.revision_decision",
+    { approved, kind: "development", listing: await developmentSummary(project.id), reason: approved ? null : body, issues: issueList(fields) }
+  ).catch((error) => logger.warn({ err: error, projectId: project.id }, "development revision email not queued"));
 }
 
 /** Tells the developer's own systems about a decision on its changes (webhook, Phase 6). */
@@ -244,6 +248,7 @@ export async function rejectProjectRevision({ projectId, userId, reason, fields 
     type: "project.revision_rejected",
     title: "Your changes were not approved",
     body: reason.trim(),
+    fields,
     emailSubject: `Your changes to ${project.name} need attention`,
     emailText: `LivFinder did not approve your latest changes to ${project.name}. The development still shows the last approved version.\n\nReason: ${reason.trim()}${issues ? `\n\n${issues}` : ""}\n\nFix the development and save it again to resubmit.`,
   });

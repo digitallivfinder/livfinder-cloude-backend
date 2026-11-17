@@ -2,6 +2,7 @@ import { query } from "../../db/query.js";
 import { resolveCategory } from "../../utils/categories.js";
 import { SPEC_MAP } from "../search/searchFilters.js";
 import { isPropertySegment } from "../search/propertySegments.js";
+import { MARKET_OPTIONS, sellerTypeOptions } from "../search/marketAndSeller.js";
 import { resolveLocation, searchLocations, toEntity } from "../locations/locations.repository.js";
 
 /**
@@ -436,6 +437,16 @@ export async function filterOptions(category, filterKey, { q = null, parent = nu
 
   if (listingType === "real-estate" && filterKey === "rentPeriod") {
     return enumOptions("listing_real_estate", "rent_period", "rentPeriod");
+  }
+
+  if (listingType === "real-estate" && filterKey === "market") {
+    return MARKET_OPTIONS;
+  }
+
+  if (listingType === "real-estate" && filterKey === "listedBy") {
+    // The `accounts.seller_type` values, with the names buyers use (Agency, Owner).
+    const values = (await enumOptions("accounts", "seller_type", "listedBy")).map((option) => option.value);
+    return sellerTypeOptions(values);
   }
 
   if (filterKey === "amenities") {

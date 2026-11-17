@@ -111,6 +111,15 @@ const server = app.listen(env.PORT, async () => {
     } catch (error) {
       logger.error({ err: error }, "listing import runner could not be started");
     }
+    // Email (0081): the outbox worker, and the reminders, alerts and digests that time triggers.
+    try {
+      const { startEmailWorker } = await import("./modules/email/worker.js");
+      const { startEmailJobs } = await import("./modules/email/jobs.js");
+      startEmailWorker();
+      startEmailJobs();
+    } catch (error) {
+      logger.error({ err: error }, "email worker could not be started");
+    }
     // Webhooks (0064): deliver lead events to companies' endpoints, with retries.
     try {
       const { startWebhookWorker } = await import("./modules/leads/webhooks.service.js");

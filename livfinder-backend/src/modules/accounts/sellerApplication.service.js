@@ -229,6 +229,14 @@ export async function submitApplication(req, input) {
       : savePersonal(input, context, place, connection);
   });
   await attachUploadedDocuments({ verificationRequestId, userId, accountId, documents: input.documents });
+  const { emailApplicationSubmitted } = await import("../email/events.js");
+  await emailApplicationSubmitted({
+    userId,
+    sellerType: input.accountType === "organization" ? (input.organizationType === "developer" ? "developer" : "company") : "individual",
+    applicantName: req.auth.user.displayName ?? req.auth.user.name ?? null,
+    companyName: input.accountType === "organization" ? input.publicName ?? input.legalName ?? null : null,
+    receipt: true,
+  });
   return { status: "pending" };
 }
 

@@ -1,7 +1,7 @@
 import { z } from "zod";
 import env from "../../config/env.js";
 import logger from "../../config/logger.js";
-import { sendMail } from "../system/mail.service.js";
+import { queueEmail } from "../email/send.js";
 import { query, queryOne, queryValue, execute } from "../../db/query.js";
 import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
@@ -335,30 +335,33 @@ async function applyApproval({ subjectType, subjectId, requestId, payload, membe
   );
 }
 
-const DECISION_EMAILS = {
-  approve: { subject: "Your LivFinder account is verified", body: "Your application has been approved." },
-  reject: { subject: "Your LivFinder application was not approved", body: "Your application could not be approved." },
-  request_changes: { subject: "Your LivFinder application needs changes", body: "A reviewer needs something changed." },
-};
-
 /** The verification page promises an email. A failure here must not undo the decision. */
 async function tellApplicant({ subjectType, subjectId, decision, note, reason }) {
-  if (subjectType === "agent") return;
   try {
+    const detail = decision === "reject" ? reason : decision === "request_changes" ? note : null;
+    // An agent profile reviewed on its own: its login (if it has one) hears the decision.
+    if (subjectType === "agent") {
+      const agent = await queryOne("SELECT u.id, u.email, u.display_name FROM agents ag JOIN users u ON u.id = ag.user_id WHERE ag.id = ?", [subjectId]);
+      if (agent?.email) {
+        await queueEmail({ template: "applications.decision", to: agent.email, toName: agent.display_name, userId: agent.id, data: { decision, detail, sellerType: "individual", agentProfile: true } });
+      }
+      return;
+    }
     const applicant = await queryOne(
       subjectType === "organization"
-        ? `SELECT u.email, a.id AS account_id FROM organizations o
+        ? `SELECT u.id AS user_id, u.email, u.display_name, a.id AS account_id, a.seller_type FROM organizations o
              JOIN accounts a ON a.id = o.account_id JOIN users u ON u.id = a.owner_user_id WHERE o.id = ?`
-        : `SELECT u.email, a.id AS account_id FROM accounts a JOIN users u ON u.id = a.owner_user_id WHERE a.id = ?`,
+        : `SELECT u.id AS user_id, u.email, u.display_name, a.id AS account_id, a.seller_type FROM accounts a JOIN users u ON u.id = a.owner_user_id WHERE a.id = ?`,
       [subjectId]
     );
     if (!applicant) return;
-    const message = DECISION_EMAILS[decision];
-    const detail = decision === "reject" ? reason : decision === "request_changes" ? note : null;
-    await sendMail({
+    await queueEmail({
+      template: "applications.decision",
       to: applicant.email,
-      subject: message.subject,
-      text: [message.body, detail, `Sign in to see the details: ${env.FRONTEND_URL}/login`].filter(Boolean).join("\n\n"),
+      toName: applicant.display_name,
+      userId: applicant.user_id,
+      accountId: applicant.account_id,
+      data: { decision, detail, sellerType: applicant.seller_type || (subjectType === "organization" ? "company" : "individual"), agentProfile: subjectType === "account" },
     });
     await notifyVerificationDecision({
       accountId: applicant.account_id,
@@ -405,10 +408,11 @@ export async function resetCompanyPassword({ identifier, method, recipient, ip }
     const sentTo = recipient === "company" ? owner.company_email : owner.email;
     if (!sentTo) throw AppError.validation("Some information is invalid.", { recipient: "This company has no email address." });
     const token = await issueToken({ userId: owner.id, purpose: "password_reset", target: owner.email, ip });
-    await sendMail({
+    await queueEmail({
+      template: "auth.password_reset_support",
       to: sentTo,
-      subject: "Reset your LivFinder password",
-      text: `LivFinder support sent this link for ${owner.company_name}. Use it within the hour to choose a new password:\n\n${env.FRONTEND_URL}/reset-password?token=${encodeURIComponent(token)}\n\nIf you did not ask for this, nothing has changed.`,
+      userId: recipient === "company" ? null : owner.id,
+      data: { companyName: owner.company_name, url: `${env.FRONTEND_URL}/reset-password?token=${encodeURIComponent(token)}` },
     });
     return { method, sentTo, userId: owner.id };
   }
@@ -427,11 +431,7 @@ export async function resetCompanyPassword({ identifier, method, recipient, ip }
     );
     await revokeAllSessions(owner.id, connection);
   });
-  await sendMail({
-    to: owner.email,
-    subject: "Your LivFinder password was reset",
-    text: "LivFinder support reset your password. Sign in with the password they give you, then change it in Account Settings. If you did not ask for this, contact support.",
-  }).catch((error) => logger.error({ err: error, userId: owner.id }, "password reset notice could not be sent"));
+  await queueEmail({ template: "auth.password_reset_temporary", to: owner.email, userId: owner.id, data: {} });
   return { method, temporaryPassword, sentTo: null, userId: owner.id };
 }
 
@@ -659,6 +659,10 @@ export async function decideCategoryAccess({ accountId, organizationPublicId, us
     );
   }
   const withdrawn = decision === "revoke" ? await withdrawCategoryListings({ accountId, rootCategoryId: definition.rootId, userId }) : 0;
+  if (decision === "approve" || decision === "reject") {
+    const { emailCategoryAccessDecision } = await import("../email/events.js");
+    await emailCategoryAccessDecision({ accountId, categoryName: definition.label ?? definition.name ?? definition.frontendId, approved: decision === "approve", note, listingQuota });
+  }
   return { accountId: String(accountId), categoryId: definition.frontendId, status, listingsWithdrawn: withdrawn };
 }
 
@@ -2774,6 +2778,10 @@ export async function upsertDevelopment({ identifier, payload, userId }) {
   // A single `paymentPlan` from an older caller becomes the one-element set, so
   // there is one write path and one validation rule.
   const plans = payload.paymentPlans ?? (payload.paymentPlan ? [payload.paymentPlan] : undefined);
+  // The status before this save, so the developer is emailed only when a decision changes it.
+  const before = identifier && payload.moderationStatus !== undefined
+    ? await queryOne("SELECT moderation_status FROM projects WHERE public_id = ? OR slug = ? LIMIT 1", [identifier, identifier])
+    : null;
 
   const projectId = await withTransaction(async (connection) => {
     let developerBrandId = null;
@@ -2874,6 +2882,15 @@ export async function upsertDevelopment({ identifier, payload, userId }) {
    * the row searchable until the next write.
    */
   await callProcedure("sp_refresh_project_search", [projectId.id]);
+
+  const DECISION_FOR = { published: "approve", rejected: "reject", archived: "archive", draft: "unpublish" };
+  if (before && payload.moderationStatus !== before.moderation_status && DECISION_FOR[payload.moderationStatus]) {
+    // Back to draft only counts as a decision when the development had been live.
+    if (payload.moderationStatus !== "draft" || before.moderation_status === "published") {
+      const { emailDevelopmentDecision } = await import("../email/events.js");
+      await emailDevelopmentDecision({ projectId: projectId.id, decision: DECISION_FOR[payload.moderationStatus], reason: payload.rejectionReason ?? null });
+    }
+  }
 
   return projectId.created
     ? { id: projectId.publicId, created: true, actorUserId: userId }

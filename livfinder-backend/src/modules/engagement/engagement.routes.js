@@ -15,7 +15,8 @@ import { auditFromRequest } from "../system/audit.service.js";
 import { listFavourites, listSavedSearches } from "../portal/engagement.repository.js";
 import { resolveCategory } from "../../utils/categories.js";
 import { resolveLocation } from "../locations/locations.repository.js";
-import { sendMail } from "../system/mail.service.js";
+import { emailStaff, queueEmail } from "../email/send.js";
+import { emailNewBooking, emailNewInquiry, emailNewOffer } from "../email/events.js";
 import env from "../../config/env.js";
 import net from "node:net";
 import { notifyNewBooking, notifyNewInquiry, notifyNewOffer } from "../system/notifications.service.js";
@@ -435,13 +436,9 @@ router.post(
       return { reference: ref, inquiryId: result.insertId, leadId, grantedDocuments: granted };
     });
 
-    if (listing?.contact_email) {
-      await sendMail({
-        to: listing.contact_email,
-        subject: `New enquiry ${reference} — ${listing.title}`,
-        text: `${req.body.name} (${req.body.email}${req.body.phone ? `, ${req.body.phone}` : ""}) asked about ${listing.title} (${listing.reference}):\n\n${req.body.message}`,
-      });
-    }
+    // The seller side (agent, owners, the listing's contact address) and a receipt for the buyer.
+    // Queued, so a mail outage can no longer turn a saved enquiry into an error for the buyer.
+    await emailNewInquiry(inquiryId);
 
     // The company's own systems hear about it (webhook, Phase 6); never holds up the visitor.
     await emitLeadEvent("inquiry", inquiryId, "lead.created");
@@ -573,6 +570,7 @@ router.post(
       listing,
       booking: { id: null, reference, scheduledStart: req.body.scheduledStart },
     });
+    await emailNewBooking(publicId);
     await emitLeadEventByPublicId("booking", publicId, "lead.created");
     return res.status(201).json(detailResponse({ id: publicId, reference, status: "requested" }));
   })
@@ -659,6 +657,7 @@ router.post(
       listing,
       offer: { id: null, reference, amount: req.body.amount, currency },
     });
+    await emailNewOffer(publicId);
     await emitLeadEventByPublicId("offer", publicId, "lead.created");
     return res.status(201).json(detailResponse({ id: publicId, reference, status: "submitted" }));
   })
@@ -953,6 +952,14 @@ router.post(
       return ref;
     });
 
+    await emailStaff("reports.view", {
+      title: `New report ${reference}: ${listing.title ?? listing.reference}`,
+      summary: `A listing was reported for: ${reasons.map((row) => row.name).join(", ")}.`,
+      rows: [["Reference", reference], ["Listing", listing.reference ?? ""], ["Priority", reasons.some((row) => row.is_severe) ? "High" : "Normal"]],
+      quote: req.body.details || null,
+      url: "/admin/reports",
+      actionLabel: "Open reports",
+    });
     return res.status(201).json(detailResponse({ id: publicId, reference }));
   })
 );
@@ -1038,6 +1045,20 @@ router.post(
       return ref;
     });
 
+    await queueEmail({
+      template: "receipts.contact",
+      to: req.body.email,
+      toName: req.body.name,
+      userId: req.auth?.user?.id ?? null,
+      data: { reference, topic: topic.subject, message: req.body.message },
+    });
+    await emailStaff("supportChat.view", {
+      title: `Contact form ${reference}: ${topic.subject}`,
+      summary: `${req.body.name} (${req.body.email}) wrote through the contact form.`,
+      quote: req.body.message,
+      url: "/admin/contacts",
+      actionLabel: "Open contacts",
+    });
     return res.status(201).json(detailResponse({ id: publicId, reference }));
   })
 );
@@ -1114,18 +1135,11 @@ router.post(
  * the subscriber's own token, which also serves the unsubscribe link.
  */
 async function sendNewsletterConfirmation(subscriberId) {
-  const row = await queryOne("SELECT email, unsubscribe_token FROM newsletter_subscribers WHERE id = ?", [subscriberId]);
+  const row = await queryOne("SELECT email, user_id, unsubscribe_token FROM newsletter_subscribers WHERE id = ?", [subscriberId]);
   if (!row?.unsubscribe_token) return;
   const confirmUrl = `${env.FRONTEND_URL}/newsletter/confirm?token=${encodeURIComponent(row.unsubscribe_token)}`;
-  try {
-    await sendMail({
-      to: row.email,
-      subject: "Confirm your LivFinder newsletter subscription",
-      text: `Please confirm that you would like to receive the LivFinder newsletter:\n\n${confirmUrl}\n\nIf you did not ask for this, ignore this message and you will not be subscribed.`,
-    });
-  } catch {
-    // The row stays pending; subscribing again resends the confirmation.
-  }
+  // The row stays pending until confirmed; subscribing again sends a new confirmation.
+  await queueEmail({ template: "newsletter.confirm", to: row.email, userId: row.user_id, data: { url: confirmUrl } });
 }
 
 router.get(
@@ -1139,6 +1153,10 @@ router.get(
         "UPDATE newsletter_subscribers SET status = 'subscribed', confirmed_at = NOW(3), updated_at = NOW(3) WHERE id = ?",
         [row.id]
       );
+      // Confirming lifts an earlier unsubscribe, then welcomes them once.
+      const subscriber = await queryOne("SELECT email, user_id FROM newsletter_subscribers WHERE id = ?", [row.id]);
+      await execute("DELETE FROM email_suppressions WHERE email = ? AND scope = 'newsletter' AND reason = 'unsubscribe'", [subscriber.email]);
+      await queueEmail({ template: "newsletter.welcome", to: subscriber.email, userId: subscriber.user_id, data: {}, dedupeKey: `newsletter.welcome:${row.id}` });
     }
     const status = row.status === "pending" ? "subscribed" : row.status;
     return res.json(detailResponse({ status }));

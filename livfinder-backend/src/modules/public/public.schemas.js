@@ -17,6 +17,9 @@ export const listingSearchQuery = z
     community: optionalString(120),
     subcommunity: optionalString(120),
     location: z.union([z.string(), z.array(z.string())]).optional(),
+    // Real estate: Market (new_launch | resale) and Listed by (seller types, comma list or repeated).
+    market: optionalString(20),
+    listedBy: z.union([z.string().max(120), z.array(z.string().max(40)).max(5)]).optional(),
     minPrice: z.coerce.number().min(0).max(1e15).optional(),
     maxPrice: z.coerce.number().min(0).max(1e15).optional(),
     priceMin: z.coerce.number().min(0).max(1e15).optional(),

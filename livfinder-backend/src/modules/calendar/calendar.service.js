@@ -5,7 +5,7 @@ import { execute, query, queryOne } from "../../db/query.js";
 import { AppError } from "../../utils/errors.js";
 import { safeFetch } from "../../utils/safeFetch.js";
 import { decryptSecret, encryptSecret } from "../../utils/secrets.js";
-import { sendMail } from "../system/mail.service.js";
+import { queueEmail } from "../email/send.js";
 import { buildInvite } from "./ics.js";
 
 /**
@@ -175,6 +175,7 @@ function describe(booking) {
     seller: {
       email: booking.agent_email ?? booking.organization_email ?? booking.owner_email,
       userId: booking.agent_user_id ?? booking.owner_user_id,
+      portal: true,
       summary: `${type}: ${title} with ${booking.contact_name ?? "customer"}`,
       description: sellerLines.filter(Boolean).join("\n"),
     },
@@ -197,16 +198,21 @@ async function emailInvite(booking, details, side, method) {
     organizer: env.MAIL_FROM,
     attendee: side.email,
   });
-  const when = new Date(details.start).toUTCString();
-  await sendMail({
+  // The time is written in the reader's own timezone by the template; the .ics carries UTC.
+  await queueEmail({
+    template: "viewings.confirmed",
     to: side.email,
-    subject: `${cancelled ? "Cancelled" : "Confirmed"}: ${side.summary}`,
-    text: `${side.summary}\n${when}${details.location ? `\n${details.location}` : ""}\n\n${side.description}\n\n${
-      cancelled ? "This has been cancelled." : "The attached invite adds this to your calendar."
-    }`,
-    attachments: [
-      { filename: "invite.ics", content: ics, contentType: `text/calendar; charset=utf-8; method=${method}` },
-    ],
+    userId: side.userId ?? null,
+    data: {
+      cancelled,
+      moved: Boolean(side.moved),
+      summary: side.summary,
+      start: details.start,
+      location: details.location,
+      lines: side.description.split("\n").filter(Boolean),
+      url: side.portal ? `${env.FRONTEND_URL}/portal/bookings` : null,
+    },
+    attachments: [{ filename: "invite.ics", content: ics, contentType: `text/calendar; charset=utf-8; method=${method}` }],
   });
 }
 

@@ -11,7 +11,7 @@ import { createSession } from "../auth/sessions.js";
 import { recordAudit } from "../system/audit.service.js";
 import { resolveCategory } from "../../utils/categories.js";
 import { resolveLocation } from "../locations/locations.repository.js";
-import { sendMail } from "../system/mail.service.js";
+import { queueEmail } from "../email/send.js";
 import { notifyPlanChanged } from "../system/notifications.service.js";
 import { syncAccountAddons } from "./addons.service.js";
 import env from "../../config/env.js";
@@ -331,6 +331,8 @@ export async function signupPersonal(input, { ip, userAgent } = {}) {
   });
 
   await sendVerificationEmail(result.userId, input.email, ip);
+  const { emailApplicationSubmitted } = await import("../email/events.js");
+  await emailApplicationSubmitted({ userId: result.userId, sellerType: "individual", applicantName: [input.firstName, input.lastName].filter(Boolean).join(" ") });
   return result;
 }
 
@@ -532,6 +534,13 @@ export async function signupOrganization(input, { ip, userAgent } = {}) {
   });
 
   await sendVerificationEmail(result.userId, input.email, ip);
+  const { emailApplicationSubmitted } = await import("../email/events.js");
+  await emailApplicationSubmitted({
+    userId: result.userId,
+    sellerType: input.organizationType === "developer" ? "developer" : "company",
+    applicantName: [input.firstName, input.lastName].filter(Boolean).join(" "),
+    companyName: input.publicName ?? input.legalName ?? null,
+  });
   return result;
 }
 
@@ -575,12 +584,11 @@ async function sendVerificationEmail(userId, email, ip) {
       target: email,
       ip,
     });
-    await sendMail({
+    await queueEmail({
+      template: "auth.confirm_email",
       to: email,
-      subject: "Confirm your LivFinder email address",
-      text: `Welcome to LivFinder. Confirm your address to activate your account:\n\n${
-        env.FRONTEND_URL
-      }/verify-email?token=${encodeURIComponent(token)}`,
+      userId,
+      data: { url: `${env.FRONTEND_URL}/verify-email?token=${encodeURIComponent(token)}` },
     });
   } catch (error) {
     logger.error({ err: error, userId }, "signup confirmation email could not be sent");
@@ -772,6 +780,8 @@ export async function schedulePlanChange({ accountId, packageId, userId = null }
       connection
     );
   });
+  const { emailAccount } = await import("../email/send.js");
+  await emailAccount({ accountId, roles: ["owner"] }, "billing.plan_change_scheduled", { planName: plan.name, effectiveAt: current.current_period_end }).catch(() => 0);
   return {
     packageId: plan.public_id,
     packageName: plan.name,
@@ -800,6 +810,10 @@ export async function cancelScheduledPlanChange(accountId) {
         SET c.status = 'cancelled' WHERE s.account_id = ? AND c.status = 'scheduled' AND c.reason = ?`,
     [accountId, SCHEDULED_REASON]
   );
+  if (result.affectedRows > 0) {
+    const { emailAccount } = await import("../email/send.js");
+    await emailAccount({ accountId, roles: ["owner"] }, "billing.plan_change_scheduled", { cancelled: true }).catch(() => 0);
+  }
   return result.affectedRows > 0;
 }
 

@@ -195,6 +195,7 @@ export async function confirmTotpEnrolment({ userId, code }) {
     }
   });
 
+  await notifyMfaChange(userId, true);
   // Returned once. There is no endpoint that will show them again.
   return { enabled: true, recoveryCodes };
 }
@@ -210,7 +211,16 @@ export async function disableMfa({ userId, code }) {
     await execute("DELETE FROM user_mfa_factors WHERE user_id = ?", [userId], connection);
     await execute("UPDATE users SET mfa_enabled = 0 WHERE id = ?", [userId], connection);
   });
+  await notifyMfaChange(userId, false);
   return { enabled: false };
+}
+
+/** A security notice whenever two-step sign-in is turned on or off. */
+async function notifyMfaChange(userId, enabled) {
+  const user = await queryOne("SELECT email, display_name FROM users WHERE id = ?", [userId]);
+  if (!user?.email) return;
+  const { queueEmail } = await import("../email/send.js");
+  await queueEmail({ template: "auth.mfa_changed", to: user.email, toName: user.display_name, userId, data: { enabled, at: new Date().toISOString() } });
 }
 
 export async function isMfaEnabled(userId) {

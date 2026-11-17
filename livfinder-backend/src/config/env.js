@@ -87,6 +87,26 @@ const schema = z.object({
   SMTP_PORT: int(587),
   SMTP_USER: z.string().optional().transform((value) => value || null),
   SMTP_PASSWORD: z.string().optional().transform((value) => value || null),
+  // "true" forces TLS from the first byte (port 465); otherwise STARTTLS is used when offered.
+  SMTP_SECURE: z.string().optional().transform((value) => (value ? ["1", "true", "yes"].includes(value.toLowerCase()) : null)),
+  // The name shown beside MAIL_FROM in the inbox, and where replies to no-reply mail should go.
+  MAIL_FROM_NAME: z.string().default("LivFinder"),
+  MAIL_REPLY_TO: z.string().optional().transform((value) => value || null),
+  // Optional separate senders for digests and the newsletter; MAIL_FROM when unset.
+  MAIL_FROM_ALERTS: z.string().optional().transform((value) => value || null),
+  MAIL_FROM_NEWS: z.string().optional().transform((value) => value || null),
+  // Where email images (the logo) are served from. FRONTEND_URL when unset.
+  EMAIL_ASSET_BASE_URL: z.string().optional().transform((value) => value || null),
+  // Printed in every email footer.
+  EMAIL_LEGAL_NAME: z.string().default("LivFinder"),
+  EMAIL_LEGAL_ADDRESS: z.string().default("Dubai, United Arab Emirates"),
+  EMAIL_SUPPORT_ADDRESS: z.string().default("support@livfinder.com"),
+  // Shared secret the mail provider's bounce and complaint webhook must send (?secret= or header).
+  EMAIL_WEBHOOK_SECRET: z.string().optional().transform((value) => value || null),
+  // The platform's own timezone: staff digests and anyone with no timezone of their own.
+  EMAIL_DEFAULT_TIMEZONE: z.string().default("Asia/Dubai"),
+  // "false" stops the email worker in this process (e.g. a second API instance).
+  EMAIL_WORKER_ENABLED: z.string().optional().transform((value) => value !== "false"),
 
   PAYMENTS_DRIVER: z.enum(["mock", "stripe"]).default("mock"),
   STRIPE_SECRET_KEY: z.string().optional().transform((value) => value || null),

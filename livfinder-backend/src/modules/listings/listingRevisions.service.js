@@ -4,7 +4,7 @@ import { execute, query, queryOne } from "../../db/query.js";
 import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
 import { ulid } from "../../utils/ids.js";
-import { sendMail } from "../system/mail.service.js";
+import { emailAccount, listingSummary } from "../email/send.js";
 import { notifyAccount } from "../system/notifications.service.js";
 import { getListingDetail, refreshListingSearch } from "./listings.repository.js";
 
@@ -266,7 +266,12 @@ export async function ownerEmails(accountId) {
   return rows.map((row) => row.email);
 }
 
-async function tellOwner(listing, { type, title, body, emailSubject, emailText }) {
+
+/** Field-by-field reasons as the email's issue list. */
+const issueList = (fields) =>
+  fields && Object.keys(fields).length ? [{ label: "What to fix", reasons: Object.entries(fields).map(([field, message]) => `${field}: ${message}`) }] : [];
+
+async function tellOwner(listing, { type, title, body, fields = null }) {
   await notifyAccount(
     { accountId: listing.account_id, organizationId: listing.organization_id, agentId: listing.agent_id },
     {
@@ -280,13 +285,12 @@ async function tellOwner(listing, { type, title, body, emailSubject, emailText }
       data: { reference: listing.reference },
     }
   );
-  const emails = await ownerEmails(listing.account_id).catch(() => []);
-  const link = `${String(env.FRONTEND_URL || "").replace(/\/$/, "")}/portal/listings/${listing.public_id}`;
-  for (const to of emails) {
-    await sendMail({ to, subject: emailSubject, text: `${emailText}\n\n${link}` }).catch((error) =>
-      logger.warn({ err: error, listingId: listing.id }, "revision email not sent")
-    );
-  }
+  const approved = type.endsWith("approved");
+  await emailAccount(
+    { accountId: listing.account_id, organizationId: listing.organization_id, agentId: listing.agent_id },
+    "listings.revision_decision",
+    { approved, kind: "listing", listing: await listingSummary(listing.id), reason: approved ? null : body, issues: issueList(fields) }
+  ).catch((error) => logger.warn({ err: error, listingId: listing.id }, "revision email not queued"));
 }
 
 /** Tells the company's own systems about a decision on its changes (webhook, Phase 6). */
@@ -363,6 +367,7 @@ export async function rejectRevision({ listingId, userId, reason, fields = null 
     type: "listing.revision_rejected",
     title: "Your changes were not approved",
     body: reason.trim(),
+    fields,
     emailSubject: `Your changes to ${listing.title} need attention`,
     emailText: `LivFinder did not approve your latest changes to ${listing.title} (${listing.reference}). The listing still shows the last approved version.\n\nReason: ${reason.trim()}${issues ? `\n\n${issues}` : ""}\n\nFix the listing and save it again to resubmit.`,
   });

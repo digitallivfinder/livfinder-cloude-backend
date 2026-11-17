@@ -773,6 +773,13 @@ async function notifyStaffOfSupport(conversationId, identity, topic) {
     subjectType: "conversation",
     subjectId: conversationId,
   });
+  const { emailStaff } = await import("../email/send.js");
+  await emailStaff("supportChat.reply", {
+    title: `New support chat from ${identity.name}`,
+    summary: topic ? `Topic: ${String(topic).slice(0, 240)}` : "A visitor opened a support chat.",
+    url: "/admin/support-chats",
+    actionLabel: "Open support chats",
+  }).catch(() => 0);
 }
 
 /** Staff opening a support thread with a company (every lead-working member joins it). */

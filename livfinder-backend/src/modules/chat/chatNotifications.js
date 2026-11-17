@@ -1,7 +1,7 @@
 import env from "../../config/env.js";
 import logger from "../../config/logger.js";
 import { execute } from "../../db/query.js";
-import { sendMail } from "../system/mail.service.js";
+import { queueEmail } from "../email/send.js";
 import { notify } from "../system/notifications.service.js";
 import * as presence from "../../realtime/presence.js";
 
@@ -68,26 +68,14 @@ export async function notifyOfflineRecipients({ conversation, participants, send
     if (!to) continue;
 
     const about = conversation.kind === "support" ? "LivFinder Support" : conversation.subject || "your conversation";
-    try {
-      await sendMail({
-        to,
-        subject: `New message from ${senderName} — ${about}`,
-        text: [
-          `${senderName} wrote:`,
-          "",
-          preview,
-          "",
-          `Reply here: ${link}`,
-          "",
-          row.guest_public_id
-            ? "This link signs you in to the chat on this device. Do not forward it."
-            : "You are receiving this because you were not online when the message arrived.",
-        ].join("\n"),
-      });
-      emailed += 1;
-    } catch (error) {
-      logger.warn({ err: error }, "chat email failed");
-    }
+    const id = await queueEmail({
+      template: "chat.message",
+      to,
+      userId: row.user_id ?? null,
+      data: { senderName, about, preview, url: link, guest: Boolean(row.guest_public_id) },
+    });
+    if (id) emailed += 1;
+    else logger.warn({ conversationId: conversation.id }, "chat email not queued");
   }
   return emailed;
 }

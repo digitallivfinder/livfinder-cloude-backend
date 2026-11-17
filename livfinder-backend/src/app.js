@@ -1,5 +1,8 @@
 import { requireAccount, requireSellerTools } from "./middleware/auth.js";
 import { devMailboxRouter } from "./modules/system/devMailbox.routes.js";
+import { devEmailsRouter } from "./modules/email/devPreview.routes.js";
+import { emailPublicRouter } from "./modules/email/email.routes.js";
+import adminEmailRouter from "./modules/email/admin.email.routes.js";
 import { portalCalendarRouter } from "./modules/calendar/calendar.routes.js";
 import { myRecordsRouter } from "./modules/portal/myRecords.routes.js";
 import express from "express";
@@ -59,6 +62,8 @@ export function createApp() {
   // still works when the API is under load.
   app.use("/health", healthRouter);
   if (!env.isProduction && !env.isTest && env.MAIL_DRIVER === "log") app.use("/dev/mailbox", devMailboxRouter);
+  // Every email design rendered from sample data (loopback only, never in production).
+  if (!env.isProduction && !env.isTest) app.use("/dev/emails", devEmailsRouter);
 
   /**
    * The API root. This is not a website — opening the API port in a browser used to return a bare
@@ -108,6 +113,10 @@ export function createApp() {
   // rewrites them on the way out. See middleware/legacyMedia.js.
   app.use(legacyMediaRewrite);
 
+  // Unsubscribe links and the mail provider's bounce webhook come from mail clients and
+  // providers with no session or CSRF token (RFC 8058 one-click), so they sit ahead of CSRF.
+  app.use("/v1/email", emailPublicRouter);
+
   app.use(csrfProtection);
 
   // Projects owns /v1/public/projects and /v1/public/developers. Mounted first
@@ -130,6 +139,7 @@ export function createApp() {
   app.use("/v1/portal", portalLeadsRouter);
   app.use("/v1/portal", portalRouter);
   app.use("/v1/admin", adminFeedMappingsRouter);
+  app.use("/v1/admin", adminEmailRouter);
   app.use("/v1/admin", adminRouter);
   // Self-contained, like projects — its own tree and its own API, not folded
   // into admin.routes.js.

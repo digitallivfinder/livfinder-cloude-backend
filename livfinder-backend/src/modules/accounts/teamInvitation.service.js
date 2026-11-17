@@ -9,7 +9,7 @@ import { PHONE_LENGTH_MESSAGE, splitPhone } from "../../utils/phone.js";
 import { normalizeEmail } from "../auth/auth.service.js";
 import { hashPassword, passwordPolicyError } from "../auth/passwords.js";
 import { createSession } from "../auth/sessions.js";
-import { sendMail } from "../system/mail.service.js";
+import { queueEmail } from "../email/send.js";
 import { uniqueAgentSlug } from "../portal/organization.service.js";
 
 /**
@@ -66,23 +66,48 @@ function serialize(row) {
   };
 }
 
-async function sendInvitation({ invitation, token, companyName, inviterName }) {
+async function sendInvitation({ invitation, token, companyName, inviterName, template = "team.invitation", expiresAt = null }) {
   const url = `${env.FRONTEND_URL}/accept-invite?token=${encodeURIComponent(token)}`;
-  try {
-    const result = await sendMail({
-      to: invitation.email,
-      subject: `${companyName} invited you to LivFinder`,
-      text: [
-        `${inviterName} invited you to join ${companyName} on LivFinder as ${ROLE_LABELS[invitation.role]}.`,
-        `Accept the invitation: ${url}`,
-        `The link works for ${LIFETIME_DAYS} days. If you were not expecting this, you can ignore it.`,
-      ].join("\n\n"),
+  const id = await queueEmail({
+    template,
+    to: invitation.email,
+    toName: [invitation.first_name, invitation.last_name].filter(Boolean).join(" ") || null,
+    data: { inviterName, companyName, roleLabel: ROLE_LABELS[invitation.role], url, days: LIFETIME_DAYS, expiresAt },
+  });
+  if (!id) logger.error({ invitationId: invitation.public_id }, "team invitation could not be queued");
+  if (id === -1) return true; // sent directly (no queue table yet)
+  const row = id ? await queryOne("SELECT status FROM email_messages WHERE id = ?", [id]) : null;
+  return Boolean(row) && row.status !== "failed" && row.status !== "suppressed";
+}
+
+/**
+ * Two days before an invitation expires, the invitee gets a reminder with a fresh link (only the
+ * hash of the old one is stored, so it cannot be sent again). Once per invitation.
+ */
+export async function remindExpiringInvitations() {
+  const rows = await query(
+    `SELECT t.*, o.name AS company_name, COALESCE(u.display_name, u.first_name, u.email) AS inviter_name
+       FROM team_invitations t
+       JOIN organizations o ON o.id = t.organization_id
+       LEFT JOIN users u ON u.id = t.invited_by_user_id
+      WHERE t.status = 'pending' AND t.expires_at BETWEEN DATE_ADD(NOW(3), INTERVAL 1 DAY) AND DATE_ADD(NOW(3), INTERVAL 2 DAY)
+        AND NOT EXISTS (SELECT 1 FROM email_messages m WHERE m.dedupe_key = CONCAT('team.invitation_reminder:', t.id))
+      LIMIT 200`
+  );
+  let sent = 0;
+  for (const row of rows) {
+    const token = randomToken(32);
+    await execute("UPDATE team_invitations SET token_hash = ? WHERE id = ? AND status = 'pending'", [sha256Hex(token), row.id]);
+    const url = `${env.FRONTEND_URL}/accept-invite?token=${encodeURIComponent(token)}`;
+    const id = await queueEmail({
+      template: "team.invitation_reminder",
+      to: row.email,
+      data: { inviterName: row.inviter_name || "Your team", companyName: row.company_name, roleLabel: ROLE_LABELS[row.role], url, expiresAt: row.expires_at },
+      dedupeKey: `team.invitation_reminder:${row.id}`,
     });
-    return result?.delivered !== false;
-  } catch (error) {
-    logger.error({ err: error, invitationId: invitation.public_id }, "team invitation could not be sent");
-    return false;
+    if (id) sent += 1;
   }
+  return sent;
 }
 
 async function inviteContext(organizationId, userId) {
@@ -327,6 +352,27 @@ async function createInvitedUser({ invitation, input, connection }) {
  * as the invited address, and carries on in their session on the company's account.
  */
 export async function acceptInvitation({ input, auth, ip, userAgent }) {
+  const outcome = await acceptInTransaction({ input, auth, ip, userAgent });
+  await tellInviter(outcome).catch((error) => logger.warn({ err: error }, "invitation accepted email not queued"));
+  return outcome;
+}
+
+/** The person who sent the invitation hears that it was accepted. */
+async function tellInviter({ userId, accountId }) {
+  const row = await queryOne(
+    `SELECT t.role, t.invited_by_user_id, o.name AS company_name, u.email, COALESCE(u.display_name, CONCAT_WS(' ', u.first_name, u.last_name)) AS name
+       FROM team_invitations t JOIN organizations o ON o.id = t.organization_id JOIN users u ON u.id = t.accepted_user_id
+      WHERE t.accepted_user_id = ? AND t.account_id = ? ORDER BY t.accepted_at DESC LIMIT 1`,
+    [userId, accountId]
+  );
+  if (!row?.invited_by_user_id || String(row.invited_by_user_id) === String(userId)) return;
+  const { emailUser } = await import("../email/send.js");
+  await emailUser(row.invited_by_user_id, "team.invitation_accepted", {
+    memberName: row.name || row.email, memberEmail: row.email, companyName: row.company_name, roleLabel: ROLE_LABELS[row.role],
+  }, { accountId });
+}
+
+async function acceptInTransaction({ input, auth, ip, userAgent }) {
   return withTransaction(async (connection) => {
     const invitation = await openInvitation(input.token, connection);
     if (invitation.company_status !== "active") {
