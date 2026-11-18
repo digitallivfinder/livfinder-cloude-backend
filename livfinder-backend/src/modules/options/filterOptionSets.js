@@ -9,6 +9,8 @@ import { MAPPING_TYPES } from "../feeds/valueMappings.js";
 import { rootIdFor } from "../admin/admin.shared.js";
 import { query } from "../../db/query.js";
 import { CATEGORY_DEFINITIONS } from "../../utils/categories.js";
+import { ORGANIZATION_KIND_OPTIONS } from "../accounts/organizationKinds.js";
+import { INTERNAL_USER_STATUS_OPTIONS } from "../admin/internalUserStatus.js";
 
 /**
  * The option sets behind every table header filter (see optionSets.js for where each kind of
@@ -110,6 +112,10 @@ registerOptionSets({
   "company.sellerType": enumSet("accounts", "seller_type", { exclude: ["individual"] }),
   "account.status": enumPlus("accounts", "status", [["rejected", "Rejected"]]),
   "user.status": enumSet("users", "status"),
+  // What the Admin Users form may set (internalUserSchema), not every value the column holds.
+  "internalUser.status": fixedSet(INTERNAL_USER_STATUS_OPTIONS),
+  // The Add Company form's business type: the organisation kinds signup accepts.
+  "organization.kind": fixedSet(ORGANIZATION_KIND_OPTIONS),
   "plan": tableSet("SELECT id AS value, name AS label FROM plans WHERE is_active = 1 ORDER BY sort_order ASC, id ASC"),
   "plan.billing": enumSet("plans", "billing_interval"),
   "plan.tier": tableSet("SELECT DISTINCT tier AS value, CONCAT('Tier ', tier) AS label FROM plans WHERE tier IS NOT NULL ORDER BY tier ASC"),

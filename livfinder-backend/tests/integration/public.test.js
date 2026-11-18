@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { client, query, queryOne, execute } from "../helpers/testApp.js";
 import { closePool } from "../../src/db/pool.js";
+import env from "../../src/config/env.js";
 
 /**
  * Public marketplace API, against the real database.
@@ -31,7 +32,8 @@ describe("health", () => {
   it("reports database readiness separately", async () => {
     const response = await api.get("/health/database");
     expect(response.status).toBe(200);
-    expect(response.body.data.database).toBe("livfinder");
+    // The configured database, not a fixed name: CI and a separate test database use others.
+    expect(response.body.data.database).toBe(env.DB_NAME);
   });
 
   it("returns a trace id on every response", async () => {

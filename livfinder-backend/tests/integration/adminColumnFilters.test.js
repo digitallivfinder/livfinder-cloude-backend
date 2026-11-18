@@ -31,28 +31,53 @@ const fold = (value) => String(value ?? "").normalize("NFD").replace(/[̀-ͯ]/g,
 const has = (needle) => (...values) => values.some((value) => fold(value).includes(fold(needle)));
 const day = (value) => (value ? new Date(value).toISOString().slice(0, 10) : "");
 
-/** Every row of a list, page by page. */
+/**
+ * Reading a whole list costs one request per 200 rows. The dev database can hold very large
+ * lists (a push test company brought ~16.5k draft listings), and reading all of them for every
+ * filter case took minutes, so a list is read in full only up to this many rows.
+ */
+const FULL_READ_LIMIT = 3000;
+/** Rows read from a list over the limit: enough to check that what comes back matches. */
+const SAMPLE_ROWS = 400;
+
+/**
+ * Every row of a list, page by page; a list over FULL_READ_LIMIT is only sampled (its first
+ * SAMPLE_ROWS). `complete` says whether every row was read.
+ */
 async function all(path, params = {}, pageSize = 200) {
   const items = [];
+  let total = 0;
   for (let page = 1; page < 100; page++) {
     const response = await admin.get(path, { ...params, page, pageSize });
     expect(response.status, `${path} ${JSON.stringify(params)} → ${JSON.stringify(response.body).slice(0, 300)}`).toBe(200);
     const rows = rowsOf(response.body);
+    total = totalOf(response.body);
     items.push(...rows);
-    if (!rows.length || items.length >= totalOf(response.body)) break;
+    if (!rows.length || items.length >= total) break;
+    if (total > FULL_READ_LIMIT && items.length >= SAMPLE_ROWS) break;
   }
+  items.complete = items.length >= total;
+  items.total = total;
   return items;
 }
 
-/** One filter case: the filtered list is exactly the predicate's subset of the full list. */
+/**
+ * One filter case: the filtered list is exactly the predicate's subset of the full list.
+ * When a list is too large to read whole, every row read must still match, and the filtered
+ * total can be no larger than the unfiltered one.
+ */
 async function expectFilter(path, base, filter, predicate, pageSize) {
   // One request at a time: parallel requests on one supertest agent reset each other.
   const everything = await all(path, base, pageSize);
   const filtered = await all(path, { ...base, ...filter }, pageSize);
-  const expected = everything.filter(predicate).map((row) => row.id).sort();
-  const got = filtered.map((row) => row.id).sort();
   const strays = filtered.filter((row) => !predicate(row)).map((row) => row.id);
   expect(strays, `${path} ${JSON.stringify(filter)}: rows that do not match`).toEqual([]);
+  if (!everything.complete || !filtered.complete) {
+    expect(filtered.total, `${path} ${JSON.stringify(filter)}: filtered total`).toBeLessThanOrEqual(everything.total);
+    return filtered.total;
+  }
+  const expected = everything.filter(predicate).map((row) => row.id).sort();
+  const got = filtered.map((row) => row.id).sort();
   expect(got, `${path} ${JSON.stringify(filter)}`).toEqual(expected);
   return got.length;
 }

@@ -19,6 +19,7 @@ import { issueToken, normalizeEmail } from "../auth/auth.service.js";
 import { splitPhone } from "../../utils/phone.js";
 import { isoDay } from "../../serializers/primitives.js";
 import { assertApplicationCategory } from "./sellerType.js";
+import { ORGANIZATION_KINDS } from "./organizationKinds.js";
 
 async function assertEmailAvailable(email, executor) {
   const existing = await queryValue(
@@ -100,6 +101,8 @@ async function assertPhoneAvailable(phone, executor) {
 
 /** A company registers once, however many email addresses apply for it. */
 export async function assertRegistrationAvailable(registrationNumber, ownAccountId = null) {
+  // Signup always has one; a company staff add may not (admin.accountCreation.js).
+  if (!registrationNumber) return;
   const existing = await queryValue(
     `SELECT l.id FROM organization_licenses l
        JOIN organizations o ON o.id = l.organization_id
@@ -157,7 +160,7 @@ export async function signupMember(input, { ip, userAgent } = {}) {
  * transaction: a half-completed signup that leaves a user with no account is
  * exactly the orphan this guards against.
  */
-export async function signupPersonal(input, { ip, userAgent } = {}) {
+export async function signupPersonal(input, { ip, userAgent, createdByAdmin = false } = {}) {
   const policyError = passwordPolicyError(input.password, {
     email: input.email,
   });
@@ -316,20 +319,26 @@ export async function signupPersonal(input, { ip, userAgent } = {}) {
       [userId],
       connection
     );
-    const session = await createSession(
-      {
-        userId,
-        sessionEpoch: user.session_epoch,
-        activeAccountId: accountId,
-        ip,
-        userAgent,
-      },
-      connection
-    );
+    // An account staff create (admin Add Individual / Add Company) opens no session: the owner
+    // signs in once they have chosen a password from the set-up email.
+    const session = createdByAdmin
+      ? null
+      : await createSession(
+          {
+            userId,
+            sessionEpoch: user.session_epoch,
+            activeAccountId: accountId,
+            ip,
+            userAgent,
+          },
+          connection
+        );
 
     return { userId, accountId, agentId, verificationId, session };
   });
 
+  // Staff-created: no "confirm your email" or "application received" — the set-up email follows.
+  if (createdByAdmin) return result;
   await sendVerificationEmail(result.userId, input.email, ip);
   const { emailApplicationSubmitted } = await import("../email/events.js");
   await emailApplicationSubmitted({ userId: result.userId, sellerType: "individual", applicantName: [input.firstName, input.lastName].filter(Boolean).join(" ") });
@@ -340,7 +349,7 @@ export async function signupPersonal(input, { ip, userAgent } = {}) {
  * Organization signup: user + account + owner membership + organization +
  * category access request + verification request, all or nothing.
  */
-export async function signupOrganization(input, { ip, userAgent } = {}) {
+export async function signupOrganization(input, { ip, userAgent, createdByAdmin = false } = {}) {
   const policyError = passwordPolicyError(input.password, {
     email: input.email,
   });
@@ -519,20 +528,26 @@ export async function signupOrganization(input, { ip, userAgent } = {}) {
       [userId],
       connection
     );
-    const session = await createSession(
-      {
-        userId,
-        sessionEpoch: user.session_epoch,
-        activeAccountId: accountId,
-        ip,
-        userAgent,
-      },
-      connection
-    );
+    // An account staff create (admin Add Individual / Add Company) opens no session: the owner
+    // signs in once they have chosen a password from the set-up email.
+    const session = createdByAdmin
+      ? null
+      : await createSession(
+          {
+            userId,
+            sessionEpoch: user.session_epoch,
+            activeAccountId: accountId,
+            ip,
+            userAgent,
+          },
+          connection
+        );
 
     return { userId, accountId, organizationId, verificationId, session };
   });
 
+  // Staff-created: no "confirm your email" or "application received" — the set-up email follows.
+  if (createdByAdmin) return result;
   await sendVerificationEmail(result.userId, input.email, ip);
   const { emailApplicationSubmitted } = await import("../email/events.js");
   await emailApplicationSubmitted({
@@ -544,18 +559,8 @@ export async function signupOrganization(input, { ip, userAgent } = {}) {
   return result;
 }
 
-export const ORGANIZATION_KINDS = [
-  "agency",
-  "brokerage",
-  "dealership",
-  "developer",
-  "yacht_broker",
-  "aviation_broker",
-  "watch_dealer",
-  "marketing_partner",
-  "service_partner",
-  "media_partner",
-];
+// One list, with labels, in organizationKinds.js (also the admin form's option set).
+export { ORGANIZATION_KINDS };
 
 export function organizationKindFor(organizationType, listingType) {
   const declared = String(organizationType || "")

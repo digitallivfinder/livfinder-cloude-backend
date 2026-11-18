@@ -105,7 +105,7 @@ export async function ensureTestPassword(password = "LivFinder!2026") {
 /** Removes rows created by a test run, newest first so foreign keys hold. */
 export async function cleanupListings(publicIds) {
   for (const publicId of publicIds) {
-    const listing = await queryOne("SELECT id, account_id, unit_id FROM listings WHERE public_id = ?", [publicId]);
+    const listing = await queryOne("SELECT id, account_id, unit_id, agent_id, organization_id FROM listings WHERE public_id = ?", [publicId]);
     if (!listing) continue;
     const ownerAccountId = listing.account_id;
     await execute("DELETE FROM listing_search WHERE listing_id = ?", [listing.id]);
@@ -127,6 +127,27 @@ export async function cleanupListings(publicIds) {
     await execute("DELETE FROM leads WHERE primary_listing_id = ?", [listing.id]);
     await execute("DELETE FROM favourites WHERE listing_id = ?", [listing.id]);
     await execute("DELETE FROM listings WHERE id = ?", [listing.id]);
+    // The agent's and company's listing counters still counted the deleted listing, so the next
+    // suite started from a stale number: listingMaintenance's "+1 on approval" read 6 where the
+    // real count was 4, and failed once the approval recounted (seen on CI, which runs in UTC).
+    if (listing.agent_id) {
+      await execute(
+        `UPDATE agents a SET a.updated_at = a.updated_at,
+                a.listing_count = (SELECT COUNT(*) FROM listings l WHERE l.agent_id = a.id AND l.deleted_at IS NULL),
+                a.active_listing_count = (SELECT COUNT(*) FROM listings l WHERE l.agent_id = a.id AND l.deleted_at IS NULL AND l.status = 'active')
+          WHERE a.id = ?`,
+        [listing.agent_id]
+      );
+    }
+    if (listing.organization_id) {
+      await execute(
+        `UPDATE organizations o SET o.updated_at = o.updated_at,
+                o.listing_count = (SELECT COUNT(*) FROM listings l WHERE l.organization_id = o.id AND l.deleted_at IS NULL),
+                o.active_listing_count = (SELECT COUNT(*) FROM listings l WHERE l.organization_id = o.id AND l.deleted_at IS NULL AND l.status = 'active')
+          WHERE o.id = ?`,
+        [listing.organization_id]
+      );
+    }
     // A hard delete bypasses the service, so the owner's allowance usage is recomputed here.
     // It used to be left counting the deleted listing, and because the suite shares the dev
     // database, repeated runs pushed the seeded portal owner to 500/500 "allowance used".

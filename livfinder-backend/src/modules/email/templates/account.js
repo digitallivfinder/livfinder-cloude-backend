@@ -52,6 +52,27 @@ export default {
     sample: { url: siteUrl("/reset-password?token=sample-token") },
   },
 
+  "auth.account_setup": {
+    category: "security",
+    priority: 1,
+    label: "Account set-up link (account created by LivFinder)",
+    render: (d) => ({
+      subject: d.companyName ? `Your LivFinder account for ${d.companyName} is ready` : "Your LivFinder account is ready",
+      preheader: `Choose a password to start. The link works for ${d.days} days.`,
+      heading: "Set up your LivFinder account",
+      blocks: [
+        {
+          type: "p",
+          text: d.companyName
+            ? `LivFinder${d.invitedBy ? ` (${d.invitedBy})` : ""} created an account for **${d.companyName}** with this email address.`
+            : `LivFinder${d.invitedBy ? ` (${d.invitedBy})` : ""} created an account for you with this email address.`,
+        },
+        { type: "button", label: "Choose your password", url: d.url, note: `The link works for ${d.days} days. If you were not expecting this, you can ignore it and nothing will happen.` },
+      ],
+    }),
+    sample: { url: siteUrl("/reset-password?token=sample-token&setup=1"), companyName: "Example Realty", invitedBy: "Sara Haddad", days: 7 },
+  },
+
   "auth.password_reset_support": {
     category: "security",
     priority: 1,

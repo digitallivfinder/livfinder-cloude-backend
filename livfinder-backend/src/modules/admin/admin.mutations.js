@@ -14,6 +14,8 @@ import { htmlToBlocks } from "../../serializers/editorial.js";
 import { callProcedure } from "../../db/query.js";
 import { optionalPhone, splitPhone } from "../../utils/phone.js";
 import { sanitizeDescription } from "../../utils/richText.js";
+import { getAssetByPublicId } from "../media/media.service.js";
+import { INTERNAL_USER_STATUSES } from "./internalUserStatus.js";
 import { issueToken } from "../auth/auth.service.js";
 import { hashPassword } from "../auth/passwords.js";
 import { revokeAllSessions } from "../auth/sessions.js";
@@ -177,7 +179,7 @@ export const verificationDecisionSchema = z
     }
   });
 
-export async function decideVerification({ subjectType, identifier, decision, note, reason, userId }) {
+export async function decideVerification({ subjectType, identifier, decision, note, reason, userId, silent = false }) {
   const table = subjectType === "organization" ? "organizations" : subjectType === "agent" ? "agents" : "accounts";
   const subject = await queryOne(`SELECT id, public_id, verification_status FROM ${table} WHERE public_id = ? LIMIT 1`, [identifier]);
   if (!subject) throw AppError.notFound("That record was not found.");
@@ -266,7 +268,8 @@ export async function decideVerification({ subjectType, identifier, decision, no
   if (decision === "approve" && subjectType !== "agent") {
     await applyApproval({ subjectType, subjectId: subject.id, requestId: request.id, payload, memberApplication, userId });
   }
-  await tellApplicant({ subjectType, subjectId: subject.id, decision, note, reason });
+  // `silent`: the approval that completes an account staff created; there was no application.
+  if (!silent) await tellApplicant({ subjectType, subjectId: subject.id, decision, note, reason });
   return { id: subject.public_id, decision, status };
 }
 
@@ -630,7 +633,7 @@ async function resolveAccountId({ accountId, organizationPublicId, userPublicId 
   return null;
 }
 
-export async function decideCategoryAccess({ accountId, organizationPublicId, userPublicId, categoryId, decision, note, listingQuota, userId }) {
+export async function decideCategoryAccess({ accountId, organizationPublicId, userPublicId, categoryId, decision, note, listingQuota, userId, silent = false }) {
   const resolvedAccountId = await resolveAccountId({ accountId, organizationPublicId, userPublicId });
   if (!resolvedAccountId) throw AppError.notFound("That account was not found.");
   accountId = resolvedAccountId;
@@ -659,7 +662,9 @@ export async function decideCategoryAccess({ accountId, organizationPublicId, us
     );
   }
   const withdrawn = decision === "revoke" ? await withdrawCategoryListings({ accountId, rootCategoryId: definition.rootId, userId }) : 0;
-  if (decision === "approve" || decision === "reject") {
+  // `silent`: part of creating the account (admin Add Company / Individual), where the set-up
+  // email is the only message the owner should get.
+  if (!silent && (decision === "approve" || decision === "reject")) {
     const { emailCategoryAccessDecision } = await import("../email/events.js");
     await emailCategoryAccessDecision({ accountId, categoryName: definition.label ?? definition.name ?? definition.frontendId, approved: decision === "approve", note, listingQuota });
   }
@@ -1503,7 +1508,7 @@ export const internalUserSchema = z.object({
   email: z.string().trim().toLowerCase().email().max(255),
   phone: optionalPhone,
   roleIds: z.array(z.coerce.number().int().positive()).max(10).optional(),
-  status: z.enum(["active", "suspended", "pending_verification"]).optional(),
+  status: z.enum(INTERNAL_USER_STATUSES).optional(),
 });
 
 export async function upsertInternalUser({ identifier, payload, userId }) {
@@ -1610,6 +1615,8 @@ export const organizationProfileSchema = z.object({
   seoTitle: z.string().trim().max(255).optional().nullable(),
   seoDescription: z.string().trim().max(500).optional().nullable(),
   isPubliclyVisible: z.boolean().optional(),
+  /** An uploaded image's public id (`POST /v1/media/upload`); null removes the logo. */
+  logoAssetId: z.string().trim().max(40).optional().nullable(),
 });
 
 const ORGANIZATION_COLUMNS = {
@@ -1648,6 +1655,18 @@ export async function updateOrganizationProfile({ identifier, payload }) {
     assignments.push(`${column} = ?`);
     const value = key === "description" ? sanitizeDescription(payload[key]) : payload[key];
     params.push(typeof value === "boolean" ? (value ? 1 : 0) : value);
+  }
+  // Staff may set any uploaded image as the logo (unlike the portal, which is limited to the
+  // account's own uploads): the logo is stored as the asset's URL, as the portal stores it.
+  if (payload.logoAssetId !== undefined) {
+    let logoUrl = null;
+    if (payload.logoAssetId) {
+      const asset = await getAssetByPublicId(payload.logoAssetId);
+      if (!asset) throw AppError.validation("Some information is invalid.", { logoAssetId: "That image was not found." });
+      logoUrl = asset.url;
+    }
+    assignments.push("logo_url = ?");
+    params.push(logoUrl);
   }
   if (!assignments.length) return { id: organization.public_id, updated: false };
 

@@ -349,6 +349,9 @@ describe("single push", () => {
     const whole = listing(id);
     const response = await as(writeKey).put(`/v1/partner/listings/${id}`, { ...whole, location: { country: "AE", city: "Dubai", community: "Dubai Marina" } });
     expect(response.status, JSON.stringify(response.body)).toBe(201);
+    // Registered for afterAll like every other listing this suite saves; it was left behind before.
+    const row = await queryOne("SELECT id FROM listings WHERE public_id = ?", [response.body.data.listingId]);
+    createdListingIds.add(row.id);
     expect(JSON.stringify(response.body.data.warnings)).toMatch(/No sub-community was given, so this listing is under Dubai Marina/);
   });
 

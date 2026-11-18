@@ -33,6 +33,9 @@ import * as teamInvitations from "../accounts/teamInvitation.service.js";
 import { adminPermissionUniverse } from "../auth/adminPermissions.js";
 import { toAdminPermissions } from "../auth/adminPermissions.js";
 import { allPermissionCodes } from "../auth/rbac.js";
+import { sendAccountSetupEmail } from "../auth/auth.service.js";
+import { adminCompanyCreateSchema, adminIndividualCreateSchema, createCompanyByAdmin, createIndividualByAdmin } from "./admin.accountCreation.js";
+import { archiveAdminContact, contactWriteSchema, createAdminContact, updateAdminContact } from "./admin.contacts.js";
 
 const router = Router();
 
@@ -103,7 +106,7 @@ const params = (req) => q(req) || {};
 router.get(
   "/dashboard",
   requirePermission("analytics.view", "listings.view", "users.view"),
-  asyncHandler(async (req, res) => res.json(detailResponse(await dashboard.adminDashboard())))
+  asyncHandler(async (req, res) => res.json(detailResponse(await dashboard.adminDashboard({ period: String(req.query.period ?? "30") }))))
 );
 
 router.get(
@@ -377,6 +380,34 @@ router.get(
   requirePermission("companies.view"),
   validate({ query: listQuery }),
   asyncHandler(async (req, res) => res.json(await catalog.listAdminCompanies({ ...params(req), packageId: params(req).package })))
+);
+
+/**
+ * Admin "Add Company" / "Add Individual": a real account, approved, with a set-up email to the
+ * owner (admin.accountCreation.js). The drawers used to add a row in the browser only.
+ */
+router.post(
+  "/companies",
+  writeLimiter,
+  requirePermission("companies.create"),
+  validate({ body: adminCompanyCreateSchema }),
+  asyncHandler(async (req, res) => {
+    const result = await createCompanyByAdmin({ payload: req.body, userId: req.auth.user.id, ip: req.ip });
+    await auditFromRequest(req, { action: "company.created", subjectType: "organization", subjectLabel: result.id, changes: { name: req.body.name, email: req.body.email } });
+    return res.status(201).json(detailResponse(result));
+  })
+);
+
+router.post(
+  "/individuals",
+  writeLimiter,
+  requirePermission("individuals.create"),
+  validate({ body: adminIndividualCreateSchema }),
+  asyncHandler(async (req, res) => {
+    const result = await createIndividualByAdmin({ payload: req.body, userId: req.auth.user.id, ip: req.ip });
+    await auditFromRequest(req, { action: "individual.created", subjectType: "user", subjectLabel: result.id, changes: { email: req.body.email } });
+    return res.status(201).json(detailResponse(result));
+  })
 );
 
 router.get(
@@ -1229,6 +1260,42 @@ router.get(
   asyncHandler(async (req, res) => res.json(await crm.listAdminContacts(params(req))))
 );
 
+/** Add / Edit Contact (admin.contacts.js); the list was read-only, so both drawers could not save. */
+router.post(
+  "/contacts",
+  writeLimiter,
+  requirePermission("leads.create"),
+  validate({ body: contactWriteSchema }),
+  asyncHandler(async (req, res) => {
+    const result = await createAdminContact({ payload: req.body, userId: req.auth.user.id });
+    await auditFromRequest(req, { action: "contact.created", subjectType: "contact", subjectLabel: result.id, changes: req.body });
+    return res.status(201).json(detailResponse(result));
+  })
+);
+
+router.patch(
+  "/contacts/:id",
+  writeLimiter,
+  requirePermission("leads.edit"),
+  validate({ body: contactWriteSchema.partial().omit({ companyId: true }) }),
+  asyncHandler(async (req, res) => {
+    const result = await updateAdminContact({ identifier: req.params.id, payload: req.body });
+    await auditFromRequest(req, { action: "contact.updated", subjectType: "contact", subjectLabel: req.params.id, changes: req.body });
+    return res.json(detailResponse(result));
+  })
+);
+
+router.delete(
+  "/contacts/:id",
+  writeLimiter,
+  requirePermission("leads.delete"),
+  asyncHandler(async (req, res) => {
+    const result = await archiveAdminContact({ identifier: req.params.id });
+    await auditFromRequest(req, { action: "contact.archived", subjectType: "contact", subjectLabel: req.params.id });
+    return res.json(detailResponse(result));
+  })
+);
+
 router.get(
   "/contacts/:id",
   requirePermission("inquiries.view"),
@@ -1675,6 +1742,10 @@ router.post(
   asyncHandler(async (req, res) => {
     const result = await mutations.upsertInternalUser({ identifier: null, payload: req.body, userId: req.auth.user.id });
     await auditFromRequest(req, { action: "internal_user.created", subjectType: "user", subjectLabel: req.body.email });
+    // The new staff user has a password nobody knows; this email lets them choose one. Without it
+    // they could not sign in until someone sent a password reset.
+    const inviter = await queryOne("SELECT display_name FROM users WHERE id = ?", [req.auth.user.id]);
+    await sendAccountSetupEmail({ userId: Number(result.userId), invitedBy: inviter?.display_name ?? null, ip: req.ip });
     return res.status(201).json(detailResponse(result));
   })
 );

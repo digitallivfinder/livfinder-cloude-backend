@@ -319,9 +319,13 @@ describe("verification decisions", () => {
   });
 
   it("grants Real Estate Developments as its own seventh category", async () => {
+    // Since 0079 only a Developer may hold category 7 (accounts/sellerType.js).
     const org = await queryOne(
-      "SELECT o.id, o.public_id, o.account_id FROM organizations o WHERE o.deleted_at IS NULL LIMIT 1"
+      `SELECT o.id, o.public_id, o.account_id FROM organizations o
+         JOIN accounts a ON a.id = o.account_id
+        WHERE o.deleted_at IS NULL AND a.seller_type = 'developer' LIMIT 1`
     );
+    expect(org).toBeTruthy();
     const before = await queryOne(
       "SELECT status FROM account_category_access WHERE account_id = ? AND category_id = 7",
       [org.account_id]
@@ -349,6 +353,32 @@ describe("verification decisions", () => {
     } else {
       await execute("DELETE FROM account_category_access WHERE account_id = ? AND category_id = 7", [org.account_id]);
     }
+  });
+
+  it("refuses Real Estate Developments to a company that is not a Developer", async () => {
+    const org = await queryOne(
+      `SELECT o.public_id, o.account_id FROM organizations o
+         JOIN accounts a ON a.id = o.account_id
+        WHERE o.deleted_at IS NULL AND a.seller_type = 'company' LIMIT 1`
+    );
+    expect(org).toBeTruthy();
+    const before = await queryOne(
+      "SELECT status, updated_at FROM account_category_access WHERE account_id = ? AND category_id = 7",
+      [org.account_id]
+    );
+
+    const response = await superAdmin.send("patch", `/v1/admin/companies/${org.public_id}/category-access`, {
+      categoryId: "real-estate-developments",
+      decision: "approve",
+    });
+    expect(response.status).toBe(403);
+    expect(response.body.error.code).toBe("SELLER_TYPE_NOT_ALLOWED");
+
+    const after = await queryOne(
+      "SELECT status, updated_at FROM account_category_access WHERE account_id = ? AND category_id = 7",
+      [org.account_id]
+    );
+    expect(after).toEqual(before);
   });
 
   it("grants a category to an individual, independent of their account type", async () => {

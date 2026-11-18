@@ -8,11 +8,25 @@ import { CATEGORY_DEFINITIONS } from "../../utils/categories.js";
  * lists — the audit finding this schema was built to answer. Nothing is
  * hardcoded and nothing is approximated.
  */
-export async function adminDashboard() {
+/**
+ * The dashboard's reporting period, as the header's selector names it. "month" is this calendar
+ * month so far. The selector used to change nothing: every figure was fixed at 30 days.
+ */
+export const DASHBOARD_PERIODS = Object.freeze(["7", "30", "90", "month"]);
+
+export function dashboardDays(period) {
+  if (period === "month") return Math.max(1, new Date().getUTCDate());
+  const days = Number(period);
+  return DASHBOARD_PERIODS.includes(String(period)) ? days : 30;
+}
+
+export async function adminDashboard({ period = "30" } = {}) {
+  const safePeriod = DASHBOARD_PERIODS.includes(String(period)) ? String(period) : "30";
+  const days = dashboardDays(safePeriod);
   const [kpis, statusCounts, trend, inventory, categories, activity, inquiries] = await Promise.all([
-    dashboardKpis(),
+    dashboardKpis(days),
     listingStatusOverview(),
-    listingTrendSeries(),
+    listingTrendSeries(days),
     recentInventory(),
     categoryBreakdown(),
     recentActivity(),
@@ -20,6 +34,8 @@ export async function adminDashboard() {
   ]);
 
   return {
+    period: safePeriod,
+    periodDays: days,
     kpis,
     // The Listings Overview chart plots a daily series, so this is an array of
     // { label, newListings, sold }. The status tallies keep their own key rather
@@ -110,15 +126,16 @@ async function inquiryBreakdown() {
   ];
 }
 
-async function dashboardKpis() {
+async function dashboardKpis(days = 30) {
   const [listings, organizations, agents, leads, users, revenue] = await Promise.all([
     queryOne(
       `SELECT COUNT(*) AS total,
               SUM(status = 'active') AS active,
               SUM(status = 'pending_review') AS pending,
-              SUM(created_at >= DATE_SUB(NOW(3), INTERVAL 30 DAY)) AS recent,
-              SUM(created_at >= DATE_SUB(NOW(3), INTERVAL 60 DAY) AND created_at < DATE_SUB(NOW(3), INTERVAL 30 DAY)) AS previous
-         FROM listings WHERE deleted_at IS NULL`
+              SUM(created_at >= DATE_SUB(NOW(3), INTERVAL ? DAY)) AS recent,
+              SUM(created_at >= DATE_SUB(NOW(3), INTERVAL ? DAY) AND created_at < DATE_SUB(NOW(3), INTERVAL ? DAY)) AS previous
+         FROM listings WHERE deleted_at IS NULL`,
+      [days, days * 2, days]
     ),
     queryOne(
       `SELECT COUNT(*) AS total,
@@ -129,14 +146,16 @@ async function dashboardKpis() {
     queryOne("SELECT COUNT(*) AS total FROM agents WHERE deleted_at IS NULL"),
     queryOne(
       `SELECT COUNT(*) AS total,
-              SUM(created_at >= DATE_SUB(NOW(3), INTERVAL 30 DAY)) AS recent,
-              SUM(created_at >= DATE_SUB(NOW(3), INTERVAL 60 DAY) AND created_at < DATE_SUB(NOW(3), INTERVAL 30 DAY)) AS previous
-         FROM leads WHERE deleted_at IS NULL`
+              SUM(created_at >= DATE_SUB(NOW(3), INTERVAL ? DAY)) AS recent,
+              SUM(created_at >= DATE_SUB(NOW(3), INTERVAL ? DAY) AND created_at < DATE_SUB(NOW(3), INTERVAL ? DAY)) AS previous
+         FROM leads WHERE deleted_at IS NULL`,
+      [days, days * 2, days]
     ),
     queryOne("SELECT COUNT(*) AS total FROM users WHERE deleted_at IS NULL"),
     queryOne(
       `SELECT COALESCE(SUM(amount_base), 0) AS total
-         FROM payments WHERE status = 'succeeded' AND paid_at >= DATE_SUB(NOW(3), INTERVAL 30 DAY)`
+         FROM payments WHERE status = 'succeeded' AND paid_at >= DATE_SUB(NOW(3), INTERVAL ? DAY)`,
+      [days]
     ),
   ]);
 
@@ -179,12 +198,12 @@ async function dashboardKpis() {
       value: int(leads?.total) ?? 0,
       trend: trend(leads?.recent, leads?.previous),
       tone: "default",
-      detail: `${int(leads?.recent) ?? 0} in the last 30 days`,
+      detail: `${int(leads?.recent) ?? 0} in the last ${days} day${days === 1 ? "" : "s"}`,
     },
     { id: "users", label: "Users", value: int(users?.total) ?? 0, trend: null, tone: "default", detail: null },
     {
       id: "revenue",
-      label: "Revenue (30d)",
+      label: `Revenue (${days}d)`,
       value: Math.round(num(revenue?.total) ?? 0),
       trend: null,
       tone: "positive",

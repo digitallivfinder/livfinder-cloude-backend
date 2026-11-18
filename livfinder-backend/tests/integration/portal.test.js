@@ -437,10 +437,11 @@ describe("buyer actions", () => {
 
   it("records an inquiry against the listing's owner and bumps the counter", async () => {
     const listing = await queryOne("SELECT id, public_id, account_id, inquiry_count FROM v_public_listings LIMIT 1");
+    const buyerEmail = `buyer-${Date.now()}@example.test`;
     const response = await client().send("post", "/v1/inquiries", {
       listingId: listing.public_id,
       name: "Integration Buyer",
-      email: `buyer-${Date.now()}@example.test`,
+      email: buyerEmail,
       message: "Is this still available for a viewing this weekend?",
     });
     expect(response.status).toBe(201);
@@ -453,6 +454,9 @@ describe("buyer actions", () => {
     expect(after.inquiry_count).toBe(listing.inquiry_count + 1);
 
     await execute("DELETE FROM inquiries WHERE public_id = ?", [response.body.data.id]);
+    // The enquiry also opened a CRM lead and contact (linkInquiryToLead); the dev DB is shared.
+    await execute("DELETE FROM leads WHERE email = ?", [buyerEmail]);
+    await execute("DELETE FROM crm_contacts WHERE primary_email = ?", [buyerEmail]);
     await execute("UPDATE listings SET inquiry_count = ? WHERE id = ?", [listing.inquiry_count, listing.id]);
   });
 

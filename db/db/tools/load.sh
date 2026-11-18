@@ -173,8 +173,15 @@ is_post_seed_migration() {
     # 0053 redefines the counter rollup and recomputes counters from the seeded rows.
     0053_entity_counters_slot_rule.sql)
       return 0 ;;
+    # 0054 inserts the devBoard permissions with the `action` column that 0032 (post-seed) adds;
+    # 0055 and 0056 alter the dev board tables 0054 creates, so they follow it.
+    0054_dev_board.sql|0055_dev_board_images.sql|0056_dev_board_settings.sql)
+      return 0 ;;
     # 0058 adds a provider row after the seeded providers, so their ids do not move.
     0058_listing_import_api.sql)
+      return 0 ;;
+    # 0063 places feed_imports.feed_source_id after api_client_id, which 0058 (post-seed) adds.
+    0063_feed_sources.sql)
       return 0 ;;
     # 0059 recomputes listing usage from the seeded listings and backfills the seeded plans.
     0059_listing_limits_and_addons.sql)

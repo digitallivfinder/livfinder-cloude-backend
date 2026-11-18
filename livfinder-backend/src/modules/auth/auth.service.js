@@ -11,9 +11,14 @@ import { requiresMfaAtLogin, verifyMfaCode } from "./mfa.service.js";
 import { recordAudit } from "../system/audit.service.js";
 import { queueEmail } from "../email/send.js";
 
+/** How long the account set-up link lasts: someone LivFinder added may not open it the same day. */
+export const ACCOUNT_SETUP_DAYS = 7;
+
 const TOKEN_TTL = {
   password_reset: 60 * 60 * 1000,
   email_verification: 24 * 60 * 60 * 1000,
+  // `invitation`: the set-up link for an account staff created (Add Company / Individual / user).
+  invitation: ACCOUNT_SETUP_DAYS * 24 * 60 * 60 * 1000,
 };
 
 function normalizeEmail(email) {
@@ -217,12 +222,36 @@ export async function requestPasswordReset({ email, ip }) {
   return { sent: true };
 }
 
+/**
+ * The email for an account LivFinder staff created: a link to choose a password, valid for
+ * ACCOUNT_SETUP_DAYS. Opening it and setting a password also confirms the address, since only
+ * its owner can read the email. Issuing a new one cancels the previous link.
+ */
+export async function sendAccountSetupEmail({ userId, companyName = null, invitedBy = null, ip = null }) {
+  const user = await queryOne("SELECT id, email, display_name FROM users WHERE id = ? AND deleted_at IS NULL", [userId]);
+  if (!user) return { sent: false };
+  const token = await issueToken({ userId: user.id, purpose: "invitation", target: user.email, ip });
+  const url = `${env.FRONTEND_URL}/reset-password?token=${encodeURIComponent(token)}&setup=1`;
+  await queueEmail({
+    template: "auth.account_setup",
+    to: user.email,
+    toName: user.display_name,
+    userId: user.id,
+    data: { url, name: user.display_name, companyName, invitedBy, days: ACCOUNT_SETUP_DAYS },
+  });
+  await recordAudit({ action: "auth.account_setup_sent", subjectType: "user", subjectId: user.id, userId: user.id, ip });
+  return { sent: true };
+}
+
 export async function resetPassword({ token, password, ip }) {
   const policyError = passwordPolicyError(password);
   if (policyError) throw AppError.validation("Some information is invalid.", { password: policyError });
 
   return withTransaction(async (connection) => {
-    const row = await consumeToken({ token, purpose: "password_reset" }, connection);
+    // A reset link, or the set-up link of an account staff created (sendAccountSetupEmail).
+    let row = await consumeToken({ token, purpose: "password_reset" }, connection);
+    const setup = !row;
+    if (setup) row = await consumeToken({ token, purpose: "invitation" }, connection);
     if (!row) throw AppError.badRequest("That reset link is no longer valid. Request a new one.");
 
     const hash = await hashPassword(password);
@@ -231,16 +260,27 @@ export async function resetPassword({ token, password, ip }) {
       [hash, row.user_id],
       connection
     );
+    if (setup) {
+      // The link reached this inbox, so the address is confirmed and the account can sign in.
+      await execute(
+        `UPDATE users SET email_verified_at = COALESCE(email_verified_at, NOW(3)),
+                          status = IF(status = 'pending_verification', 'active', status)
+          WHERE id = ?`,
+        [row.user_id],
+        connection
+      );
+    }
     // A password change ends every existing session.
     await revokeAllSessions(row.user_id, connection);
     await recordAudit(
-      { action: "auth.password_reset", subjectType: "user", subjectId: row.user_id, userId: row.user_id, ip },
+      { action: setup ? "auth.account_setup_completed" : "auth.password_reset", subjectType: "user", subjectId: row.user_id, userId: row.user_id, ip },
       connection
     );
-    return { userId: row.user_id };
+    return { userId: row.user_id, setup };
   }).then(async (result) => {
-    await notifyPasswordChanged(result.userId, "reset");
-    return result;
+    // Choosing a first password is not a change worth a security notice.
+    if (!result.setup) await notifyPasswordChanged(result.userId, "reset");
+    return { userId: result.userId };
   });
 }
 
