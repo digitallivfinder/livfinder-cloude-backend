@@ -109,6 +109,12 @@ describe("Member signup", () => {
     for (const path of ["/v1/portal/listings", "/v1/portal/leads", "/v1/portal/bookings", "/v1/portal/inquiries", "/v1/portal/billing", "/v1/portal/payouts", "/v1/portal/integrations"]) {
       expect((await person.send("get", path)).status, path).toBe(403);
     }
+    // Become a seller reads the account and business types from the portal option lists.
+    const options = await person.send("get", "/v1/portal/options?sets=account.sellerType,organization.businessType");
+    expect(options.status).toBe(200);
+    expect(options.body.data["account.sellerType"].map((o) => o.value)).toEqual(expect.arrayContaining(["individual", "company", "developer"]));
+    expect(options.body.data["organization.businessType"].map((o) => o.value)).toContain("agency");
+    expect(options.body.data["organization.businessType"].map((o) => o.value)).not.toContain("developer");
   });
 
   it("refuses a used email and a weak password", async () => {

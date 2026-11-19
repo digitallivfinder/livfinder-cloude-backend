@@ -58,9 +58,10 @@ registerOptionSets(
     "categoryAccess.status": enumSet("account_category_access", "status"),
     // What a seller account is: Individual, Company or Developer (accounts.seller_type, 0079).
     "account.sellerType": enumSet("accounts", "seller_type"),
-    // The business types a Company may choose (organizations.kind). A developer is its own seller
-    // type, so it is not offered here.
-    "organization.kind": enumSet("organizations", "kind", { exclude: ["developer"], labels: { agency: "Real estate agency", dealership: "Car dealership" } }),
+    // The business types a Company may choose on Become a seller: the kinds signup accepts, minus
+    // developer (its own seller type). Not "organization.kind": that name is the admin set below,
+    // and a later registration under the same name would replace this one and hide it from the portal.
+    "organization.businessType": fixedSet(ORGANIZATION_KIND_OPTIONS.filter(([value]) => value !== "developer")),
     // The client lead funnel; "viewing" is called what the category calls it ("lead.funnelStep:cars" → Test drive).
     "lead.funnelStep": async (category) => {
       const rootId = category ? rootIdFor(category) : null;

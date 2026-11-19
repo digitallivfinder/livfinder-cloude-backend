@@ -220,7 +220,8 @@ export function requireAccount(req, res, next) {
   return next();
 }
 
-const MEMBER_PORTAL_PATHS = ["/calendar", "/dashboard", "/favourites", "/messages", "/my-enquiries", "/my-viewings", "/profile", "/saved-searches", "/settings"];
+// `/options` serves label lists only; Become a seller reads the account and business types from it.
+const MEMBER_PORTAL_PATHS = ["/calendar", "/dashboard", "/favourites", "/messages", "/my-enquiries", "/my-viewings", "/options", "/profile", "/saved-searches", "/settings"];
 
 /** A Member is not a seller: everything else under `/v1/portal` is seller tooling. */
 export function requireSellerTools(req, res, next) {
