@@ -45,7 +45,7 @@ describe("admin reads", () => {
       "/v1/admin/locations/hierarchy-options", "/v1/admin/settings/general",
       "/v1/admin/settings/general/options", "/v1/admin/settings/payment",
       "/v1/admin/settings/payment/options", "/v1/admin/permission-catalog", "/v1/admin/me/permissions",
-      "/v1/admin/business-activity",
+      "/v1/admin/business-activity", "/v1/admin/seo-analytics",
     ];
     for (const path of paths) {
       const response = await superAdmin.get(path);
@@ -120,6 +120,18 @@ describe("permission gating", () => {
       decision: "approve",
     });
     expect(response.status).toBe(403);
+  });
+
+  it("measures SEO & Analytics over the requested window and rejects any other", async () => {
+    const response = await superAdmin.get("/v1/admin/seo-analytics?period=7d");
+    expect(response.status).toBe(200);
+    const data = response.body.data;
+    expect(data.period).toBe("7d");
+    expect(data.trend).toHaveLength(7);
+    expect(data.kpis.indexedPages).toBe(data.sitemap.sections.reduce((sum, section) => sum + section.urls, 0));
+    expect(data.health.liveListings).toBe(Number((await queryOne("SELECT COUNT(*) AS n FROM listing_search")).n));
+    expect(data.health.checks.length).toBeGreaterThan(0);
+    expect((await superAdmin.get("/v1/admin/seo-analytics?period=365d")).status).toBe(422);
   });
 
   it("refuses an unauthenticated caller before it refuses an unauthorised one", async () => {

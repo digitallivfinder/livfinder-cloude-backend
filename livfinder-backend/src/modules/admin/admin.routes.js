@@ -12,6 +12,7 @@ import { revisionForReview } from "../listings/listingRevisions.service.js";
 import { projectRevisionForReview } from "../projects/projectRevisions.service.js";
 import { auditFromRequest } from "../system/audit.service.js";
 import * as dashboard from "./admin.dashboard.js";
+import { SEO_PERIODS, seoAnalytics } from "./admin.seo.js";
 import * as catalog from "./admin.catalog.js";
 import * as crm from "./admin.crm.js";
 import * as content from "./admin.content.js";
@@ -107,6 +108,14 @@ router.get(
   "/dashboard",
   requirePermission("analytics.view", "listings.view", "users.view"),
   asyncHandler(async (req, res) => res.json(detailResponse(await dashboard.adminDashboard({ period: String(req.query.period ?? "30") }))))
+);
+
+// SEO & Analytics: live traffic, sitemap coverage and SEO checks on public listings (admin.seo.js).
+router.get(
+  "/seo-analytics",
+  requirePermission("analytics.view"),
+  validate({ query: z.object({ period: z.enum(Object.keys(SEO_PERIODS)).optional() }) }),
+  asyncHandler(async (req, res) => res.json(detailResponse(await seoAnalytics({ period: req.query.period }))))
 );
 
 router.get(
