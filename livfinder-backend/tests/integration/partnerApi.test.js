@@ -45,6 +45,7 @@ const basic = (key) => `Basic ${Buffer.from(`${key.clientId}:${key.secret}`).toS
 const as = (key) => ({
   get: (path) => request(app).get(path).set("Authorization", basic(key)),
   put: (path, body) => request(app).put(path).set("Authorization", basic(key)).send(body),
+  patch: (path, body) => request(app).patch(path).set("Authorization", basic(key)).send(body),
   post: (path, body) => request(app).post(path).set("Authorization", basic(key)).send(body),
   delete: (path) => request(app).delete(path).set("Authorization", basic(key)),
 });
@@ -239,6 +240,13 @@ describe("authentication and authorization", () => {
     expect(response.status).toBe(200);
     expect(response.body.data.company.id).toBe(company.public_id);
     expect(response.body.data.apiKey.clientId).toBe(writeKey.clientId);
+  });
+
+  it("answers who a key is whatever its scopes", async () => {
+    const leadsOnly = await makeKey(company.organization_id, ["leads:read"]);
+    const response = await as(leadsOnly).get("/v1/partner/me");
+    expect(response.status).toBe(200);
+    expect(response.body.data.apiKey.scopes).toEqual(["leads:read"]);
   });
 
   it("logs every partner request against its key", async () => {
@@ -525,6 +533,53 @@ describe("single push", () => {
     expect(foreignImport.status).toBe(404);
   });
 
+  it("changes only the fields a PATCH sends, keeping the rest of the last push", async () => {
+    const response = await as(writeKey).patch(`/v1/partner/listings/${id}`, { price: 2750000 });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body.data.operation).toBe("update");
+    expect(response.body.data.listingId).toBe(listingPublicId);
+    const stored = await queryOne(
+      `SELECT JSON_EXTRACT(er.last_payload, '$.price') AS price, JSON_UNQUOTE(JSON_EXTRACT(er.last_payload, '$.title')) AS title
+         FROM external_references er WHERE er.external_id = ? AND er.entity_type = 'listing'`,
+      [id]
+    );
+    expect(Number(stored.price)).toBe(2750000);
+    expect(stored.title).toBe(`QA import ${id}`);
+  });
+
+  it("answers unchanged when a PATCH changes nothing", async () => {
+    const response = await as(writeKey).patch(`/v1/partner/listings/${id}`, { price: 2750000 });
+    expect(response.status).toBe(200);
+    expect(response.body.data.operation).toBe("unchanged");
+  });
+
+  it("refuses a PATCH that would leave the listing incomplete", async () => {
+    const response = await as(writeKey).patch(`/v1/partner/listings/${id}`, { description: null });
+    expect(response.status).toBe(422);
+    expect(response.body.error.fields.description).toBeTruthy();
+  });
+
+  it("refuses a PATCH that changes the category, or names an unknown listing, or sends nothing", async () => {
+    const category = await as(writeKey).patch(`/v1/partner/listings/${id}`, { category: "cars" });
+    expect(category.status).toBe(422);
+    expect(category.body.error.fields.category).toBeTruthy();
+    const unknown = await as(writeKey).patch(`/v1/partner/listings/${ext("never-pushed")}`, { price: 1 });
+    expect(unknown.status).toBe(404);
+    const empty = await as(writeKey).patch(`/v1/partner/listings/${id}`, {});
+    expect(empty.status).toBe(400);
+  });
+
+  it("asks for one full push before a PATCH when no complete copy is stored", async () => {
+    await execute("UPDATE external_references SET last_payload = NULL WHERE external_id = ? AND entity_type = 'listing'", [id]);
+    const refused = await as(writeKey).patch(`/v1/partner/listings/${id}`, { price: 2800000 });
+    expect(refused.status).toBe(409);
+    expect(refused.body.error.code).toBe("FULL_PUSH_REQUIRED");
+    // Pushing it in full again, even unchanged, stores the copy.
+    await as(writeKey).put(`/v1/partner/listings/${id}`, listing(id, { price: 2750000 }));
+    const stored = await queryOne("SELECT last_payload FROM external_references WHERE external_id = ? AND entity_type = 'listing'", [id]);
+    expect(stored.last_payload).toBeTruthy();
+  });
+
   it("withdraws the listing and records where every change came from", async () => {
     const response = await as(writeKey).delete(`/v1/partner/listings/${id}`);
     expect(response.status).toBe(200);
@@ -568,6 +623,44 @@ describe("bulk push", () => {
       createdListingIds.add(row.id);
     }
     expect(items.body.data).toHaveLength(2);
+  });
+
+  it("withdraws listings in a batch alongside new ones, and reports each", async () => {
+    const keep = ext("bulk-keep");
+    const gone = ext("bulk-gone");
+    const first = await as(writeKey).put(`/v1/partner/listings/${gone}`, listing(gone));
+    expect(first.status, JSON.stringify(first.body)).toBe(201);
+    createdListingIds.add((await queryOne("SELECT id FROM listings WHERE public_id = ?", [first.body.data.listingId])).id);
+
+    const response = await as(writeKey).post("/v1/partner/imports", {
+      listings: [{ externalId: keep, ...listing(keep) }],
+      withdrawals: [gone, "has space", keep],
+    });
+    expect(response.status).toBe(202);
+    expect(response.body.data.accepted).toBe(2);
+    expect(response.body.data.rejected.map((item) => item.row)).toEqual([3, 4]);
+    expect(response.body.data.rejected[1].error.code).toBe("DUPLICATE_IN_BATCH");
+
+    const done = await waitForImport(writeKey, response.body.data.id);
+    expect(done.counts).toMatchObject({ total: 4, created: 1, withdrawn: 1, failed: 2 });
+    const listingNow = await as(writeKey).get(`/v1/partner/listings/${gone}`);
+    expect(listingNow.body.data.status).toMatch(/withdrawn|archived/);
+    const kept = await as(writeKey).get(`/v1/partner/listings/${keep}`);
+    createdListingIds.add((await queryOne("SELECT id FROM listings WHERE public_id = ?", [kept.body.data.listingId])).id);
+  });
+
+  it("refuses an empty batch, and more than 100 changes together", async () => {
+    expect((await as(writeKey).post("/v1/partner/imports", {})).status).toBe(422);
+    const tooMany = await as(writeKey).post("/v1/partner/imports", {
+      listings: Array.from({ length: 60 }, () => ({})),
+      withdrawals: Array.from({ length: 41 }, (_, index) => `x-${index}`),
+    });
+    expect(tooMany.status).toBe(422);
+  });
+
+  it("refuses a key the batch does not know, as the documentation says", async () => {
+    const response = await as(writeKey).post("/v1/partner/imports", { withdrawals: ["x-1"], withdrawal: ["x-2"] });
+    expect(response.status).toBe(422);
   });
 
   it("refuses more than 100 listings in one request", async () => {

@@ -4,7 +4,7 @@ import request from "supertest";
 import { ipAllowed, normalizeIp, requireApiClient, scopesGrant } from "../../src/middleware/apiClient.js";
 import { errorHandler } from "../../src/middleware/errors.js";
 import { normalizeAllowedIps } from "../../src/modules/portal/organization.service.js";
-import { parseListingRecord, payloadHash } from "../../src/modules/imports/listingImport.service.js";
+import { mergeListingPatch, parseListingRecord, payloadHash } from "../../src/modules/imports/listingImport.service.js";
 import { AppError } from "../../src/utils/errors.js";
 
 const validRecord = {
@@ -110,5 +110,52 @@ describe("listing records", () => {
     expect(payloadHash(validRecord)).toBe(payloadHash(reordered));
     expect(payloadHash(validRecord)).not.toBe(payloadHash({ ...validRecord, price: 1 }));
     expect(payloadHash(validRecord)).toHaveLength(32);
+  });
+});
+
+describe("mergeListingPatch", () => {
+  const base = {
+    ...validRecord,
+    status: "pending_review",
+    features: ["Pool", "Gym"],
+    detail: { bedrooms: 5, bathrooms: 6, parking: 2 },
+  };
+
+  it("changes only the fields sent and keeps the rest", () => {
+    const merged = mergeListingPatch(base, { price: 31000000 }, "PF-10293");
+    expect(merged).toEqual({ ...base, price: 31000000 });
+  });
+
+  it("merges detail key by key, a null removing a key", () => {
+    const merged = mergeListingPatch(base, { detail: { bathrooms: 7, parking: null } }, "PF-10293");
+    expect(merged.detail).toEqual({ bedrooms: 5, bathrooms: 7 });
+  });
+
+  it("replaces location, images and features whole", () => {
+    const merged = mergeListingPatch(
+      base,
+      { location: { id: "123" }, images: ["https://cdn.example.com/9.jpg"], features: ["Sea view"] },
+      "PF-10293"
+    );
+    expect(merged.location).toEqual({ id: "123" });
+    expect(merged.images).toEqual(["https://cdn.example.com/9.jpg"]);
+    expect(merged.features).toEqual(["Sea view"]);
+  });
+
+  it("clears a top-level field sent as null", () => {
+    const merged = mergeListingPatch({ ...base, subtitle: "Old" }, { subtitle: null }, "PF-10293");
+    expect("subtitle" in merged).toBe(false);
+  });
+
+  it("always takes externalId from the URL, and does not change the base", () => {
+    const copy = structuredClone(base);
+    const merged = mergeListingPatch(base, { externalId: "OTHER", detail: { bedrooms: 4 } }, "PF-10293");
+    expect(merged.externalId).toBe("PF-10293");
+    expect(base).toEqual(copy);
+  });
+
+  it("gives the same hash as the equivalent full push, so a no-op patch is unchanged", () => {
+    const merged = parseListingRecord(mergeListingPatch(parseListingRecord(base), { price: base.price }, "PF-10293"));
+    expect(payloadHash(merged)).toBe(payloadHash(parseListingRecord(base)));
   });
 });

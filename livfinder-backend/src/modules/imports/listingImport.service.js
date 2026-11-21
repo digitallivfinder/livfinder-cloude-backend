@@ -756,6 +756,14 @@ export async function importListing({ client, ctx, record, source = "api", impor
     }
 
     if (listing && reference.payload_hash === hash) {
+      // A reference from before 0082 has no stored record; an unchanged push fills it in, so the
+      // listing can take partial updates (PATCH) from now on.
+      if (reference.reference_id) {
+        await execute("UPDATE external_references SET last_payload = ? WHERE id = ? AND last_payload IS NULL", [
+          JSON.stringify(record),
+          reference.reference_id,
+        ]);
+      }
       return { operation: "unchanged", listing, warnings: [], media: { attached: null, failed: [] } };
     }
     if (listing && Number(listing.root_category_id) !== definition.rootId) {
@@ -876,12 +884,13 @@ export async function importListing({ client, ctx, record, source = "api", impor
     const storedHash = failedImages.length ? null : hash;
     await execute(
       `INSERT INTO external_references
-         (provider_id, connection_id, entity_type, entity_id, external_id, remote_status, payload_hash,
+         (provider_id, connection_id, entity_type, entity_id, external_id, remote_status, payload_hash, last_payload,
           first_synced_at, last_synced_at, last_success_at, sync_count, created_at)
-       VALUES (?, ?, 'listing', ?, ?, 'live', ?, NOW(3), NOW(3), NOW(3), 1, NOW(3))
-       ON DUPLICATE KEY UPDATE entity_id = VALUES(entity_id), payload_hash = VALUES(payload_hash), remote_status = 'live',
-                               last_synced_at = NOW(3), last_success_at = NOW(3), sync_count = sync_count + 1`,
-      [ctx.providerId, ctx.connectionId, listing.id, record.externalId, storedHash]
+       VALUES (?, ?, 'listing', ?, ?, 'live', ?, ?, NOW(3), NOW(3), NOW(3), 1, NOW(3))
+       ON DUPLICATE KEY UPDATE entity_id = VALUES(entity_id), payload_hash = VALUES(payload_hash), last_payload = VALUES(last_payload),
+                               remote_status = 'live', last_synced_at = NOW(3), last_success_at = NOW(3), sync_count = sync_count + 1`,
+      // The record as accepted is the base a later PATCH is merged onto (migration 0082).
+      [ctx.providerId, ctx.connectionId, listing.id, record.externalId, storedHash, JSON.stringify(record)]
     );
 
     await recordAudit({
@@ -960,7 +969,61 @@ export async function findImportedListing({ ctx, externalId }) {
   return reference ? loadListing(reference.listing_id) : null;
 }
 
-export async function listImportedListings({ ctx, updatedSince = null, status = null, page = 1, pageSize = 50 }) {
+/**
+ * The last complete record this client pushed for `externalId`, the base of a partial update.
+ * `{ listing: null }` when nothing was pushed under that id; `record: null` when a listing exists
+ * but no full record is stored for it (pushed before migration 0082, or made in the portal).
+ */
+export async function lastPushedRecord({ ctx, externalId }) {
+  const row = await queryOne(
+    `SELECT er.entity_id AS listing_id, er.last_payload
+       FROM external_references er
+      WHERE er.provider_id = ? AND er.connection_id = ? AND er.entity_type = 'listing' AND er.external_id = ?
+      LIMIT 1`,
+    [ctx.providerId, ctx.connectionId, externalId]
+  );
+  const listing = row ? await loadListing(row.listing_id) : null;
+  if (!listing) return { listing: null, record: null };
+  const stored = typeof row.last_payload === "string" ? JSON.parse(row.last_payload) : row.last_payload;
+  return { listing, record: stored && typeof stored === "object" ? stored : null };
+}
+
+const isPlainObject = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+
+/**
+ * A partial update merged onto the last pushed record:
+ *
+ *   - a top-level field that is sent replaces the stored one; `null` clears it;
+ *   - `detail` is merged key by key, and a `null` detail value removes that key;
+ *   - `location`, `images` and `features` are replaced whole when sent (mixing location levels
+ *     from two places, or half an image list, is never what was meant);
+ *   - `externalId` always comes from the URL.
+ *
+ * The result is exactly the full record the partner would otherwise have PUT, so it is checked
+ * by the same rules, and a patch that changes nothing comes back `unchanged`.
+ */
+export function mergeListingPatch(base, patch, externalId) {
+  const merged = { ...(isPlainObject(base) ? base : {}) };
+  for (const [key, value] of Object.entries(patch)) {
+    if (key === "externalId") continue;
+    if (key === "detail" && isPlainObject(value)) {
+      const detail = { ...(isPlainObject(merged.detail) ? merged.detail : {}) };
+      for (const [field, fieldValue] of Object.entries(value)) {
+        if (fieldValue === null) delete detail[field];
+        else detail[field] = fieldValue;
+      }
+      merged.detail = detail;
+    } else if (value === null) {
+      delete merged[key];
+    } else {
+      merged[key] = value;
+    }
+  }
+  merged.externalId = externalId;
+  return merged;
+}
+
+export async function listImportedListings({ ctx, updatedSince = null, status = null, order = "desc", page = 1, pageSize = 50 }) {
   const conditions = ["er.provider_id = ?", "er.connection_id = ?", "er.entity_type = 'listing'", "l.deleted_at IS NULL"];
   const params = [ctx.providerId, ctx.connectionId];
   if (updatedSince) {
@@ -977,7 +1040,7 @@ export async function listImportedListings({ ctx, updatedSince = null, status = 
   );
   const rows = await query(
     `SELECT l.*, er.external_id FROM external_references er JOIN listings l ON l.id = er.entity_id
-      WHERE ${where} ORDER BY l.updated_at DESC, l.id DESC LIMIT ? OFFSET ?`,
+      WHERE ${where} ORDER BY l.updated_at ${order === "asc" ? "ASC" : "DESC"}, l.id ${order === "asc" ? "ASC" : "DESC"} LIMIT ? OFFSET ?`,
     [...params, pageSize, (page - 1) * pageSize]
   );
   return { rows, total };

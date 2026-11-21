@@ -17,7 +17,9 @@ import { mountPartnerLeads } from "../leads/leads.routes.js";
 import { MAX_BULK_LISTINGS, createBulkImport, runSingleImport, runWithdrawal } from "../imports/importRunner.js";
 import {
   findImportedListing,
+  lastPushedRecord,
   listImportedListings,
+  mergeListingPatch,
   parseListingRecord,
   serializeImportedListing,
 } from "../imports/listingImport.service.js";
@@ -73,10 +75,13 @@ function withImportHeader(res, error) {
   if (error?.importId) res.setHeader("X-Import-Id", error.importId);
 }
 
-/** Who this key is: lets a partner confirm which company its listings will land in. */
+/**
+ * Who this key is: lets a partner confirm which company its listings will land in. Any valid key
+ * may ask, whatever its scopes, so a lead-feed-only key can check itself too.
+ */
 router.get(
   "/me",
-  ...signedIn("listings:read"),
+  ...signedIn(null),
   asyncHandler(async (req, res) =>
     res.json(
       detailResponse({
@@ -89,40 +94,83 @@ router.get(
   )
 );
 
-/** Create or update one listing, identified by the partner's own id. */
+/** The JSON object a PUT or PATCH sends, its externalId (if any) matching the URL's. */
+function listingBody(req) {
+  const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : null;
+  if (!body) throw AppError.badRequest("Send the listing as a JSON object.");
+  if (body.externalId !== undefined && body.externalId !== null && String(body.externalId).trim() !== req.params.externalId) {
+    throw AppError.validation("Some information in this listing is invalid.", {
+      externalId: "The externalId in the body must match the one in the URL.",
+    });
+  }
+  return body;
+}
+
+/** Runs one complete record as a single import and answers with the listing. */
+async function pushRecord(req, res, ctx, record) {
+  const source = sourceOf(req);
+  try {
+    const { importRun, outcome } = await runSingleImport({ client: req.apiClient, ctx, record, ...source });
+    res.setHeader("X-Import-Id", importRun.publicId);
+    return res.status(outcome.operation === "create" ? 201 : 200).json(
+      detailResponse(
+        serializeImportedListing(outcome.listing, {
+          externalId: record.externalId,
+          operation: outcome.operation,
+          importId: importRun.publicId,
+          images: { attached: outcome.media.attached, failed: outcome.media.failed },
+          warnings: outcome.warnings,
+        })
+      )
+    );
+  } catch (error) {
+    withImportHeader(res, error);
+    throw error;
+  }
+}
+
+/** Create or update one listing, identified by the partner's own id. Send the whole listing. */
 router.put(
   "/listings/:externalId",
   ...signedIn("listings:write"),
   perKeyIdempotency,
   asyncHandler(async (req, res) => {
-    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : null;
-    if (!body) throw AppError.badRequest("Send the listing as a JSON object.");
-    if (body.externalId !== undefined && String(body.externalId).trim() !== req.params.externalId) {
-      throw AppError.validation("Some information in this listing is invalid.", {
-        externalId: "The externalId in the body must match the one in the URL.",
+    const record = parseListingRecord({ ...listingBody(req), externalId: req.params.externalId });
+    return pushRecord(req, res, await connectionFor(req), record);
+  })
+);
+
+/**
+ * Update part of a listing: only the fields sent change, merged onto the last complete listing
+ * this client pushed (see `mergeListingPatch`). The merged listing must still be complete.
+ */
+router.patch(
+  "/listings/:externalId",
+  ...signedIn("listings:write"),
+  perKeyIdempotency,
+  asyncHandler(async (req, res) => {
+    const patch = listingBody(req);
+    if (!Object.keys(patch).some((key) => key !== "externalId")) {
+      throw AppError.badRequest("Send at least one field to change.");
+    }
+    const ctx = await connectionFor(req);
+    const { listing, record: base } = await lastPushedRecord({ ctx, externalId: req.params.externalId });
+    if (!listing) {
+      throw AppError.notFound(`No listing with the externalId "${req.params.externalId}" was pushed for this company. Create it with PUT first.`);
+    }
+    if (!base) {
+      throw new AppError("This listing has no complete copy stored to update. Send it once in full with PUT; PATCH works after that.", {
+        status: 409,
+        code: "FULL_PUSH_REQUIRED",
       });
     }
-    const record = parseListingRecord({ ...body, externalId: req.params.externalId });
-    const ctx = await connectionFor(req);
-    const source = sourceOf(req);
-    try {
-      const { importRun, outcome } = await runSingleImport({ client: req.apiClient, ctx, record, ...source });
-      res.setHeader("X-Import-Id", importRun.publicId);
-      return res.status(outcome.operation === "create" ? 201 : 200).json(
-        detailResponse(
-          serializeImportedListing(outcome.listing, {
-            externalId: record.externalId,
-            operation: outcome.operation,
-            importId: importRun.publicId,
-            images: { attached: outcome.media.attached, failed: outcome.media.failed },
-            warnings: outcome.warnings,
-          })
-        )
-      );
-    } catch (error) {
-      withImportHeader(res, error);
-      throw error;
+    if (patch.category !== undefined && patch.category !== base.category) {
+      throw AppError.validation("Some information in this listing is invalid.", {
+        category: "A listing's category cannot change. Withdraw it and push it again under a new externalId.",
+      });
     }
+    const record = parseListingRecord(mergeListingPatch(base, patch, req.params.externalId));
+    return pushRecord(req, res, ctx, record);
   })
 );
 
@@ -211,23 +259,42 @@ for (const category of FEED_CATEGORIES) {
   );
 }
 
-/** Up to 100 listings at once; processed in the background, results per listing. */
+/**
+ * Up to 100 changes at once: `listings` to create or update and `withdrawals` (externalIds) to
+ * take down. Processed in the background, results per listing.
+ */
 router.post(
   "/imports",
   ...signedIn("listings:write"),
   perKeyIdempotency,
   validate({
-    body: z.object({
-      listings: z
-        .array(z.unknown())
-        .min(1, "Send at least one listing.")
-        .max(MAX_BULK_LISTINGS, `Send at most ${MAX_BULK_LISTINGS} listings per request.`),
-    }),
+    body: z
+      .object({
+        listings: z.array(z.unknown()).max(MAX_BULK_LISTINGS, `Send at most ${MAX_BULK_LISTINGS} listings per request.`).optional(),
+        withdrawals: z.array(z.unknown()).max(MAX_BULK_LISTINGS, `Send at most ${MAX_BULK_LISTINGS} withdrawals per request.`).optional(),
+      })
+      // The documentation promises `additionalProperties: false`: a misspelt key is refused, not ignored.
+      .strict()
+      .refine((body) => (body.listings?.length ?? 0) + (body.withdrawals?.length ?? 0) > 0, {
+        message: "Send at least one listing or withdrawal.",
+        path: ["listings"],
+      })
+      .refine((body) => (body.listings?.length ?? 0) + (body.withdrawals?.length ?? 0) <= MAX_BULK_LISTINGS, {
+        message: `Send at most ${MAX_BULK_LISTINGS} listings and withdrawals together per request.`,
+        path: ["listings"],
+      }),
   }),
   asyncHandler(async (req, res) => {
     const ctx = await connectionFor(req);
     const { ip, userAgent } = sourceOf(req);
-    const result = await createBulkImport({ client: req.apiClient, ctx, listings: req.body.listings, ip, userAgent });
+    const result = await createBulkImport({
+      client: req.apiClient,
+      ctx,
+      listings: req.body.listings ?? [],
+      withdrawals: req.body.withdrawals ?? [],
+      ip,
+      userAgent,
+    });
     const row = await repo.getImportRow(result.importRun.publicId, ownerOf(req));
     res.setHeader("X-Import-Id", result.importRun.publicId);
     res.setHeader("Location", `/v1/partner/imports/${result.importRun.publicId}`);
@@ -282,13 +349,15 @@ router.get(
   validate({
     query: pageQuery.extend({
       updatedSince: z.string().datetime({ offset: true }).optional(),
+      // `asc` (oldest change first) suits paging through a sync: rows changed mid-sync move to the end.
+      order: z.enum(["asc", "desc"]).optional(),
       status: z.enum(["draft", "pending_review", "active", "rejected", "expired", "sold", "rented", "withdrawn", "archived"]).optional(),
     }),
   }),
   asyncHandler(async (req, res) => {
-    const { page = 1, pageSize = 50, updatedSince, status } = q(req);
+    const { page = 1, pageSize = 50, updatedSince, status, order = "desc" } = q(req);
     const ctx = await connectionFor(req);
-    const result = await listImportedListings({ ctx, updatedSince, status, page, pageSize });
+    const result = await listImportedListings({ ctx, updatedSince, status, order, page, pageSize });
     return res.json(
       listResponse(
         result.rows.map((row) => serializeImportedListing(row, { externalId: row.external_id })),

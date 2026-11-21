@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parsePushedXml } from "../../src/modules/feeds/feedParser.js";
+import { parseFeed, parsePushedXml } from "../../src/modules/feeds/feedParser.js";
 import { listingsCsv, listingsXml, sampleAllXml } from "../../src/modules/feeds/feedTemplates.js";
 import { FEED_CATEGORIES } from "../../src/modules/feeds/feedFormats.js";
 
@@ -21,6 +21,17 @@ describe("the all-categories file", () => {
   it("needs only the id to withdraw a listing", () => {
     const [cars] = parsePushedXml('<livfinder-feed version="1"><category name="cars"><listing><externalId>A</externalId><status>Withdrawn</status></listing></category></livfinder-feed>');
     expect(cars.items[0]).toMatchObject({ externalId: "A", errors: null, record: { externalId: "A", category: "cars", withdraw: true } });
+  });
+
+  it("does not warn about <status> on a withdrawal", () => {
+    const [cars] = parsePushedXml('<livfinder-feed category="cars" version="1"><listing><externalId>A</externalId><status>withdrawn</status></listing></livfinder-feed>');
+    expect(cars.items[0].record.withdraw).toBe(true);
+    expect(cars.warnings).toEqual([]);
+  });
+
+  it("still warns about an element it does not know", () => {
+    const [cars] = parsePushedXml('<livfinder-feed category="cars" version="1"><listing><externalId>A</externalId><status>withdrawn</status><colour>red</colour></listing></livfinder-feed>');
+    expect(cars.warnings).toEqual(["Unknown element <colour> was ignored."]);
   });
 
   it("refuses an unknown category, a repeated one, and a file with no sections", () => {
@@ -63,6 +74,20 @@ describe("the CSV a client reads back", () => {
     expect(lines[1]).toContain('"Villa, ""sea view"""');
     expect(lines[1]).toContain("https://a/1.jpg|https://a/2.jpg");
     expect(lines[1].endsWith(",active")).toBe(true);
+  });
+
+  it("can be pushed straight back without a warning about livfinderStatus", () => {
+    const realEstate = parsePushedXml(sampleAllXml()).find((result) => result.category === "real-estate");
+    const csv = listingsCsv("real-estate", [{ record: realEstate.items[0].record, status: "draft" }]);
+    const parsed = parseFeed({ category: "real-estate", format: "csv", content: csv });
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.items[0].errors).toBeNull();
+  });
+
+  it("withdraws by a status column without a warning, and still names an unknown column", () => {
+    const parsed = parseFeed({ category: "cars", format: "csv", content: "externalId,status,colour\r\nA,withdrawn,red\r\n" });
+    expect(parsed.items[0].record).toMatchObject({ externalId: "A", withdraw: true });
+    expect(parsed.warnings).toEqual(['Unknown column "colour" was ignored.']);
   });
 });
 

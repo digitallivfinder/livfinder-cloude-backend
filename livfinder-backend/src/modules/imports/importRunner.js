@@ -55,30 +55,50 @@ export async function runWithdrawal({ client, ctx, externalId, ip, userAgent, re
   }
 }
 
+const EXTERNAL_ID = /^\S{1,191}$/;
+
 /**
- * Accepts up to 100 listings. Each is checked against the record schema now, so obvious mistakes
- * come back in this response; the rest are queued and processed in the background.
+ * Accepts up to 100 changes: listings to create or update, and `withdrawals` (externalIds to take
+ * down). Each is checked now, so obvious mistakes come back in this response; the rest are queued
+ * and processed in the background. Rows are numbered listings first, then withdrawals.
  */
-export async function createBulkImport({ client, ctx, listings, ip, userAgent }) {
+export async function createBulkImport({ client, ctx, listings = [], withdrawals = [], ip, userAgent }) {
   const seen = new Set();
-  const items = listings.map((raw, index) => {
+  const duplicate = () =>
+    new AppError("This externalId appears more than once in the batch.", {
+      status: 422,
+      code: "DUPLICATE_IN_BATCH",
+      fields: { externalId: "Send each listing once per batch." },
+    });
+  const upserts = listings.map((raw, index) => {
     const row = index + 1;
     const externalId = typeof raw?.externalId === "string" ? raw.externalId.trim() : null;
     try {
       const record = parseListingRecord(raw);
-      if (seen.has(record.externalId)) {
-        throw new AppError("This externalId appears more than once in the batch.", {
-          status: 422,
-          code: "DUPLICATE_IN_BATCH",
-          fields: { externalId: "Send each listing once per batch." },
-        });
-      }
+      if (seen.has(record.externalId)) throw duplicate();
       seen.add(record.externalId);
       return { row, externalId: record.externalId, raw: record };
     } catch (error) {
       return { row, externalId, raw, error };
     }
   });
+  const takedowns = withdrawals.map((value, index) => {
+    const row = listings.length + index + 1;
+    const externalId = typeof value === "string" ? value.trim() : null;
+    const raw = { externalId, withdraw: true };
+    if (!externalId || !EXTERNAL_ID.test(externalId)) {
+      const error = new AppError("Some information in this withdrawal is invalid.", {
+        status: 422,
+        code: "VALIDATION_ERROR",
+        fields: { externalId: "Give the listing's id in your system: up to 191 characters, no spaces." },
+      });
+      return { row, externalId, raw, error };
+    }
+    if (seen.has(externalId)) return { row, externalId, raw, error: duplicate() };
+    seen.add(externalId);
+    return { row, externalId, raw };
+  });
+  const items = [...upserts, ...takedowns];
 
   const accepted = items.filter((item) => !item.error).length;
   const importRun = await repo.createImportRun({
@@ -111,22 +131,28 @@ export async function createBulkImport({ client, ctx, listings, ip, userAgent })
 
 async function clientForRun(run) {
   const row = await queryOne(
-    `SELECT ac.id, ac.public_id, ac.name, ac.client_id, ac.status, ac.created_by_user_id, ac.organization_id,
+    `SELECT ac.id, ac.public_id, ac.name, ac.client_id, ac.status, ac.expires_at, ac.created_by_user_id, ac.organization_id,
             COALESCE(ac.account_id, o.account_id) AS account_id, o.public_id AS organization_public_id,
-            o.status AS organization_status
-       FROM api_clients ac LEFT JOIN organizations o ON o.id = ac.organization_id
+            o.status AS organization_status, o.deleted_at AS organization_deleted_at, a.status AS account_status
+       FROM api_clients ac
+       LEFT JOIN organizations o ON o.id = ac.organization_id
+       LEFT JOIN accounts a ON a.id = COALESCE(ac.account_id, o.account_id)
       WHERE ac.id = ?`,
     [run.api_client_id]
   );
   if (!row) return null;
+  // The same checks the request itself passed (middleware/apiClient.js): a key that expired, or
+  // an account closed, while the batch waited stops it like a revoked key.
+  const expired = row.expires_at && new Date(row.expires_at) <= new Date();
+  const accountClosed = row.account_status !== "active";
   return {
     id: row.id,
     publicId: row.public_id,
     name: row.name,
     clientId: row.client_id,
-    status: row.status,
+    status: expired || accountClosed ? "inactive" : row.status,
     // An individual's key has no organization to be suspended.
-    organizationStatus: row.organization_id ? row.organization_status : "active",
+    organizationStatus: row.organization_id ? (row.organization_deleted_at ? "deleted" : row.organization_status) : "active",
     organizationId: row.organization_id,
     organizationPublicId: row.organization_public_id,
     accountId: row.account_id,

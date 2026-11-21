@@ -283,8 +283,15 @@ function flattenNode(node, format) {
   return values;
 }
 
+/**
+ * Keys a file may carry beyond the format's fields: `status` withdraws a listing, and
+ * `livfinderStatus` is the read-only column of a file downloaded from LivFinder, so a client can
+ * push that file straight back. Neither is warned about.
+ */
+const CONTROL_KEYS = ["status", "livfinderStatus"];
+
 function unknownKeys(values, format) {
-  const known = new Set(format.fields.map((field) => field.key));
+  const known = new Set([...format.fields.map((field) => field.key), ...CONTROL_KEYS]);
   return Object.keys(values).filter((key) => !known.has(key) && !key.startsWith("@_"));
 }
 
@@ -408,7 +415,7 @@ function readCsv(category, format, text) {
   const [header = [], ...data] = records;
   if (data.length > MAX_FEED_ROWS) throw fileError(`A feed file can hold at most ${MAX_FEED_ROWS} rows.`);
   const rows = data.map((cells) => Object.fromEntries(header.map((column, index) => [column, cells[index] ?? ""])));
-  const known = new Set(csvColumns(category));
+  const known = new Set([...csvColumns(category), ...CONTROL_KEYS]);
   const warnings = header.filter((column) => !known.has(column)).map((column) => `Unknown column "${column}" was ignored.`);
   if (!header.includes("externalId")) throw fileError('The CSV file needs an "externalId" column.', { externalId: "Add the column." });
 
