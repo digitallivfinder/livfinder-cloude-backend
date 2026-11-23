@@ -1,3 +1,4 @@
+import { amenityLookupSlug } from "../search/realEstateCatalogue.js";
 import { z } from "zod";
 import env from "../../config/env.js";
 import logger from "../../config/logger.js";
@@ -2213,22 +2214,9 @@ export const DEVELOPMENT_PROJECT_TYPES = [
   "master_community",
 ];
 export const DEVELOPMENT_OWNERSHIP = ["freehold", "leasehold", "commonhold", "usufruct", "musataha", "other", "unknown"];
-export const DEVELOPMENT_UNIT_TYPES = [
-  "apartment",
-  "penthouse",
-  "duplex",
-  "villa",
-  "townhouse",
-  "studio",
-  "loft",
-  "office",
-  "retail",
-  "warehouse",
-  "plot",
-  "floor",
-  "whole_building",
-  "other",
-];
+/** Property Finder's New Projects types (0083). A Studio is an Apartment with 0 bedrooms. */
+export const DEVELOPMENT_UNIT_TYPES = ["apartment", "villa", "townhouse", "penthouse", "duplex"];
+const LEGACY_DEVELOPMENT_UNIT_TYPES = { studio: "apartment", loft: "apartment", studios: "apartment", apartments: "apartment" };
 export const DEVELOPMENT_AVAILABILITY = ["available", "limited", "sold_out", "coming_soon"];
 export const PAYMENT_PLAN_TYPES = ["construction_linked", "time_linked", "post_handover", "cash", "custom"];
 export const MILESTONE_TRIGGERS = [
@@ -2263,7 +2251,10 @@ const DOCUMENT_VISIBILITY = ["public", "gated", "restricted", "internal"];
 const nullableDate = z.string().trim().max(20).optional().nullable();
 
 const unitTypeSchema = z.object({
-  unitType: enumIn(DEVELOPMENT_UNIT_TYPES, "Unit type"),
+  unitType: z.preprocess(
+    (value) => (typeof value === "string" ? LEGACY_DEVELOPMENT_UNIT_TYPES[value.trim().toLowerCase()] || value : value),
+    enumIn(DEVELOPMENT_UNIT_TYPES, "Unit type")
+  ),
   name: z.string().trim().max(160).optional().nullable(),
   bedrooms: z.coerce.number().int().min(0).max(60).optional().nullable(),
   bathrooms: z.coerce.number().min(0).max(60).optional().nullable(),
@@ -2554,22 +2545,41 @@ async function writePaymentPlans({ projectId, plans, developerBrandId }, connect
   }
 }
 
+/**
+ * A development's amenities: Property Finder's list, the one linked to Real Estate Developments
+ * (0083). Each is matched to that list (PF codes and earlier names included) and saved under
+ * its list name; anything not on the list is left off.
+ */
 async function writeAmenities({ projectId, amenities }, connection) {
   if (amenities === undefined) return;
   await execute("DELETE FROM project_amenities WHERE project_id = ?", [projectId], connection);
   const seen = new Set();
-  for (const [index, label] of amenities.entries()) {
-    const slug = slugify(label).slice(0, 120);
-    if (!slug || seen.has(slug)) continue;
-    seen.add(slug);
+  const saved = [];
+  for (const label of amenities) {
+    const lookup = amenityLookupSlug(label, slugify);
+    if (!lookup) continue;
+    const feature = await queryOne(
+      `SELECT f.slug, f.name, f.sort_order FROM features f
+         JOIN category_features cf ON cf.feature_id = f.id
+         JOIN categories c ON c.id = cf.category_id AND c.code = 'real-estate-developments'
+        WHERE f.slug = ? OR f.code = ? OR LOWER(f.name) = LOWER(?) LIMIT 1`,
+      [lookup, lookup, String(label).trim()],
+      connection
+    );
+    if (!feature || seen.has(feature.slug)) continue;
+    seen.add(feature.slug);
+    saved.push(feature);
+  }
+  saved.sort((a, b) => Number(a.sort_order) - Number(b.sort_order));
+  for (const [index, feature] of saved.entries()) {
     await execute(
       "INSERT INTO project_amenities (project_id, slug, label, sort_order, created_at) VALUES (?, ?, ?, ?, NOW(3))",
-      [projectId, slug, label.slice(0, 160), index],
+      [projectId, feature.slug, feature.name, index],
       connection
     );
   }
   // The legacy JSON column is kept in step so nothing reading it goes stale.
-  await execute("UPDATE projects SET amenities = ? WHERE id = ?", [JSON.stringify(amenities), projectId], connection);
+  await execute("UPDATE projects SET amenities = ? WHERE id = ?", [JSON.stringify(saved.map((feature) => feature.name)), projectId], connection);
 }
 
 async function writeUnitTypes({ projectId, unitTypes }, connection) {

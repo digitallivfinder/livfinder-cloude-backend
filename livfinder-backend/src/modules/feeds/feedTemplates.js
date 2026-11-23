@@ -36,9 +36,9 @@ const EXAMPLES = {
   contactEmail: "sales@example.com",
   contactPhone: "+971500000000",
   images: ["https://example.com/photos/1.jpg", "https://example.com/photos/2.jpg", "https://example.com/photos/3.jpg"],
-  features: ["Private pool", "Sea view"],
+  features: ["Private Pool", "View of Water"],
   highlights: ["Beachfront", "Branded residences"],
-  amenities: ["Gym", "Infinity pool"],
+  amenities: ["Shared Gym", "Shared Pool"],
   brochureUrl: "https://example.com/brochure.pdf",
 };
 

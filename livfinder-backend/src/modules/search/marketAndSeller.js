@@ -11,9 +11,10 @@
  * labels below only rename the known ones the way buyers say them.
  */
 
+/** In the order the menu lists them: Resale before New Launch. */
 export const MARKETS = {
-  new_launch: { label: "New Launch", isNewBuild: 1 },
   resale: { label: "Resale", isNewBuild: 0 },
+  new_launch: { label: "New Launch", isNewBuild: 1 },
 };
 
 export const MARKET_OPTIONS = Object.entries(MARKETS).map(([value, { label }]) => ({

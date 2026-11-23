@@ -1,5 +1,6 @@
 import { AppError } from "../../utils/errors.js";
 import { isPropertySegment, normalizeSegment, typeFitsSegment } from "../search/propertySegments.js";
+import { DEFAULT_SEGMENT_FOR_BOTH } from "../search/realEstateCatalogue.js";
 
 const LABEL = { residential: "Residential", commercial: "Commercial" };
 
@@ -28,7 +29,7 @@ function invalid(message, field = "propertySegment") {
  * @param {string|null} [input.stored]              the listing's current segment (edits)
  * @returns {"residential"|"commercial"}
  */
-export function decideSegment({ requested, typeSegment = null, typeName = null, stored = null }) {
+export function decideSegment({ requested, typeSegment = null, typeName = null, typeCode = null, stored = null }) {
   const asked = requested === undefined || requested === null || requested === "" ? null : normalizeSegment(requested);
   if (asked !== null && !isPropertySegment(asked)) throw invalid("Choose Residential or Commercial.");
 
@@ -46,6 +47,8 @@ export function decideSegment({ requested, typeSegment = null, typeName = null, 
   if (typeSegment === "residential" || typeSegment === "commercial") return typeSegment;
   // An edit keeps what it had when the type allows it.
   if (stored && typeFitsSegment(typeSegment, stored)) return stored;
+  // A type that was one segment before 0083 (Villa, Full Floor …) still defaults to it.
+  if (typeSegment === "both" && DEFAULT_SEGMENT_FOR_BOTH[typeCode]) return DEFAULT_SEGMENT_FOR_BOTH[typeCode];
   throw invalid(
     typeName
       ? `A ${typeName} can be residential or commercial. Choose Residential or Commercial.`

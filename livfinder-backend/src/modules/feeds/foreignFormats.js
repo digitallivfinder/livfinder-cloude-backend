@@ -1,3 +1,4 @@
+import { PF_TYPE_CODES } from "../search/realEstateCatalogue.js";
 import { XMLParser } from "fast-xml-parser";
 import { FEED_XML_ENTITIES } from "./xmlEntities.js";
 import { childElements, rootElement, textOf, toBytes } from "./xmlChunks.js";
@@ -26,28 +27,8 @@ const parser = new XMLParser({
   isArray: (name) => ["property", "listing", "url", "image", "photo", "feature", "amenity", "facility"].includes(String(name).toLowerCase()),
 });
 
-// Property Finder's two-letter property type codes, to LivFinder's real-estate types.
-const PF_TYPES = {
-  AP: "apartment",
-  VH: "villa",
-  TH: "townhouse",
-  PH: "penthouse",
-  DX: "duplex",
-  LP: "plot",
-  OF: "office",
-  RE: "retail",
-  WB: "whole-building",
-  HA: "hotel-apartment",
-  // Commercial types (0077). Bulk units are commercial on Property Finder, not villas.
-  BU: "bulk-unit",
-  SH: "shop",
-  SR: "showroom",
-  WH: "warehouse",
-  FA: "factory",
-  LC: "labour-camp",
-  FF: "commercial-floor",
-  HF: "commercial-floor",
-};
+// Property Finder's two-letter property type codes → LivFinder types (0083: PF's own list).
+const PF_TYPES = PF_TYPE_CODES;
 
 /** Property Finder's offering type: RS / RR residential, CS / CR commercial. */
 function pfSegment(offering) {
@@ -62,7 +43,7 @@ function bayutType(value) {
   if (!match) return { propertyType: value || undefined, propertySegment: undefined };
   const type = match[2].trim();
   return {
-    propertyType: /^building$/i.test(type) ? "whole-building" : type,
+    propertyType: /^building$/i.test(type) ? "whole-building" : /^(plot|land)$/i.test(type) ? "land" : type,
     propertySegment: match[1].toLowerCase(),
   };
 }

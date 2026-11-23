@@ -1,3 +1,4 @@
+import { amenityLookupSlug, currentTypeCode, typeOfferedFor } from "../search/realEstateCatalogue.js";
 import { query, queryOne, queryValue, execute } from "../../db/query.js";
 import { alignRentPeriod } from "./rentPeriod.js";
 import { alignCompletionStatus, assertOffPlanForSale } from "./completionStatus.js";
@@ -108,10 +109,12 @@ const BRAND_KIND = {
 // fixed-wing-only manufacturer, and vice versa.
 const AIRCRAFT_SEGMENT = { jets: "fixed_wing", helicopters: "rotorcraft" };
 
-async function resolveCategoryRow(definition, categorySlug, executor) {
-  if (!categorySlug) return { categoryId: definition.rootId, rootCategoryId: definition.rootId, typeSegment: null, typeName: null };
+async function resolveCategoryRow(definition, rawCategorySlug, executor, { purpose = null } = {}) {
+  if (!rawCategorySlug) return { categoryId: definition.rootId, rootCategoryId: definition.rootId, typeSegment: null, typeName: null, offeredFor: null };
+  // Real estate's pre-0083 codes (plot, mansion, office …) still resolve to the type that replaced them.
+  const categorySlug = definition.listingType === "real-estate" ? currentTypeCode(rawCategorySlug, purpose) : rawCategorySlug;
   const row = await queryOne(
-    `SELECT id, root_category_id, property_segment, name FROM categories
+    `SELECT id, code, root_category_id, property_segment, offered_for, name FROM categories
       WHERE (slug = ? OR code = ?) AND root_category_id = ? AND deleted_at IS NULL LIMIT 1`,
     [categorySlug, categorySlug, definition.rootId],
     executor
@@ -129,7 +132,22 @@ async function resolveCategoryRow(definition, categorySlug, executor) {
     // Real estate's Residential / Commercial for this type (0077); null elsewhere.
     typeSegment: row.property_segment ?? null,
     typeName: row.name ?? null,
+    typeCode: row.code ?? null,
+    offeredFor: row.offered_for ?? null,
   };
+}
+
+/**
+ * Property Finder offers some types for one purpose only in a segment (0083): Land is not let as
+ * residential, a Bulk Sale Unit is not rented, a commercial Hotel is not rented.
+ */
+function assertTypeOffered({ offeredFor, typeName, segment, purpose }) {
+  if (typeOfferedFor(offeredFor, segment, purpose)) return;
+  const purposeLabel = purpose === "rent" ? "rent" : "sale";
+  const segmentLabel = segment ? `${segment} ` : "";
+  throw AppError.validation("Some information is invalid.", {
+    categorySlug: `${typeName || "This property type"} is not offered for ${purposeLabel} as a ${segmentLabel}property. Choose another type.`,
+  });
 }
 
 async function resolvePurposeId(purpose, executor) {
@@ -208,9 +226,12 @@ async function uniqueListingSlug(title, listingId, executor) {
  */
 const UNIT_TYPE_BY_CATEGORY_CODE = {
   apartment: "apartment", villa: "villa", penthouse: "penthouse", townhouse: "townhouse",
-  mansion: "villa", duplex: "duplex", chalet: "villa", estate: "villa", plot: "plot",
-  "whole-building": "whole_building", office: "office", retail: "retail",
-  "hotel-apartment": "apartment", island: "plot", vineyard: "plot",
+  compound: "villa", bungalow: "villa", duplex: "duplex", land: "plot",
+  "full-floor": "floor", "half-floor": "floor", "whole-building": "whole_building",
+  "bulk-sale-unit": "other", "bulk-rent-unit": "other", "hotel-apartment": "apartment",
+  "office-space": "office", "co-working-space": "office", "business-centre": "office",
+  retail: "retail", shop: "retail", "show-room": "retail", warehouse: "warehouse", factory: "warehouse",
+  "labor-camp": "other", "staff-accommodation": "other", farm: "plot",
 };
 
 const UNIT_TENURE = { freehold: "freehold", leasehold: "leasehold", commonhold: "commonhold", usufruct: "usufruct", musataha: "musataha" };
@@ -339,13 +360,27 @@ async function writeDetail({ listingType, listingId, detail }, executor) {
 
 async function writeFeatures({ listingId, featureIds, featureSlugs }, executor) {
   if (!featureIds && !featureSlugs) return;
+  // Only what the listing's category offers (its `category_features`); commercial real estate
+  // offers none (Property Finder's rule, 0083).
+  const scope = await queryOne(
+    `SELECT l.root_category_id, l.property_segment, root.code AS root_code
+       FROM listings l JOIN categories root ON root.id = l.root_category_id WHERE l.id = ?`,
+    [listingId],
+    executor
+  );
+  const offered = new Set(
+    scope && !(scope.root_code === "real-estate" && scope.property_segment === "commercial")
+      ? (await query("SELECT feature_id FROM category_features WHERE category_id = ?", [scope.root_category_id], executor)).map((row) => Number(row.feature_id))
+      : []
+  );
   const ids = new Set();
   for (const id of featureIds || []) {
-    if (/^\d+$/.test(String(id))) ids.add(Number(id));
+    if (/^\d+$/.test(String(id)) && offered.has(Number(id))) ids.add(Number(id));
   }
   for (const slug of featureSlugs || []) {
-    const row = await queryOne("SELECT id FROM features WHERE slug = ? OR code = ? LIMIT 1", [slugify(slug), slug], executor);
-    if (row) ids.add(row.id);
+    const lookup = amenityLookupSlug(slug, slugify);
+    const row = lookup ? await queryOne("SELECT id FROM features WHERE slug = ? OR code = ? LIMIT 1", [lookup, slug], executor) : null;
+    if (row && offered.has(Number(row.id))) ids.add(Number(row.id));
   }
   await execute("DELETE FROM listing_features WHERE listing_id = ?", [listingId], executor);
   for (const id of ids) {
@@ -568,12 +603,17 @@ export async function createListing({ payload: rawPayload, accountId, userId, or
   assertOffPlanForSale(definition.listingType, { purpose: payload.purpose, completionStatus: payload.detail?.completionStatus });
 
   return withTransaction(async (connection) => {
-    const { categoryId, rootCategoryId, typeSegment, typeName } = await resolveCategoryRow(definition, payload.categorySlug, connection);
+    const { categoryId, rootCategoryId, typeSegment, typeName, typeCode, offeredFor } = await resolveCategoryRow(definition, payload.categorySlug, connection, {
+      purpose: payload.purpose || "sale",
+    });
     // Residential / Commercial: chosen first, and the type must belong to it (propertySegment.js).
     const propertySegment =
       definition.listingType === "real-estate"
-        ? decideSegment({ requested: payload.propertySegment, typeSegment, typeName })
+        ? decideSegment({ requested: payload.propertySegment, typeSegment, typeName, typeCode })
         : null;
+    if (definition.listingType === "real-estate") {
+      assertTypeOffered({ offeredFor, typeName, segment: propertySegment, purpose: payload.purpose || "sale" });
+    }
     await assertStorageAvailable(accountId, connection);
     if (payload.status === "pending_review") await assertLiveSlotAvailable({ accountId, rootCategoryId }, connection);
     const purposeId = await resolvePurposeId(payload.purpose, connection);
@@ -832,11 +872,14 @@ export async function updateListing({ listing, payload: rawPayload, userId, acco
         payload.categorySlug !== undefined
           ? payload.categorySlug
           : await queryValue("SELECT c.slug FROM listings l JOIN categories c ON c.id = l.category_id WHERE l.id = ?", [listing.id], connection);
-      const { categoryId, typeSegment, typeName } = await resolveCategoryRow(definition, typeSlug, connection);
+      const purposeForType =
+        payload.purpose ??
+        (await queryValue("SELECT p.code FROM listings l JOIN purposes p ON p.id = l.purpose_id WHERE l.id = ?", [listing.id], connection));
+      const { categoryId, typeSegment, typeName, typeCode } = await resolveCategoryRow(definition, typeSlug, connection, { purpose: purposeForType });
       if (payload.categorySlug !== undefined) set("category_id", categoryId);
       if (definition.listingType === "real-estate") {
         const stored = await queryValue("SELECT property_segment FROM listings WHERE id = ?", [listing.id], connection);
-        set("property_segment", decideSegment({ requested: payload.propertySegment, typeSegment, typeName, stored }));
+        set("property_segment", decideSegment({ requested: payload.propertySegment, typeSegment, typeName, typeCode, stored }));
       }
     }
     if (payload.purpose !== undefined) {
@@ -876,6 +919,20 @@ export async function updateListing({ listing, payload: rawPayload, userId, acco
 
     if (assignments.length) {
       await execute(`UPDATE listings SET ${assignments.join(", ")} WHERE id = ?`, [...params, listing.id], connection);
+    }
+    // The type, segment and purpose as now saved must still fit Property Finder's rules (0083).
+    if (
+      definition.listingType === "real-estate" &&
+      (payload.categorySlug !== undefined || payload.propertySegment !== undefined || payload.purpose !== undefined)
+    ) {
+      const saved = await queryOne(
+        `SELECT c.offered_for, c.name, l.property_segment, p.code AS purpose
+           FROM listings l JOIN categories c ON c.id = l.category_id JOIN purposes p ON p.id = l.purpose_id
+          WHERE l.id = ?`,
+        [listing.id],
+        connection
+      );
+      if (saved) assertTypeOffered({ offeredFor: saved.offered_for, typeName: saved.name, segment: saved.property_segment, purpose: saved.purpose });
     }
 
     if (payload.detail !== undefined) {

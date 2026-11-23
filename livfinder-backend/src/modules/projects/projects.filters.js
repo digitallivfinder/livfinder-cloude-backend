@@ -44,22 +44,8 @@ export const OWNERSHIP_TYPES = Object.freeze([
   "unknown",
 ]);
 
-export const UNIT_TYPES = Object.freeze([
-  "apartment",
-  "penthouse",
-  "duplex",
-  "villa",
-  "townhouse",
-  "studio",
-  "loft",
-  "office",
-  "retail",
-  "warehouse",
-  "plot",
-  "floor",
-  "whole_building",
-  "other",
-]);
+/** A development's unit types: Property Finder's New Projects types (0083). */
+export const UNIT_TYPES = Object.freeze(["apartment", "villa", "townhouse", "penthouse", "duplex"]);
 
 export const AVAILABILITY = Object.freeze(["available", "limited", "sold_out", "coming_soon"]);
 

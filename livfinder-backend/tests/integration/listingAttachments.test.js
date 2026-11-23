@@ -66,8 +66,10 @@ describe("catalogue reads for the portal form", () => {
       const response = await portal.get("/v1/public/features", { category });
       expect(response.status).toBe(200);
       expect(response.body.data.length, category).toBeGreaterThanOrEqual(10);
-      // Grouped the way the form renders them.
-      expect(new Set(response.body.data.map((row) => row.group)).size, category).toBeGreaterThan(1);
+      // Grouped the way the form renders them (developments: Property Finder's one list, 0083).
+      if (category !== "real-estate-developments") {
+        expect(new Set(response.body.data.map((row) => row.group)).size, category).toBeGreaterThan(1);
+      }
     }
   });
 
@@ -84,7 +86,9 @@ describe("catalogue reads for the portal form", () => {
     expect(helis).toContain("Wire strike protection");
 
     const devs = (await portal.get("/v1/public/features", { category: "real-estate-developments" })).body.data.map((row) => row.name);
-    expect(devs).toContain("Post-handover payment plan");
+    // Property Finder's 23 amenities, as for real estate (0083).
+    expect(devs).toContain("Shared Pool");
+    expect(devs).not.toContain("Post-handover payment plan");
     expect(devs).not.toContain("Adaptive cruise control");
   });
 

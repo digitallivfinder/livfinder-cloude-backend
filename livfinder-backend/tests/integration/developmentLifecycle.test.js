@@ -104,7 +104,7 @@ describe("real development lifecycle", () => {
       availableUnits: 80,
       communityId,
       handoverDate: "2028-12-31",
-      amenities: ["Swimming pool", "Gym"],
+      amenities: ["Swimming pool", "Gym"], // matched to Property Finder's list (0083)
       unitTypes: [{ unitType: "apartment", name: "1BR Apartment", bedrooms: 1, startingPrice: 1500000, availableUnits: 40 }],
       paymentPlans: [
         {
@@ -163,7 +163,7 @@ describe("real development lifecycle", () => {
       ["Booking", 20],
       ["On handover", 80],
     ]);
-    expect(detail.amenities).toEqual(["Swimming pool", "Gym"]);
+    expect(detail.amenities).toEqual(["Shared Pool", "Shared Gym"]);
     expect(detail.locationIds.community).toBe(String(communityId));
     expect(detail.priceMax).toBe(4500000);
   });

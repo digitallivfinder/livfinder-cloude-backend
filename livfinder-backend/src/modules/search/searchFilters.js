@@ -1,3 +1,4 @@
+import { currentAmenitySlugs, currentTypeSlug } from "./realEstateCatalogue.js";
 import { resolveCategory } from "../../utils/categories.js";
 import { asArray, toInt, toNumber, toBool, cleanString } from "../../utils/http.js";
 import { isPropertySegment } from "./propertySegments.js";
@@ -198,7 +199,11 @@ export function normalizeSearchInput(input = {}) {
     definition,
     listingType,
     rootCategoryId: definition?.rootId ?? null,
-    categorySlug: cleanString(input.propertyType ?? input.categorySlug ?? input.type, 80),
+    // Real estate: a pre-0083 slug in an old link or saved search (plots, mansions …) still finds its type.
+    categorySlug:
+      listingType === "real-estate"
+        ? currentTypeSlug(cleanString(input.propertyType ?? input.categorySlug ?? input.type, 80))
+        : cleanString(input.propertyType ?? input.categorySlug ?? input.type, 80),
     purposeSlug: PURPOSE_SLUGS[String(input.transactionType || input.purpose || "").toLowerCase()] || null,
     country: input.country ?? null,
     state: input.state ?? null,
@@ -234,7 +239,8 @@ export function normalizeSearchInput(input = {}) {
     bathrooms: parseCountChips(input.bathrooms ?? input.baths),
     rentPeriod: RENT_PERIODS[String(input.rentPeriod || "").toLowerCase()] || null,
     propertySegment: isPropertySegment(input.propertySegment ?? input.segment) ? input.propertySegment ?? input.segment : null,
-    amenities: parseAmenities(input.amenities),
+    // Real estate's amenities are Property Finder's since 0083; older slugs (sea-view …) map onto them.
+    amenities: listingType === "real-estate" ? currentAmenitySlugs(parseAmenities(input.amenities)) : parseAmenities(input.amenities),
     // Real estate's Market (new_launch | resale) and Listed by (seller types); see marketAndSeller.js.
     market: isMarket(String(input.market || "").toLowerCase()) ? String(input.market).toLowerCase() : null,
     sellerTypes: parseSellerTypes(asArray(input.listedBy ?? input.sellerType)),

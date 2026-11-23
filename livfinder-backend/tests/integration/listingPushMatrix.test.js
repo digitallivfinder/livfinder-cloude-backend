@@ -219,14 +219,13 @@ describe("amenities", () => {
     expect(response.body.error.fields.features).toBeTruthy();
   });
 
-  it("a new one is added once, whatever its case", async () => {
+  it("one that is not on LivFinder's list is left off, the listing is kept, and the push says so", async () => {
     const name = `QA sky deck ${suffix}`;
-    for (const [label, value] of [["a", name], ["b", name.toUpperCase()]]) {
-      const externalId = id(`amenity-${label}`);
-      expect((await put(externalId, house(externalId, { features: [value] }))).status).toBe(201);
-    }
-    const rows = await query("SELECT id FROM features WHERE name = ?", [name]);
-    expect(rows).toHaveLength(1);
+    const externalId = id("amenity-unknown");
+    const response = await put(externalId, house(externalId, { features: ["Balcony", name] }));
+    expect(response.status).toBe(201);
+    expect(JSON.stringify(response.body)).toMatch(/is not in LivFinder's amenity list/);
+    expect(await query("SELECT id FROM features WHERE name = ?", [name])).toHaveLength(0);
   });
 
   it("is not added when the listing is rejected", async () => {

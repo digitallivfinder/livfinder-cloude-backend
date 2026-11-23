@@ -122,7 +122,7 @@ const DESCRIPTIONS = {
   country: "2-letter code or the country's name.",
   locationId: "A LivFinder location id; use instead of the names when you have it.",
   images: `Full image URLs, separated by ${LIST_SEPARATOR}. LivFinder downloads and stores them.`,
-  features: `Feature names, separated by ${LIST_SEPARATOR}.`,
+  features: `Amenity or feature names from LivFinder's list for the category (real estate: Property Finder's 23), separated by ${LIST_SEPARATOR}. One that is not on the list is left off and reported as a warning.`,
   agentEmail: "The email of the agent on your LivFinder account who handles this listing.",
   completionStatus: "ready, off_plan, or shell_and_core for commercial. Off plan is for sale only; a rental is ready.",
   rentPeriod: "For a rental: yearly, half_yearly, quarterly, monthly, weekly or daily.",

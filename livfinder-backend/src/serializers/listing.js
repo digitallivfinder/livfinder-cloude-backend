@@ -24,7 +24,7 @@ export function serializeListingCard(row) {
     listingType: definition?.listingType ?? null,
     categorySlug: row.category_slug ?? null,
     // Real estate's Residential / Commercial (0077); null for other marketplaces.
-    propertySegment: row.property_segment ?? null,
+    propertySegment: row.property_segment ?? row.listing_property_segment ?? null,
     purpose: row.purpose_slug === "for-rent" ? "rent" : row.purpose_slug === "for-charter" ? "charter" : "sale",
     purposeSlug: row.purpose_slug ?? null,
     title: row.title,
@@ -283,7 +283,7 @@ export function serializeListingDetail({ listing, detail, media = [], features =
     listingType,
     categoryId: int(listing.category_id),
     categorySlug: listing.category_slug,
-    propertySegment: listing.property_segment ?? null,
+    propertySegment: listing.property_segment ?? listing.listing_property_segment ?? null,
     categoryName: listing.category_name,
     rootCategoryId: int(listing.root_category_id),
     purpose: listing.purpose_slug === "for-rent" ? "rent" : listing.purpose_slug === "for-charter" ? "charter" : "sale",

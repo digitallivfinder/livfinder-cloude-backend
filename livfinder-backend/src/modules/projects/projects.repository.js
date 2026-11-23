@@ -1,3 +1,4 @@
+import { currentAmenitySlugs } from "../search/realEstateCatalogue.js";
 import { query, queryOne, queryValue } from "../../db/query.js";
 import { PROJECT_TYPES_BY_SEGMENT } from "../search/propertySegments.js";
 import { parseAmenities } from "../search/searchFilters.js";
@@ -11,6 +12,7 @@ import {
   NEARING_COMPLETION_THRESHOLD,
   PROJECT_STATUSES,
   SORT_MAP,
+  UNIT_TYPES,
 } from "./projects.filters.js";
 
 /**
@@ -257,7 +259,8 @@ export async function buildProjectQuery(filters = {}) {
   }
 
   // Amenities: a development must offer every one that is chosen (same slugs as listings).
-  const amenities = parseAmenities(filters.amenities);
+  // Property Finder's amenities since 0083; older slugs (infinity-pool …) map onto them.
+  const amenities = currentAmenitySlugs(parseAmenities(filters.amenities));
   if (amenities.length) {
     conditions.push(
       `ps.project_id IN (
@@ -675,6 +678,12 @@ export async function getPublicDeveloper(slug) {
  * Backed by the same projection the results come from, so a developer, unit
  * type, handover year or availability offered here is one that returns rows.
  */
+/** "whole_building" → "Whole building". */
+function unitTypeLabel(value) {
+  const text = String(value).replace(/_/g, " ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 export async function projectFilterOptions(filterKey, { q = null, limit = 60, filters = {} } = {}) {
   const key = String(filterKey);
   if (key === "developer") {
@@ -754,6 +763,47 @@ export async function projectFilterOptions(filterKey, { q = null, limit = 60, fi
       .filter((row) => row.value)
       .sort((a, b) => Number(a.value) - Number(b.value))
       .map((row) => ({ value: String(row.value), label: String(row.value), count: row.count }));
+  }
+  if (key === "amenities") {
+    /**
+     * Every amenity a development can offer — Property Finder's list, linked to Real Estate
+     * Developments (0083) — with how many live developments offer each. The website's New Launch
+     * menu shows all of them (owner, 2026-11-23); PF has none for commercial.
+     */
+    if (filters?.propertySegment === "commercial") return [];
+    const { amenities: _chosen, ...rest } = filters || {};
+    const built = await buildProjectQuery(rest);
+    const counts = new Map();
+    if (!built.impossible) {
+      const rows = await query(
+        `SELECT pa.slug, COUNT(DISTINCT pa.project_id) AS count
+           FROM project_amenities pa
+           JOIN project_search ps ON ps.project_id = pa.project_id
+          ${built.where}
+          GROUP BY pa.slug`,
+        built.params
+      );
+      for (const row of rows) counts.set(row.slug, Number(row.count) || 0);
+    }
+    const catalogue = await query(
+      `SELECT f.slug, f.name FROM category_features cf
+         JOIN features f ON f.id = cf.feature_id
+         JOIN categories c ON c.id = cf.category_id AND c.code = 'real-estate-developments'
+        ORDER BY cf.sort_order, f.sort_order, f.name`
+    );
+    const needle = q ? String(q).toLowerCase() : null;
+    return catalogue
+      .filter((row) => !needle || row.name.toLowerCase().includes(needle))
+      .map((row) => ({ value: row.slug, label: row.name, count: counts.get(row.slug) || 0 }));
+  }
+  if (key === "propertyType") {
+    // Every development unit type — Property Finder's five New Projects types (0083) — with how
+    // many developments hold each. All five are offered (owner, 2026-11-23); PF's New Projects
+    // types are residential, so a commercial search offers none.
+    if (filters?.propertySegment === "commercial") return [];
+    const rows = await projectFacets(filters, "propertyType");
+    const counts = new Map(rows.map((row) => [row.value, Number(row.count) || 0]));
+    return UNIT_TYPES.map((value) => ({ value, label: unitTypeLabel(value), count: counts.get(value) || 0 }));
   }
   if (key === "availability") {
     const rows = await projectFacets(filters, "availability");

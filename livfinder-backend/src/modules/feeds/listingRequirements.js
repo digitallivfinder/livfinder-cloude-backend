@@ -42,6 +42,15 @@ const saysResidential = (record) => /^(r|resid)/i.test(String(record.propertySeg
 const homeRoomsFromRecord = (record) => saysResidential(record) && !landWord(record);
 const builtRoomsFromRecord = (record) => !landWord(record);
 
+/**
+ * Amenities belong to homes: LivFinder (like Property Finder) shows none on commercial property, so a
+ * commercial real-estate listing need not send any (owner's rule, 2026-11-23). Whether a listing is
+ * commercial can depend on its type, so the import checks this once the type is looked up.
+ */
+export function amenitiesRequired({ category, segment }) {
+  return !(category === "real-estate" && segment === "commercial");
+}
+
 /** The room fields a real-estate listing must give, once its type and segment are known. */
 export function roomFieldsRequired({ segment, land }) {
   if (land) return [];
@@ -71,7 +80,8 @@ const blank = (value) => value === undefined || value === null || value === "" |
 
 /** Which of a category's fields must always be there, for the published format and its schema. */
 export function isAlwaysRequired(category, field) {
-  if (["externalId", "title", "name", "description", "features", "amenities", "images"].includes(field.key)) return true;
+  if (field.key === "features") return category !== "real-estate";
+  if (["externalId", "title", "name", "description", "amenities", "images"].includes(field.key)) return true;
   if (field.key === "purpose") return true;
   if (field.key === "propertyType") return category === "real-estate";
   if (category === "developments") return ["projectType", "status", "currency"].includes(field.key);
@@ -89,12 +99,17 @@ export function requirementNote(category, field) {
   if ((ONE_OF[category] || []).some((pair) => pair.includes(field.key))) return "Required in one of its two units.";
   if (field.key in (REQUIRED_WHEN[category] || {})) return "Required when it applies to this listing.";
   if (field.key === "images") return `At least ${MIN_IMAGES} images.`;
+  if (field.key === "features" && category === "real-estate") {
+    return "At least one, for residential properties. Commercial properties have no amenities on LivFinder, so none are needed and any sent are left off with a warning.";
+  }
   if (field.key === "country") return "Required unless locationId is given.";
-  if (field.key === "propertySegment") return "Required for a plot or a whole building; otherwise taken from propertyType.";
+  if (field.key === "propertySegment") return "Required when the type can be either (Villa, Land, Full or Half Floor, Whole Building, Bulk Sale / Rent Unit, Hotel & Hotel Apartment); otherwise taken from propertyType.";
   if (field.key === "state") return "Required only if the country has states but no cities on LivFinder.";
   if (field.key === "city") return "Required where the country has cities on LivFinder.";
   if (field.key === "community") return "Required where the city has communities on LivFinder.";
   if (field.key === "subCommunity") {
+    // Developments still need full depth (developmentImport.service.js); listings do not.
+    if (category === "developments") return "Required where the community has sub-communities on LivFinder.";
     return "Give it where the community has sub-communities on LivFinder. Without it, or with one LivFinder does not have yet, the listing goes in under its community, with a warning.";
   }
   if (field.key === "price" || field.key === "currency") return "Required unless priceType is on_request.";
@@ -145,7 +160,10 @@ export function missingRequired(category, record) {
       if (blank(record.price)) say("price", "Give a price, or set priceType to on_request.");
       if (blank(record.currency)) say("currency");
     }
-    if (!record.features?.length) say("features", "Give at least one amenity or feature.");
+    // Real estate: only a record that says it is residential can be checked here; the rest waits
+    // for the type lookup (amenitiesRequired, from listingImport.service).
+    const featuresNeeded = category !== "real-estate" || saysResidential(record);
+    if (!record.features?.length && featuresNeeded) say("features", "Give at least one amenity or feature.");
     // Off plan is for sale only (completionStatus.js).
     if (category === "real-estate" && record.purpose === "rent" && OFF_PLAN_STATUSES.includes(record.detail?.completionStatus)) {
       say("completionStatus", OFF_PLAN_RENT_MESSAGE);

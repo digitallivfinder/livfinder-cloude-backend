@@ -1,5 +1,6 @@
 import path from "node:path";
 import { normalizeSegment } from "../search/propertySegments.js";
+import { DEFAULT_SEGMENT_FOR_BOTH, amenityLookupSlug, currentTypeCode } from "../search/realEstateCatalogue.js";
 import { z } from "zod";
 import env from "../../config/env.js";
 import { getPool } from "../../db/pool.js";
@@ -152,8 +153,10 @@ export function payloadHash(record) {
 /* Resolving the partner's words into ours                                     */
 /* -------------------------------------------------------------------------- */
 
-async function resolvePropertyType(definition, value) {
-  if (!value) return undefined;
+async function resolvePropertyType(definition, rawValue, purpose = null) {
+  if (!rawValue) return undefined;
+  // Real estate: PF's two-letter codes and LivFinder's pre-0083 codes (plot, mansion …).
+  const value = definition.listingType === "real-estate" ? currentTypeCode(rawValue, purpose) : rawValue;
   const slug = slugify(value);
   const row = await queryOne(
     // By code, slug or name — "Labour Camp" and "labour-camp" both find the labour-camp type.
@@ -539,29 +542,42 @@ export async function assertLocationComplete(locationId, { subCommunityOptional 
 }
 
 /**
- * The listing's amenities by slug. One LivFinder does not have yet is added to its list, for this
- * category, so the listing shows exactly what the client sent (owner's rule, 2026-10-30).
+ * The listing's amenities, matched to the category's own list (real estate: Property Finder's 23,
+ * 0083). An amenity that is not on the list is left off and reported, and the listing is still
+ * accepted (owner's rule, 2026-11-23; it replaces 2026-10-30's "add whatever the client sends").
+ * PF's codes (BA, SP …) and earlier LivFinder names (Terrace, Sea view …) are matched first.
  */
-async function ensureFeatures(rootId, names) {
-  const slugs = [];
-  for (const name of [...new Set((names || []).map((value) => String(value).trim()).filter(Boolean))]) {
-    const slug = slugify(name);
-    const lookup = () => queryOne("SELECT id, slug FROM features WHERE slug = ? OR code = ? OR LOWER(name) = LOWER(?) LIMIT 1", [slug, slug, name]);
-    let feature = await lookup();
-    if (!feature) {
-      await execute("INSERT IGNORE INTO features (code, slug, name, created_at) VALUES (?, ?, ?, NOW(3))", [slug, slug, name.slice(0, 120)]);
-      feature = await lookup();
-    }
-    await execute("INSERT IGNORE INTO category_features (category_id, feature_id, sort_order) VALUES (?, ?, 999)", [rootId, feature.id]);
-    slugs.push(feature.slug);
+async function resolveFeatures({ rootId, listingType, segment, names, warnings }) {
+  const sent = [...new Set((names || []).map((value) => String(value).trim()).filter(Boolean))];
+  if (!sent.length) return [];
+  if (listingType === "real-estate" && segment === "commercial") {
+    warnings.push(
+      `Amenities are not used for commercial properties on LivFinder, so these were not added: ${sent.join(", ")}.`
+    );
+    return [];
   }
-  return slugs;
+  const slugs = [];
+  const unknown = [];
+  for (const name of sent) {
+    const lookup = amenityLookupSlug(name, slugify);
+    const feature = await queryOne(
+      `SELECT f.slug FROM features f JOIN category_features cf ON cf.feature_id = f.id AND cf.category_id = ?
+        WHERE f.slug = ? OR f.code = ? OR LOWER(f.name) = LOWER(?) LIMIT 1`,
+      [rootId, lookup, lookup, name]
+    );
+    if (feature) slugs.push(feature.slug);
+    else unknown.push(name);
+  }
+  for (const name of unknown) {
+    warnings.push(`Amenity "${name}" is not in LivFinder's amenity list, so it was not added. Please choose an alternative from the list.`);
+  }
+  return [...new Set(slugs)];
 }
 
 async function buildPayload({ record, definition, client }) {
   const warnings = [];
   // Imported here, not at the top: the feed formats are built from this module's schema.
-  const { missingRequired, roomFieldsRequired } = await import("../feeds/listingRequirements.js");
+  const { missingRequired, roomFieldsRequired, amenitiesRequired } = await import("../feeds/listingRequirements.js");
   const missing = missingRequired(record.category, record);
   if (Object.keys(missing).length) throw importValidationError(missing);
 
@@ -580,7 +596,7 @@ async function buildPayload({ record, definition, client }) {
   // Settled together, so a listing with an unknown type and an unknown place reports both at once.
   const locationNotes = {};
   const settled = await Promise.allSettled([
-    resolvePropertyType(definition, record.propertyType),
+    resolvePropertyType(definition, record.propertyType, purpose || "sale"),
     resolveImportLocation(record.location, { keepUnknownSubCommunity: true, notes: locationNotes }).then(async (id) => {
       // An unknown sub-community was given, so the community is as deep as this listing can go.
       if (!locationNotes.unknownSubCommunity) {
@@ -627,13 +643,18 @@ async function buildPayload({ record, definition, client }) {
       "SELECT code, property_segment FROM categories WHERE code = ? AND root_category_id = ? LIMIT 1",
       [categorySlug, definition.rootId]
     );
-    const single = ["residential", "commercial"].includes(type?.property_segment) ? type.property_segment : null;
+    const single = ["residential", "commercial"].includes(type?.property_segment)
+      ? type.property_segment
+      : DEFAULT_SEGMENT_FOR_BOTH[type?.code] || null;
     const segment = record.propertySegment || single;
-    const land = ["plot", "industrial-land"].includes(type?.code);
+    const land = type?.code === "land";
     const blankDetail = (key) => record.detail?.[key] === undefined || record.detail?.[key] === null || record.detail?.[key] === "";
     const missingRooms = Object.fromEntries(
       roomFieldsRequired({ segment, land }).filter(blankDetail).map((key) => [key, "This is required."])
     );
+    if (!record.features?.length && amenitiesRequired({ category: "real-estate", segment })) {
+      missingRooms.features = "Give at least one amenity or feature.";
+    }
     if (Object.keys(missingRooms).length) throw importValidationError(missingRooms);
   }
 
@@ -815,7 +836,19 @@ export async function importListing({ client, ctx, record, source = "api", impor
       });
     }
     for (const failure of failedImages) warnings.push(`Image not added (${failure.reason}): ${failure.url}`);
-    payload.features = await ensureFeatures(definition.rootId, record.features);
+    const typeSegment =
+      definition.listingType === "real-estate" && payload.categorySlug
+        ? await queryValue("SELECT property_segment FROM categories WHERE code = ? AND root_category_id = ? LIMIT 1", [payload.categorySlug, definition.rootId])
+        : null;
+    payload.features = await resolveFeatures({
+      rootId: definition.rootId,
+      listingType: definition.listingType,
+      segment:
+        payload.propertySegment ||
+        (["residential", "commercial"].includes(typeSegment) ? typeSegment : DEFAULT_SEGMENT_FOR_BOTH[payload.categorySlug] || null),
+      names: record.features,
+      warnings,
+    });
 
     let operation;
     if (!listing) {

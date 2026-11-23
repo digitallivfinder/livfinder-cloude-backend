@@ -65,7 +65,7 @@ beforeAll(async () => {
     address: "Plot 12, Test Boulevard",
     latitude: 25.0657,
     longitude: 55.17128,
-    amenities: ["Infinity pool", "Padel courts"],
+    amenities: ["Infinity pool", "Padel courts"], // PF's list (0083): Shared Pool; padel courts are not on it
     unitTypes: [
       { unitType: "apartment", bedrooms: 1, minSize: 720, maxSize: 860, areaUnit: "sqft", startingPrice: 1850000, currencyCode: "AED", availability: "available", totalUnits: 120, availableUnits: 96 },
       { unitType: "penthouse", bedrooms: 4, minSize: 3900, maxSize: 4600, areaUnit: "sqft", startingPrice: 9400000, currencyCode: "AED", availability: "limited", totalUnits: 8, availableUnits: 2 },
@@ -506,7 +506,7 @@ describe("detail", () => {
     expect(data.unitTypeDetails).toHaveLength(2);
     expect(data.paymentPlans).toHaveLength(2);
     expect(data.paymentPlans[0].milestones).toHaveLength(3);
-    expect(data.amenities.map((amenity) => amenity.label)).toEqual(["Infinity pool", "Padel courts"]);
+    expect(data.amenities.map((amenity) => amenity.label)).toEqual(["Shared Pool"]);
     expect(data.highlights).toEqual(["Private marina", "Sky lounge"]);
     expect(data.marketingHeading).toBe("Every field, persisted");
     expect(data.related.recent.every((row) => row.id !== project.public_id)).toBe(true);
@@ -603,7 +603,7 @@ describe("admin write contract", () => {
     expect(record.unitTypes).toHaveLength(2);
     expect(record.paymentPlans).toHaveLength(2);
     expect(record.paymentPlans[0].milestones).toHaveLength(3);
-    expect(record.amenities).toEqual(["Infinity pool", "Padel courts"]);
+    expect(record.amenities).toEqual(["Shared Pool"]);
   });
 
   it("returns the developer as an object", () => {

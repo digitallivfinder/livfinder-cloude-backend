@@ -340,8 +340,11 @@ describe("single push", () => {
       location: { country: location.country_name, city: location.city_name },
     });
     expect(response.status).toBe(422);
-    // Bedrooms wait for Residential / Commercial (none given here); bathrooms apply to any building.
-    expect(Object.keys(response.body.error.fields)).toEqual(expect.arrayContaining(["purpose", "description", "bathrooms", "features", "images"]));
+    // Bedrooms and amenities wait for Residential / Commercial (none given here: commercial needs
+    // no amenity since 2026-11-23); bathrooms apply to any building.
+    const fields = Object.keys(response.body.error.fields);
+    expect(fields).toEqual(expect.arrayContaining(["purpose", "description", "bathrooms", "images"]));
+    expect(fields).not.toContain("features");
   });
 
   it("refuses a company's listing with no agent", async () => {
@@ -472,22 +475,21 @@ describe("single push", () => {
     });
   });
 
-  it("adds an amenity LivFinder does not have, and the listing shows it", async () => {
+  it("keeps the listing but leaves off an amenity that is not on LivFinder's list, and says so", async () => {
+    // Property Finder's list since 0083; PF codes and earlier names (Sea view) still match.
     const id = ext("amenity");
     const amenity = `QA rooftop cinema ${suffix}`;
-    const response = await as(writeKey).put(`/v1/partner/listings/${id}`, listing(id, { features: ["Private pool", amenity] }));
+    const response = await as(writeKey).put(`/v1/partner/listings/${id}`, listing(id, { features: ["Private pool", "SP", "Sea view", amenity] }));
     expect(response.status).toBe(201);
+    expect(response.body.data.warnings.join(" ")).toMatch(new RegExp(`Amenity "${amenity}" is not in LivFinder's amenity list`));
     const row = await queryOne("SELECT id FROM listings WHERE public_id = ?", [response.body.data.listingId]);
     createdListingIds.add(row.id);
-    const feature = await queryOne(
-      `SELECT f.id, f.name FROM features f JOIN listing_features lf ON lf.feature_id = f.id WHERE lf.listing_id = ? AND f.name = ?`,
-      [row.id, amenity]
-    );
-    expect(feature).toBeTruthy();
-    expect(await queryOne("SELECT 1 AS ok FROM category_features WHERE category_id = 1 AND feature_id = ?", [feature.id])).toBeTruthy();
-    await execute("DELETE FROM listing_features WHERE feature_id = ?", [feature.id]);
-    await execute("DELETE FROM category_features WHERE feature_id = ?", [feature.id]);
-    await execute("DELETE FROM features WHERE id = ?", [feature.id]);
+    const names = (await query(
+      "SELECT f.name FROM features f JOIN listing_features lf ON lf.feature_id = f.id WHERE lf.listing_id = ? ORDER BY f.sort_order",
+      [row.id]
+    )).map((feature) => feature.name);
+    expect(names).toEqual(["Shared Pool", "View of Water", "Private Pool"]);
+    expect(await query("SELECT id FROM features WHERE name = ?", [amenity])).toHaveLength(0);
   });
 
   it("explains what to fix, with the partner's field names, and records the failure", async () => {

@@ -1,3 +1,4 @@
+import { normalizePurpose, offeredForCondition } from "../search/realEstateCatalogue.js";
 import { query } from "../../db/query.js";
 import { resolveCategory } from "../../utils/categories.js";
 import { SPEC_MAP } from "../search/searchFilters.js";
@@ -174,7 +175,7 @@ export async function listModels(listingType, { brandSlug = null, q = null, limi
 }
 
 /** Sub-categories, e.g. the real-estate property types or the yacht types. */
-export async function listCategoryTypes(listingType, { q = null, limit = 60, segment = null, all = false } = {}) {
+export async function listCategoryTypes(listingType, { q = null, limit = 60, segment = null, purpose = null, all = false } = {}) {
   const definition = resolveCategory(listingType);
   if (!definition) return [];
   const safeLimit = Math.min(200, Math.max(1, Number(limit) || 60));
@@ -196,6 +197,13 @@ export async function listCategoryTypes(listingType, { q = null, limit = 60, seg
   if (seg) {
     filter += " AND c.property_segment IN (?, 'both')";
     params.push(seg);
+  }
+  // Buy or Rent: some types are offered for one only in a segment (Property Finder's rules, 0083).
+  const purposeCode = definition.listingType === "real-estate" ? normalizePurpose(purpose) : null;
+  const offered = offeredForCondition({ segment: seg, purpose: ["sale", "rent"].includes(purposeCode) ? purposeCode : null });
+  if (offered) {
+    filter += ` AND ${offered.sql}`;
+    params.push(...offered.params);
   }
   /**
    * Counted from the projection, and ordered by it.
@@ -327,9 +335,11 @@ async function enumOptions(table, column, type) {
  * The amenities a marketplace offers, from the feature catalogue linked to its root category —
  * never from what listings happen to carry. Each row names its group so a menu can section them.
  */
-async function listAmenities(listingType, { q = null } = {}) {
+async function listAmenities(listingType, { q = null, segment = null } = {}) {
   const definition = resolveCategory(listingType);
   if (!definition) return [];
+  // Property Finder offers no amenities for commercial property (0083).
+  if (definition.listingType === "real-estate" && segment === "commercial") return [];
   const params = [definition.rootId];
   let filter = "";
   if (q) {
@@ -371,7 +381,7 @@ const FACET_KEY_COLUMN = {
  * `filterKey` is the frontend's own naming (carModel, yachtType, brand …); the
  * mapping to a data source lives here so the frontend keeps its vocabulary.
  */
-export async function filterOptions(category, filterKey, { q = null, parent = null, limit = 30, preferCountry = null, all = false } = {}) {
+export async function filterOptions(category, filterKey, { q = null, parent = null, purpose = null, segment = null, limit = 30, preferCountry = null, all = false } = {}) {
   const definition = resolveCategory(category);
   const listingType = definition?.listingType || "real-estate";
 
@@ -426,8 +436,9 @@ export async function filterOptions(category, filterKey, { q = null, parent = nu
 
   if (["propertyType", "category", "assetType"].includes(filterKey)) {
     // Real estate's `parent` is the Residential / Commercial segment; `all` is the forms' full list.
-    const segment = listingType === "real-estate" && isPropertySegment(parent) ? parent : null;
-    return listCategoryTypes(listingType, { q, limit, segment, all });
+    const typeSegment =
+      listingType !== "real-estate" ? null : isPropertySegment(parent) ? parent : isPropertySegment(segment) ? segment : null;
+    return listCategoryTypes(listingType, { q, limit, segment: typeSegment, purpose, all });
   }
 
   if (listingType === "real-estate" && filterKey === "propertySegment") {
@@ -450,7 +461,7 @@ export async function filterOptions(category, filterKey, { q = null, parent = nu
   }
 
   if (filterKey === "amenities") {
-    return listAmenities(listingType, { q });
+    return listAmenities(listingType, { q, segment: isPropertySegment(segment) ? segment : isPropertySegment(parent) ? parent : null });
   }
 
   const column = FACET_KEY_COLUMN[listingType]?.[filterKey];

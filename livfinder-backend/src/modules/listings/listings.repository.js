@@ -7,6 +7,8 @@ const LISTING_COLUMNS = `
   l.*,
   cat.slug AS category_slug, cat.name AS category_name,
   root.code AS root_category_code,
+  -- Residential / Commercial (0077). Read from the table: the public view predates the column.
+  (SELECT seg.property_segment FROM listings seg WHERE seg.id = l.id) AS listing_property_segment,
   pur.slug AS purpose_slug, pur.code AS purpose_code,
   co.slug AS country_slug, co.name AS country_name,
   st.slug AS state_slug,   st.name AS state_name,

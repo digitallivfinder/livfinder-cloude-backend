@@ -361,6 +361,8 @@ router.get(
   asyncHandler(async (req, res) => {
     const definition = resolveCategory(String(req.query.category || ""));
     if (!definition) throw AppError.validation("Some information is invalid.", { category: "Unknown category." });
+    // Property Finder offers no amenities for commercial property (0083).
+    if (definition.listingType === "real-estate" && req.query.segment === "commercial") return res.json(detailResponse([]));
     const rows = await query(
       `SELECT f.id, f.slug, f.name, fg.name AS group_name
          FROM category_features cf
@@ -588,6 +590,10 @@ router.get(
     const options = await optionsRepo.filterOptions(req.params.category, req.params.filterKey, {
       q: req.query.q || null,
       parent: req.query.parent || null,
+      // Real estate: Buy / Rent and Residential / Commercial narrow the property types and
+      // amenities the way Property Finder does (0083).
+      purpose: req.query.purpose || null,
+      segment: req.query.segment || null,
       limit: Number(req.query.limit) || 30,
       // The header's selected country. Orders the location list; never restricts it.
       preferCountry: req.query.preferCountry || null,
