@@ -144,6 +144,13 @@ function listingItem(category, format, values, row) {
 }
 
 function developmentItem(format, entry, row) {
+  // "withdrawn" is not a construction status, so it can only mean: take this development down.
+  // Like a listing, that needs only the id.
+  if (String(entry.values.status ?? "").trim().toLowerCase() === "withdrawn") {
+    const id = String(entry.values.externalId ?? "").trim();
+    if (!id) return { row, externalId: null, record: null, errors: { externalId: "This is required." } };
+    return { row, externalId: id, record: { externalId: id, withdraw: true }, errors: null };
+  }
   const { out, errors } = readFields(format.fields, entry.values);
   const unitTypes = entry.unitTypes.map((unit, index) => {
     const read = readFields(format.unitTypeFields, unit, `unitTypes.${index + 1}.`);

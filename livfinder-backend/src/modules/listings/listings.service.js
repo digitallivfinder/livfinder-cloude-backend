@@ -68,8 +68,7 @@ const DETAIL_COLUMNS = {
     guestsCruising: "guests_cruising", crewCapacity: "crew_capacity", engineMake: "engine_make",
     engineModel: "engine_model", engineHours: "engine_hours",
     cruisingSpeedKnots: "cruising_speed_knots", maxSpeedKnots: "max_speed_knots",
-    rangeNm: "range_nm", homePort: "home_port",
-    isCharterAvailable: "is_charter_available", isVatPaid: "is_vat_paid",
+    rangeNm: "range_nm", homePort: "home_port", isVatPaid: "is_vat_paid",
   },
   jets: {
     aircraftType: "aircraft_type", yearBuilt: "year_built", yearRefurbished: "year_refurbished",
@@ -79,7 +78,6 @@ const DETAIL_COLUMNS = {
     engineCount: "engine_count", engineMake: "engine_make", engineModel: "engine_model",
     engineProgram: "engine_program", avionicsSuite: "avionics_suite",
     interiorConfiguration: "interior_configuration", baseAirportCode: "base_airport_code",
-    isCharterAvailable: "is_charter_available", charterHourlyRate: "charter_hourly_rate",
     nextInspectionDue: "next_inspection_due", serialNumber: "serial_number",
   },
   watches: {

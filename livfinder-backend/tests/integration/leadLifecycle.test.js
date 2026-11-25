@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { client, adminEmail, cleanupListings, ensureTestPassword, execute, queryOne } from "../helpers/testApp.js";
+import { client, adminEmail, cleanupListings, ensureTestPassword, execute, queryOne, ensurePackageForEmail } from "../helpers/testApp.js";
 import { closePool } from "../../src/db/pool.js";
 
 /**
@@ -27,6 +27,13 @@ const createdListings = [];
 const visitorEmails = [];
 
 async function ownerForCategory(categoryId) {
+  // Sellers need a package to publish (0084).
+  const owner = await ownerForCategoryRow(categoryId);
+  if (owner) await ensurePackageForEmail(owner.email);
+  return owner;
+}
+
+async function ownerForCategoryRow(categoryId) {
   return queryOne(
     `SELECT u.email, a.id AS account_id
        FROM users u
@@ -114,7 +121,7 @@ describe.each(CASES)("real lead lifecycle — $category", ({ category, categoryI
     const response = await portal.send("post", "/v1/portal/listings", {
       category,
       categorySlug,
-      purpose: category === "yachts" ? "charter" : "sale",
+      purpose: "sale",
       title: `QA lifecycle ${category} ${Date.now()}`,
       description: `<p>Created by the lead-lifecycle QA suite for ${category}.</p>`,
       price: 500000,
@@ -258,7 +265,7 @@ describe.each(CASES)("real reject-with-reason lifecycle — $category", ({ categ
     const response = await portal.send("post", "/v1/portal/listings", {
       category,
       categorySlug,
-      purpose: category === "yachts" ? "charter" : "sale",
+      purpose: "sale",
       title: `QA reject ${category} ${Date.now()}`,
       description: `<p>Created to exercise the reject path for ${category}.</p>`,
       price: 500000,

@@ -67,6 +67,15 @@ const server = app.listen(env.PORT, async () => {
       logger.error({ err: error }, "listing maintenance could not be started");
     }
   }
+  // IndexNow: announce changed listings, developments and posts to the engines that share it.
+  if (env.NODE_ENV !== "test") {
+    try {
+      const { startIndexNow } = await import("./modules/seo/indexnow.jobs.js");
+      startIndexNow();
+    } catch (error) {
+      logger.error({ err: error }, "indexnow could not be started");
+    }
+  }
   // Time-triggered billing maintenance — no payment provider exists to report a failed renewal
   // or a missed invoice itself, so this applies that outcome once it is genuinely overdue and
   // notifies the account, instead of the account looking permanently current.

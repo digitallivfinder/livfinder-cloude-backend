@@ -4,6 +4,7 @@ import { toAdminPermissions, loadPermissionUniverse } from "./adminPermissions.j
 import { frontendCategoryId } from "../../utils/categories.js";
 import { isoDate } from "../../serializers/primitives.js";
 import { sellerProfileRequired } from "../accounts/sellerApplication.service.js";
+import { accountPackage } from "../accounts/entitlement.js";
 
 /**
  * The session payload the frontend auth guards already read.
@@ -221,6 +222,9 @@ export async function serializeSession(userId, { sessionId = null, activeAccount
         verification_status: accountRow?.verification_status,
         account_type_code: membership.account_type_code,
       }),
+      // The seller's package and whether it works (0084): the portal shows only the basics, and
+      // the package screen, while `active` is false. Null for a Member.
+      package: membership.account_type_code === "personal" ? null : await accountPackage(membership.account_id),
       listingQuota: membership.listing_quota === null ? null : Number(membership.listing_quota),
       listingUsed: Number(membership.listing_used || 0),
       storageQuota: membership.storage_quota == null ? null : Number(membership.storage_quota),

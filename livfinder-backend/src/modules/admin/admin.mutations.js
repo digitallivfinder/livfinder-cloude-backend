@@ -27,6 +27,7 @@ import { approveRevision, closeOpenRevision, rejectRevision } from "../listings/
 import { approveProjectRevision, closeOpenProjectRevision, rejectProjectRevision } from "../projects/projectRevisions.service.js";
 import { ADDON_CODES, disableAddon, enableAddon, listAccountAddons, syncPlanSubscribers, upsertPlanAddons } from "../accounts/addons.service.js";
 import { DEVELOPMENTS_ROOT_ID, assertSellerTypeAllowsCategory, sellerTypeAllowsCategory, sellerTypeFor } from "../accounts/sellerType.js";
+import { accountPackage, setFreeAccess } from "../accounts/entitlement.js";
 
 /**
  * Admin write operations.
@@ -240,12 +241,13 @@ export async function decideVerification({ subjectType, identifier, decision, no
         );
       }
     } else if (subjectType === "agent") {
+      // Only the badge: an agent is already working for their company, and a rejected or
+      // returned document must not take them offline (the company decides that).
       await execute(
-        "UPDATE agents SET verification_status = ?, verified_at = ?, status = ? WHERE id = ?",
+        "UPDATE agents SET verification_status = ?, verified_at = ? WHERE id = ?",
         [
           decision === "approve" ? "verified" : decision === "reject" ? "rejected" : "pending",
           decision === "approve" ? new Date() : null,
-          decision === "approve" ? "active" : "pending",
           subject.id,
         ],
         connection
@@ -1510,6 +1512,11 @@ export const internalUserSchema = z.object({
   phone: optionalPhone,
   roleIds: z.array(z.coerce.number().int().positive()).max(10).optional(),
   status: z.enum(INTERNAL_USER_STATUSES).optional(),
+  // 0085: who the person is at LivFinder — support agents, moderators and editors are users too.
+  jobTitle: z.string().trim().max(120).nullish(),
+  department: z.string().trim().max(120).nullish(),
+  languageIds: z.array(z.coerce.number().int().positive()).max(20).optional(),
+  avatarUrl: z.string().trim().max(500).nullish(),
 });
 
 export async function upsertInternalUser({ identifier, payload, userId }) {
@@ -1527,7 +1534,9 @@ export async function upsertInternalUser({ identifier, payload, userId }) {
       await execute(
         `UPDATE users
             SET first_name = ?, last_name = ?, display_name = ?,
-                phone_country_code = ?, phone_number = ?, status = COALESCE(?, status)
+                phone_country_code = ?, phone_number = ?, status = COALESCE(?, status),
+                job_title = IF(?, ?, job_title), department = IF(?, ?, department),
+                avatar_url = IF(?, ?, avatar_url)
           WHERE id = ?`,
         [
           payload.firstName,
@@ -1536,6 +1545,9 @@ export async function upsertInternalUser({ identifier, payload, userId }) {
           phone.countryCode,
           phone.number,
           payload.status ?? null,
+          payload.jobTitle !== undefined, payload.jobTitle || null,
+          payload.department !== undefined, payload.department || null,
+          payload.avatarUrl !== undefined, payload.avatarUrl || null,
           targetId,
         ],
         connection
@@ -1548,8 +1560,9 @@ export async function upsertInternalUser({ identifier, payload, userId }) {
       const result = await execute(
         `INSERT INTO users
            (public_id, email, email_normalized, phone_country_code, phone_number, password_hash,
-            password_updated_at, status, first_name, last_name, display_name, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, NOW(3), 'pending_verification', ?, ?, ?, NOW(3))`,
+            password_updated_at, status, first_name, last_name, display_name,
+            job_title, department, avatar_url, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, NOW(3), 'pending_verification', ?, ?, ?, ?, ?, ?, NOW(3))`,
         [
           ulid(),
           payload.email,
@@ -1561,6 +1574,9 @@ export async function upsertInternalUser({ identifier, payload, userId }) {
           payload.firstName,
           payload.lastName,
           `${payload.firstName} ${payload.lastName}`,
+          payload.jobTitle || null,
+          payload.department || null,
+          payload.avatarUrl || null,
         ],
         connection
       );
@@ -1581,8 +1597,57 @@ export async function upsertInternalUser({ identifier, payload, userId }) {
       }
     }
 
+    if (payload.languageIds) {
+      await execute("DELETE FROM user_languages WHERE user_id = ?", [targetId], connection);
+      for (const languageId of [...new Set(payload.languageIds)]) {
+        await execute(
+          "INSERT IGNORE INTO user_languages (user_id, language_id) SELECT ?, id FROM languages WHERE id = ?",
+          [targetId, languageId],
+          connection
+        );
+      }
+    }
+
     const publicId = await queryValue("SELECT public_id FROM users WHERE id = ?", [targetId], connection);
     return { id: publicId, userId: String(targetId) };
+  });
+}
+
+/**
+ * Removes a staff user: they can no longer sign in and leave the Users list, while their past
+ * actions, chats and audit entries keep their name (soft delete). The same guards as a status
+ * change apply — not yourself, not the last active Super Administrator. The email is released
+ * so the person can be added again later.
+ */
+export async function deleteInternalUser({ identifier, actorUserId }) {
+  return withTransaction(async (connection) => {
+    const user = await queryOne(
+      "SELECT id, public_id, email FROM users WHERE public_id = ? AND deleted_at IS NULL LIMIT 1",
+      [identifier],
+      connection
+    );
+    if (!user) throw AppError.notFound("That user was not found.");
+    if (String(user.id) === String(actorUserId)) {
+      throw AppError.forbidden("You cannot delete your own account. Ask another administrator to do it.");
+    }
+    await assertAccessChangeAllowed({ targetUserId: user.id, actingUserId: actorUserId, nextStatus: "suspended", nextRoleIds: [] }, connection);
+    const released = `deleted+${user.id}+${user.email}`.slice(0, 255);
+    await execute(
+      `UPDATE users
+          SET deleted_at = NOW(3), status = 'suspended', session_epoch = session_epoch + 1,
+              email = ?, email_normalized = ?
+        WHERE id = ?`,
+      [released, released.toLowerCase(), user.id],
+      connection
+    );
+    await execute("DELETE FROM user_roles WHERE user_id = ?", [user.id], connection);
+    await execute("UPDATE user_sessions SET revoked_at = NOW(3) WHERE user_id = ? AND revoked_at IS NULL", [user.id], connection);
+    await execute(
+      "UPDATE user_tokens SET consumed_at = NOW(3) WHERE user_id = ? AND consumed_at IS NULL",
+      [user.id],
+      connection
+    ).catch(() => {});
+    return { id: user.public_id, email: user.email };
   });
 }
 
@@ -2133,6 +2198,28 @@ export const accountAddonSchema = z.object({
   amount: z.coerce.number().min(0).max(100000000).optional(),
   endsAt: z.string().datetime({ offset: true }).optional().nullable(),
 });
+
+/** Free access (0084) for one company or individual, with the package state it leads to. */
+export async function getAccountFreeAccess(identifier) {
+  const account = await accountForAdmin(identifier);
+  const row = await queryOne(
+    `SELECT a.free_access, a.free_access_at, u.display_name AS granted_by
+       FROM accounts a LEFT JOIN users u ON u.id = a.free_access_by WHERE a.id = ?`,
+    [account.id]
+  );
+  return {
+    enabled: Number(row?.free_access) === 1,
+    grantedAt: row?.free_access_at ?? null,
+    grantedBy: row?.granted_by ?? null,
+    package: await accountPackage(account.id),
+  };
+}
+
+export async function setAccountFreeAccess({ identifier, enabled, userId }) {
+  const account = await accountForAdmin(identifier);
+  await setFreeAccess(account.id, enabled, userId);
+  return getAccountFreeAccess(identifier);
+}
 
 export async function listAccountAddonsFor(identifier) {
   const account = await accountForAdmin(identifier);

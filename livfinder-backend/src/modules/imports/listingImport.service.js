@@ -10,7 +10,7 @@ import { sha256Hex } from "../../utils/ids.js";
 import { safeFetch } from "../../utils/safeFetch.js";
 import { slugify } from "../../utils/slug.js";
 import { CATEGORY_PURPOSES, resolveCategory } from "../../utils/categories.js";
-import { DETAIL_SCHEMAS, createListingSchema, updateListingSchema } from "../listings/listings.schemas.js";
+import { DETAIL_SCHEMAS, createListingSchema, updateListingSchema, withoutRetiredDetails } from "../listings/listings.schemas.js";
 import * as listingsService from "../listings/listings.service.js";
 import { resolveCountryByCode, resolveLocation } from "../locations/locations.repository.js";
 import { MAX_IMAGE_BYTES, storeImage } from "../media/media.service.js";
@@ -589,6 +589,8 @@ async function buildPayload({ record, definition, client }) {
 
   // Detail fields are checked here, with unknown keys refused, so a typo is reported rather than dropped.
   if (record.detail) {
+    // Retired fields (charter, 2026-11-25) are dropped first, so an old feed is not refused for them.
+    record.detail = withoutRetiredDetails(definition.listingType, record.detail);
     const parsed = DETAIL_SCHEMAS[definition.listingType].strict().safeParse(record.detail);
     if (!parsed.success) throw importValidationError(fieldsFromIssues(parsed.error.issues, "detail."));
   }

@@ -143,6 +143,12 @@ is_post_seed_migration() {
     # 0083 moves the seeded listings and developments onto Property Finder's types and amenities.
     0083_property_finder_types_amenities.sql)
       return 0 ;;
+    # 0086 withdraws the seeded rentals and charters outside real estate (only real estate rents).
+    0086_rent_real_estate_only.sql)
+      return 0 ;;
+    # 0084 adds its payments switch beside the seeded payment settings.
+    0084_package_access.sql)
+      return 0 ;;
     # 0071 switches on what the seeded plans include for the seeded subscriptions.
     0071_plan_included_addons.sql)
       return 0 ;;

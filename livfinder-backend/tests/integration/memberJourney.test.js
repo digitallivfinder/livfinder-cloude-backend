@@ -24,7 +24,7 @@ vi.mock("../../src/utils/safeFetch.js", async (original) => ({
   },
 }));
 
-import { client, cleanupUsers, createDisposablePortalOwner, ensureTestPassword, adminEmail, execute, query, queryOne } from "../helpers/testApp.js";
+import { client, cleanupUsers, createDisposablePortalOwner, ensureTestPassword, adminEmail, execute, query, queryOne, ensurePackageForEmail } from "../helpers/testApp.js";
 import { clearSentMessages, sentMessages } from "../../src/modules/system/mail.service.js";
 import { isEncrypted } from "../../src/utils/secrets.js";
 import * as calendar from "../../src/modules/calendar/calendar.service.js";
@@ -273,6 +273,8 @@ describe("Becoming a seller", () => {
     const account = await queryOne("SELECT public_id FROM accounts WHERE id = ?", [user.default_account_id]);
     const decided = await admin.send("patch", `/v1/admin/individuals/${account.public_id}/verification`, { decision: "approve" });
     expect(decided.status).toBe(200);
+    // A seller picks a package before the seller tools open (0084).
+    await ensurePackageForEmail(address);
 
     const session = (await person.send("get", "/v1/auth/session")).body.data;
     expect(session.account.memberType).toBe("personal_seller");
@@ -333,6 +335,8 @@ describe("Becoming a seller", () => {
       [address]
     );
     expect((await admin.send("patch", `/v1/admin/companies/${organization.public_id}/verification`, { decision: "approve" })).status).toBe(200);
+    // A seller picks a package before the seller tools open (0084).
+    await ensurePackageForEmail(address);
     const session = (await person.send("get", "/v1/auth/session")).body.data;
     expect(session.account.memberType).toBe("organization");
     expect((await person.send("get", "/v1/portal/listings")).status).toBe(200);

@@ -52,7 +52,54 @@ export function client() {
 }
 
 /** A demo account owner who can use the portal. */
+/**
+ * Gives a seller account a package (0084): an active subscription to a business plan, unless it
+ * has a live one already. Sellers without a package keep only the portal basics and cannot create
+ * listings, so every suite that publishes as a seller needs one. Idempotent; returns the account id.
+ */
+export async function ensureSellerPackage(accountId) {
+  if (!accountId) return accountId;
+  const live = await queryOne(
+    `SELECT s.id FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+      WHERE s.account_id = ? AND s.status IN ('active', 'trialing') AND p.audience <> 'personal' LIMIT 1`,
+    [accountId]
+  );
+  if (!live) {
+    // A roomy company plan, so seat and listing limits do not get in the suites' way.
+    const plan = await queryOne(
+      `SELECT id FROM plans WHERE audience = 'company'
+        ORDER BY code = 'agency_growth' DESC, agent_seat_quota DESC, id LIMIT 1`
+    );
+    if (!plan) return accountId;
+    await execute(
+      `INSERT INTO subscriptions (public_id, account_id, plan_id, status, billing_interval, amount, currency_code, created_at)
+       VALUES (?, ?, ?, 'active', 'monthly', 0, 'AED', NOW(3))`,
+      [`testpkg${accountId}${Date.now().toString(36)}`.slice(0, 26), accountId, plan.id]
+    );
+  }
+  const { syncPackageHolds } = await import("../../src/modules/accounts/entitlement.js");
+  await syncPackageHolds(accountId).catch(() => {});
+  return accountId;
+}
+
+/** `ensureSellerPackage` for the account an owner (by email) runs. */
+export async function ensurePackageForEmail(email) {
+  const row = await queryOne(
+    `SELECT am.account_id FROM users u
+       JOIN account_members am ON am.user_id = u.id AND am.role = 'owner' AND am.status = 'active'
+      WHERE u.email_normalized = LOWER(?) ORDER BY am.account_id LIMIT 1`,
+    [email]
+  );
+  return ensureSellerPackage(row?.account_id);
+}
+
 export async function findPortalOwner() {
+  const owner = await findPortalOwnerRow();
+  if (owner) await ensureSellerPackage(owner.account_id);
+  return owner;
+}
+
+async function findPortalOwnerRow() {
   return queryOne(
     `SELECT u.id, u.email, am.account_id, a.public_id AS account_public_id, o.id AS organization_id
        FROM users u
@@ -281,6 +328,8 @@ export async function createDisposablePortalOwner({ prefix = "disposable-owner",
     [email]
   );
   const user = await queryOne("SELECT id, public_id, email FROM users WHERE email_normalized = ?", [email]);
+  const account = await queryOne("SELECT id FROM accounts WHERE owner_user_id = ?", [user.id]);
+  await ensureSellerPackage(account?.id);
   return { id: user.id, publicId: user.public_id, email: user.email };
 }
 

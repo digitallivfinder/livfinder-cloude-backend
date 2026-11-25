@@ -1,5 +1,6 @@
 import { currentAmenitySlugs } from "../search/realEstateCatalogue.js";
 import { query, queryOne, queryValue } from "../../db/query.js";
+import { heldProjectsCondition } from "../accounts/entitlement.js";
 import { PROJECT_TYPES_BY_SEGMENT } from "../search/propertySegments.js";
 import { parseAmenities } from "../search/searchFilters.js";
 import { resolveLocation } from "../locations/locations.repository.js";
@@ -299,6 +300,10 @@ export async function buildProjectQuery(filters = {}) {
     params.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`, `%${keyword}%`);
   }
 
+  // A developer without a working package stays out of the Developments search (0084).
+  const held = await heldProjectsCondition("ps");
+  if (held) conditions.push(held);
+
   return {
     impossible: false,
     where: conditions.length ? `WHERE ${conditions.join(" AND ")}` : "",
@@ -580,11 +585,14 @@ export async function getProjectChildren(projectId, { includeGatedDocuments = fa
 /** Similar projects, other projects by the same developer, recently launched. */
 export async function getRelatedProjects(row, { limit = 6 } = {}) {
   const exclude = row.project_id;
+  // Held developers' projects stay off these lists too (0084).
+  const held = await heldProjectsCondition("ps");
+  const andHeld = held ? `AND ${held}` : "";
   const [similar, byDeveloper, recent] = await Promise.all([
     query(
       `SELECT ${CARD_COLUMNS} FROM project_search ps ${CARD_JOINS}
         WHERE ps.project_id <> ?
-          AND (ps.community_id = ? OR ps.city_id = ? OR ps.country_id = ?)
+          AND (ps.community_id = ? OR ps.city_id = ? OR ps.country_id = ?) ${andHeld}
         ORDER BY (ps.community_id = ?) DESC, (ps.city_id = ?) DESC, ps.is_featured DESC, ps.published_at DESC
         LIMIT ${Number(limit)}`,
       [exclude, row.community_id, row.city_id, row.country_id, row.community_id, row.city_id]
@@ -592,7 +600,7 @@ export async function getRelatedProjects(row, { limit = 6 } = {}) {
     row.developer_brand_id
       ? query(
           `SELECT ${CARD_COLUMNS} FROM project_search ps ${CARD_JOINS}
-            WHERE ps.developer_brand_id = ? AND ps.project_id <> ?
+            WHERE ps.developer_brand_id = ? AND ps.project_id <> ? ${andHeld}
             ORDER BY ps.is_featured DESC, ps.published_at DESC
             LIMIT ${Number(limit)}`,
           [row.developer_brand_id, exclude]
@@ -600,7 +608,7 @@ export async function getRelatedProjects(row, { limit = 6 } = {}) {
       : Promise.resolve([]),
     query(
       `SELECT ${CARD_COLUMNS} FROM project_search ps ${CARD_JOINS}
-        WHERE ps.project_id <> ? AND ps.launch_date IS NOT NULL
+        WHERE ps.project_id <> ? AND ps.launch_date IS NOT NULL ${andHeld}
         ORDER BY ps.launch_date DESC
         LIMIT ${Number(limit)}`,
       [exclude]

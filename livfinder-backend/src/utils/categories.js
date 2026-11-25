@@ -100,9 +100,11 @@ export function listingTypeFor(rootId) {
 export const CATEGORY_PURPOSES = Object.freeze({
   "real-estate": ["sale", "rent"],
   "real-estate-developments": ["sale"],
-  cars: ["sale", "rent"],
-  yachts: ["sale", "charter"],
-  jets: ["sale", "charter"],
-  helicopters: ["sale", "charter"],
+  // Real estate is the only marketplace that rents (owner, 2026-11-25): cars, yachts and aircraft
+  // are sale only, with no rent or charter.
+  cars: ["sale"],
+  yachts: ["sale"],
+  jets: ["sale"],
+  helicopters: ["sale"],
   watches: ["sale"],
 });

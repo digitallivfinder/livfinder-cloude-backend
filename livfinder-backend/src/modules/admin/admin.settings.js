@@ -443,8 +443,12 @@ export async function listAdminAccessUsers({ status = "all", search = "", roleId
   const [rows, total, summary] = await Promise.all([
     query(
       `SELECT u.id, u.public_id, u.first_name, u.last_name, u.display_name, u.email, u.phone_e164,
-              u.status, u.avatar_url, u.last_login_at, u.created_at, u.updated_at,
-              GROUP_CONCAT(r.id) AS role_ids, GROUP_CONCAT(r.name) AS role_names
+              u.status, u.avatar_url, u.job_title, u.department, u.last_login_at, u.created_at, u.updated_at,
+              GROUP_CONCAT(r.id) AS role_ids, GROUP_CONCAT(r.name) AS role_names,
+              (SELECT GROUP_CONCAT(lang.id ORDER BY lang.sort_order, lang.name)
+                 FROM user_languages ul JOIN languages lang ON lang.id = ul.language_id WHERE ul.user_id = u.id) AS language_ids,
+              (SELECT GROUP_CONCAT(lang.name ORDER BY lang.sort_order, lang.name SEPARATOR '|')
+                 FROM user_languages ul JOIN languages lang ON lang.id = ul.language_id WHERE ul.user_id = u.id) AS language_names
          FROM users u
          LEFT JOIN user_roles ur ON ur.user_id = u.id
          LEFT JOIN roles r ON r.id = ur.role_id
@@ -478,8 +482,10 @@ export async function listAdminAccessUsers({ status = "all", search = "", roleId
       email: row.email,
       phone: row.phone_e164,
       avatar: row.avatar_url,
-      jobTitle: (row.role_names || "").split(",")[0] || null,
-      department: null,
+      jobTitle: row.job_title || null,
+      department: row.department || null,
+      languageIds: (row.language_ids || "").split(",").filter(Boolean),
+      languages: (row.language_names || "").split("|").filter(Boolean),
       status: row.status,
       roleId: (row.role_ids || "").split(",")[0] || null,
       roleIds: (row.role_ids || "").split(",").filter(Boolean),
@@ -512,6 +518,8 @@ export async function getAdminAccessUser(identifier) {
   );
   return {
     ...user,
+    // The Edit User drawer on the detail page picks languages from this list.
+    languageOptions: result.options.languages ?? [],
     activity: activity.map((entry) => ({
       action: entry.action,
       details: entry.subject_label || entry.subject_type,
@@ -747,6 +755,8 @@ async function accessUserOptions() {
       permissionCount: byId.get(String(role.id))?.permissionCount ?? 0,
     })),
     statuses: options.staticOptions(["active", "suspended", "pending_verification", "banned"]),
+    languages: (await query("SELECT id, name FROM languages WHERE is_active = 1 ORDER BY sort_order, name"))
+      .map((row) => ({ value: String(row.id), label: row.name })),
   };
 }
 

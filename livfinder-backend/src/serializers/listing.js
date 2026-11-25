@@ -59,10 +59,16 @@ export function serializeListingCard(row) {
     agentSlug: row.agent_slug || null,
     agentName: row.agent_name || null,
     agentPhoto: row.agent_photo_url || null,
+    // Card contact buttons (fallback order in the search query). Email opens the enquiry
+    // form, which reaches the agent or the company, so it is always on and carries no address.
+    contactPhone: row.card_phone || null,
+    contactWhatsapp: row.card_whatsapp || null,
+    emailEnquiry: true,
     featured: bool(row.is_featured),
     sponsored: bool(row.is_premium),
     verified: bool(row.is_verified),
     exclusive: bool(row.is_exclusive),
+    isNewListing: bool(row.is_new_listing),
     hasVirtualTour: bool(row.has_virtual_tour),
     specs,
     specValues: {
@@ -183,7 +189,6 @@ const DETAIL_BUILDERS = {
     maxSpeedKnots: num(detail.max_speed_knots),
     rangeNm: int(detail.range_nm),
     homePort: detail.home_port || null,
-    isCharterAvailable: bool(detail.is_charter_available),
     isVatPaid: bool(detail.is_vat_paid),
   }),
   jets: aviationDetail,
@@ -238,8 +243,6 @@ function aviationDetail(detail) {
     interiorConfiguration: detail.interior_configuration || null,
     baseAirportCode: detail.base_airport_code || null,
     nextInspectionDue: isoDay(detail.next_inspection_due),
-    isCharterAvailable: bool(detail.is_charter_available),
-    charterHourlyRate: num(detail.charter_hourly_rate),
     // Serial and registration are controlled disclosures, not public fields.
     serialDisclosure: detail.serial_number ? "on-request" : "not-supplied",
   };

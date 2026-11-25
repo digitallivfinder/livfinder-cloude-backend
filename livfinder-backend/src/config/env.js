@@ -45,6 +45,10 @@ const schema = z.object({
 
   
   FRONTEND_URL: z.string().default("http://localhost:3000"),
+  // IndexNow (modules/seo/indexnow.jobs.js): off unless a key is set and the site URL is a public
+  // https host. The website serves the same key at /indexnow-key.txt (frontend INDEXNOW_KEY).
+  INDEXNOW_KEY: z.string().optional().transform((value) => value || null),
+  INDEXNOW_SITE_URL: z.string().optional().transform((value) => value || null),
   LIVFINDER_ALLOWED_ORIGINS: csv,
   BODY_LIMIT: z.string().default("1mb"),
   TRUST_PROXY: bool(false),
@@ -89,17 +93,15 @@ const schema = z.object({
   SMTP_PASSWORD: z.string().optional().transform((value) => value || null),
   // "true" forces TLS from the first byte (port 465); otherwise STARTTLS is used when offered.
   SMTP_SECURE: z.string().optional().transform((value) => (value ? ["1", "true", "yes"].includes(value.toLowerCase()) : null)),
-  // The name shown beside MAIL_FROM in the inbox, and where replies to no-reply mail should go.
+  // The name shown beside MAIL_FROM in the inbox, and where replies to no-reply mail should go
+  // (EMAIL_SUPPORT_ADDRESS when unset). Owner, 2026-11-24: LivFinder mail uses only the no-reply
+  // sender and the support address — no other LivFinder addresses.
   MAIL_FROM_NAME: z.string().default("LivFinder"),
   MAIL_REPLY_TO: z.string().optional().transform((value) => value || null),
-  // Optional separate senders for digests and the newsletter; MAIL_FROM when unset.
-  MAIL_FROM_ALERTS: z.string().optional().transform((value) => value || null),
-  MAIL_FROM_NEWS: z.string().optional().transform((value) => value || null),
   // Where email images (the logo) are served from. FRONTEND_URL when unset.
   EMAIL_ASSET_BASE_URL: z.string().optional().transform((value) => value || null),
-  // Printed in every email footer.
+  // Printed in every email footer. No place: LivFinder is international (owner, 2026-11-24).
   EMAIL_LEGAL_NAME: z.string().default("LivFinder"),
-  EMAIL_LEGAL_ADDRESS: z.string().default("Dubai, United Arab Emirates"),
   EMAIL_SUPPORT_ADDRESS: z.string().default("support@livfinder.com"),
   // Shared secret the mail provider's bounce and complaint webhook must send (?secret= or header).
   EMAIL_WEBHOOK_SECRET: z.string().optional().transform((value) => value || null),

@@ -2,6 +2,7 @@ import { query, queryOne, queryValue } from "../../db/query.js";
 import { agentIn, applyColumnFilters, csvList, referenceNumber } from "../../utils/columnFilters.js";
 import { bool, int, isoDate, isoDay, num } from "../../serializers/primitives.js";
 import { funnelStepOf } from "../leads/leadFunnel.js";
+import { agentInquiryClause, agentLeadClause, agentOfferClause } from "./agentScope.js";
 import { PORTAL_LISTING_COLUMNS, PORTAL_LISTING_JOINS, serializePortalListing, formatMoney, relativeTime, rootIdForFrontendCategory, titleize } from "./portal.repository.js";
 
 /**
@@ -56,10 +57,15 @@ const INQUIRY_FILTERS = [
   { type: "in", key: "statusIn", column: "i.status" },
 ];
 
-export async function listInquiries({ accountId, organizationId, search = "", listing = "all", category = "all", status = "all", from, to, sort = "newest", page = 1, pageSize = 10, ...columnFilters }) {
+export async function listInquiries({ accountId, organizationId, agentId = null, search = "", listing = "all", category = "all", status = "all", from, to, sort = "newest", page = 1, pageSize = 10, ...columnFilters }) {
   const scope = scopeClause("i", { accountId, organizationId });
   const conditions = [scope.sql, "i.deleted_at IS NULL", "i.is_spam = 0"];
   const params = [...scope.params];
+  if (agentId != null) {
+    const own = agentInquiryClause("i", agentId);
+    conditions.push(own.sql);
+    params.push(...own.params);
+  }
 
   if (status !== "all") {
     conditions.push("i.status = ?");
@@ -112,6 +118,7 @@ export async function listInquiries({ accountId, organizationId, search = "", li
                 WHERE ld.id = COALESCE(i.lead_id, (SELECT li.lead_id FROM lead_inquiries li WHERE li.inquiry_id = i.id LIMIT 1))) AS lead_public_id,
               pj.public_id AS project_public_id, pj.name AS project_name,
               pj.canonical_path AS project_path, pj.is_publicly_visible AS project_visible,
+              pj.cover_image_url AS project_cover_image_url,
               (SELECT c.public_id FROM conversations c WHERE c.inquiry_id = i.id
                 ORDER BY c.last_message_at DESC LIMIT 1) AS conversation_public_id,
               ${PORTAL_LISTING_COLUMNS.replaceAll("l.", "l.")}
@@ -134,12 +141,13 @@ export async function listInquiries({ accountId, organizationId, search = "", li
       params
     ),
     queryValue(`SELECT COUNT(*) FROM inquiries i LEFT JOIN listings l ON l.id = i.listing_id LEFT JOIN projects pj ON pj.id = i.project_id ${where}`, params),
-    inquiryCounts({ accountId, organizationId }),
+    inquiryCounts({ accountId, organizationId, agentId }),
     query(
       `SELECT ${PORTAL_LISTING_COLUMNS} FROM listings l ${PORTAL_LISTING_JOINS}
         WHERE l.account_id = ? AND l.deleted_at IS NULL AND l.inquiry_count > 0
+          ${agentId != null ? "AND l.agent_id = ?" : ""}
         ORDER BY l.inquiry_count DESC LIMIT 20`,
-      [accountId]
+      agentId != null ? [accountId, agentId] : [accountId]
     ),
   ]);
 
@@ -164,7 +172,12 @@ export async function listInquiries({ accountId, organizationId, search = "", li
       listing: row.id ? serializePortalListing(row) : null,
       // A development enquiry names its development (it has no listing).
       project: row.project_public_id
-        ? { id: row.project_public_id, name: row.project_name, publicUrl: row.project_visible ? row.project_path : null }
+        ? {
+            id: row.project_public_id,
+            name: row.project_name,
+            publicUrl: row.project_visible ? row.project_path : null,
+            image: row.project_cover_image_url ? { src: row.project_cover_image_url, alt: row.project_name } : null,
+          }
         : null,
       availableActions: inquiryActions(row.entity_status),
     })),
@@ -183,8 +196,10 @@ function inquiryActions(status) {
   return ["reply", "reopen"];
 }
 
-export async function inquiryCounts({ accountId, organizationId }) {
-  const scope = scopeClause("i", { accountId, organizationId });
+export async function inquiryCounts({ accountId, organizationId, agentId = null }) {
+  const base = scopeClause("i", { accountId, organizationId });
+  const own = agentId != null ? agentInquiryClause("i", agentId) : null;
+  const scope = own ? { sql: `${base.sql} AND ${own.sql}`, params: [...base.params, ...own.params] } : base;
   const row = await queryOne(
     `SELECT COUNT(*) AS all_count,
             SUM(i.status = 'new') AS new_count,
@@ -224,9 +239,14 @@ export async function inquiryCounts({ accountId, organizationId }) {
 /* Leads (CRM)                                                                 */
 /* -------------------------------------------------------------------------- */
 
-export async function listLeads({ accountId, organizationId, status = "all", search = "", page = 1, pageSize = 20 }) {
+export async function listLeads({ accountId, organizationId, agentId = null, status = "all", search = "", page = 1, pageSize = 20 }) {
   const conditions = ["l.deleted_at IS NULL"];
   const params = [];
+  if (agentId != null) {
+    const own = agentLeadClause("l", agentId);
+    conditions.push(own.sql);
+    params.push(...own.params);
+  }
   if (organizationId) {
     conditions.push("l.organization_id = ?");
     params.push(organizationId);
@@ -587,8 +607,11 @@ const OFFER_FILTERS = [
   { type: "in", key: "statusIn", column: "o.status" },
 ];
 
-export async function listOffers({ accountId, organizationId, search = "", category = "all", listing = "all", status = "all", sort = "newest", view = "list", page = 1, pageSize = 10, ...columnFilters }) {
-  const scope = scopeClause("o", { accountId, organizationId });
+export async function listOffers({ accountId, organizationId, agentId = null, search = "", category = "all", listing = "all", status = "all", sort = "newest", view = "list", page = 1, pageSize = 10, ...columnFilters }) {
+  const base = scopeClause("o", { accountId, organizationId });
+  // An agent-role member sees offers on their own listings only; the summary below follows.
+  const own = agentId != null ? agentOfferClause("o", agentId) : null;
+  const scope = own ? { sql: `${base.sql} AND ${own.sql}`, params: [...base.params, ...own.params] } : base;
   const conditions = [scope.sql, "o.deleted_at IS NULL"];
   const params = [...scope.params];
 
@@ -654,7 +677,7 @@ export async function listOffers({ accountId, organizationId, search = "", categ
       params
     ),
     queryValue(`SELECT COUNT(*) FROM offers o LEFT JOIN listings l ON l.id = o.listing_id ${where}`, params),
-    offerCounts({ accountId, organizationId }),
+    offerCounts({ accountId, organizationId, agentId }),
     queryOne(
       `SELECT COALESCE(SUM(o.amount_base), 0) AS value_base
          FROM offers o WHERE ${scope.sql} AND o.deleted_at IS NULL AND o.status IN ('submitted','under_review','countered','accepted')`,
@@ -715,8 +738,10 @@ function offerActions(status) {
   return ["view"];
 }
 
-export async function offerCounts({ accountId, organizationId }) {
-  const scope = scopeClause("o", { accountId, organizationId });
+export async function offerCounts({ accountId, organizationId, agentId = null }) {
+  const base = scopeClause("o", { accountId, organizationId });
+  const own = agentId != null ? agentOfferClause("o", agentId) : null;
+  const scope = own ? { sql: `${base.sql} AND ${own.sql}`, params: [...base.params, ...own.params] } : base;
   const row = await queryOne(
     `SELECT COUNT(*) AS all_count,
             SUM(o.status = 'submitted') AS new_count,
@@ -1178,7 +1203,7 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5, ...col
       [accountId]
     ),
     query(
-      `SELECT public_id, code, name, description, tier, billing_interval, listing_quota, storage_quota,
+      `SELECT public_id, code, name, description, tier, audience, billing_interval, listing_quota, storage_quota,
               featured_quota, agent_seat_quota, lead_quota
          FROM plans WHERE is_active = 1 AND is_public = 1 ORDER BY sort_order ASC`,
       []
@@ -1279,6 +1304,7 @@ export async function accountBilling({ accountId, page = 1, pageSize = 5, ...col
       name: plan.name,
       description: plan.description,
       tier: plan.tier,
+      audience: plan.audience,
       interval: plan.billing_interval,
       price: planPrices.get(plan.public_id)?.amount ?? null,
       currency: planPrices.get(plan.public_id)?.currency ?? "AED",
@@ -1454,3 +1480,4 @@ export async function accountPayouts({ accountId, page = 1, pageSize = 10, ...co
 }
 
 export { require_frontendCategoryId as frontendCategoryIdFor, paginate, scopeClause };
+export { agentInquiryClause, agentLeadClause, agentOfferClause };

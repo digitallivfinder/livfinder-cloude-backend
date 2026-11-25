@@ -38,9 +38,10 @@ const IGNORED = [
 ];
 
 const RULES = [
-  [TAGS.listings, /^(listings|listing_.+|featured_placements|promotion_purchases|media_.+|floor_plans|floor_plan_rooms|virtual_tours|tour_.+|video_assets|property_units|search_.+)$/],
+  [TAGS.listings, /^(listings|listing_.+|featured_placements|promotion_purchases|media_.+|floor_plans|floor_plan_rooms|virtual_tours|tour_.+|video_assets|property_units|search_.+|seller_package_holds)$/],
   [TAGS.organizations, /^(organizations|organization_.+|agents|agent_.+|reviews|review_responses|accounts|account_category_access|account_members|users|subscriptions)$/],
-  [TAGS.projects, /^(projects|project_.+|buildings|building_floors)$/],
+  // seller_package_holds (0084) decides which sellers' listings and developments search shows.
+  [TAGS.projects, /^(projects|project_.+|buildings|building_floors|seller_package_holds)$/],
   [TAGS.editorial, /^(posts|post_.+|authors|editorial_.+|pages|page_translations|faqs|kb_.+)$/],
   [TAGS.locations, /^(locations|location_.+)$/],
   [

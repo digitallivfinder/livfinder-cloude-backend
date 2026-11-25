@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { adminEmail, cleanupListings, cleanupUsers, client, createDisposablePortalOwner, ensureTestPassword, execute, organizationSignup, personalSignup, queryOne } from "../helpers/testApp.js";
+import { adminEmail, cleanupListings, cleanupUsers, client, createDisposablePortalOwner, ensureTestPassword, execute, organizationSignup, personalSignup, queryOne, ensurePackageForEmail } from "../helpers/testApp.js";
 import { getStorage } from "../../src/config/storage.js";
 import { closePool } from "../../src/db/pool.js";
 import { clearSentMessages, sentMessages } from "../../src/modules/system/mail.service.js";
@@ -145,6 +145,8 @@ describe("Individual who signed up to sell", () => {
     expect((await decide("individuals", account.public_id, { decision: "approve" })).status).toBe(200);
     expect(sentMessages().some((mail) => mail.to === email && /verified/i.test(mail.subject))).toBe(true);
     expect(await accountOf(email)).toMatchObject({ status: "active", verification_status: "verified", code: "lister" });
+    // A seller picks a package before the seller tools open (0084).
+    await ensurePackageForEmail(email);
     const person = await signIn(email);
     expect((await person.send("get", "/v1/auth/session")).body.data.account.memberType).toBe("personal_seller");
     expect((await person.send("get", "/v1/portal/listings")).status).toBe(200);
@@ -193,8 +195,12 @@ describe("Company that signed up to sell", () => {
     expect(grant.status).toBe("approved");
   });
 
-  it("can list straight away, on no plan yet", async () => {
+  it("lists once it has chosen a package, and not before (0084)", async () => {
     const person = await signIn(email);
+    const blocked = await person.send("get", "/v1/portal/listings");
+    expect(blocked.status).toBe(403);
+    expect(blocked.body.error.code).toBe("PACKAGE_REQUIRED");
+    await ensurePackageForEmail(email);
     const community = await queryOne("SELECT id FROM locations WHERE level = 'community' AND status = 'active' AND active_listing_count > 0 LIMIT 1");
     const created = await person.send("post", "/v1/portal/listings", {
       category: "real-estate", categorySlug: "villas", purpose: "sale", title: `Approved Villa ${suffix}`, description: "Created by a newly approved company in the review test suite, long enough to pass.",

@@ -3,6 +3,7 @@ import { AppError } from "../utils/errors.js";
 import { withoutSecret } from "../utils/redactUrl.js";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
+import { recordSystemError } from "../modules/system/systemLog.js";
 
 export function notFoundHandler(req, res, next) {
   next(AppError.notFound(`No route matches ${req.method} ${req.path}.`));
@@ -49,7 +50,11 @@ export function errorHandler(error, req, res, next) {
       stack: env.isProduction ? undefined : (appError.cause?.stack || appError.stack),
     },
   };
-  if (status >= 500) logger.error(logPayload, "request failed");
+  if (status >= 500) {
+    logger.error(logPayload, "request failed");
+    // System Logs → Errors reads this table; nothing else writes to it.
+    recordSystemError({ req, status, appError });
+  }
   else logger.warn(logPayload, "request rejected");
 
   const body = {

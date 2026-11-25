@@ -279,6 +279,9 @@ export async function listAgents({ organizationId, page = 1, pageSize = 20, sear
   return {
     data: rows.map((row) => ({
       ...serializeAgent(row),
+      // The team page and its Edit form read the job title as `title`; the shared serializer
+      // only names it `role` (with an "Advisor" fallback), so every row read "No title recorded".
+      title: row.title ?? null,
       hasLogin: Boolean(row.user_id),
       isPubliclyVisible: bool(row.is_publicly_visible),
       publicUrl: bool(row.is_publicly_visible) ? `/agents/${row.slug}` : null,

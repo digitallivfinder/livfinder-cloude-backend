@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import sharp from "sharp";
-import { client, cleanupListings, ensureTestPassword, queryOne } from "../helpers/testApp.js";
+import { client, cleanupListings, ensureTestPassword, queryOne, ensurePackageForEmail } from "../helpers/testApp.js";
 import { query } from "../../src/db/query.js";
 import { closePool } from "../../src/db/pool.js";
 
@@ -32,6 +32,13 @@ async function png(seed = 1) {
 
 /** An active portal owner whose account is approved for `categoryId`. */
 async function ownerForCategory(categoryId) {
+  // Sellers need a package to publish (0084).
+  const owner = await ownerForCategoryRow(categoryId);
+  if (owner) await ensurePackageForEmail(owner.email);
+  return owner;
+}
+
+async function ownerForCategoryRow(categoryId) {
   return queryOne(
     `SELECT u.email
        FROM users u

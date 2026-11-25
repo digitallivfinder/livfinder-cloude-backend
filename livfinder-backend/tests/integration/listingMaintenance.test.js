@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { client, adminEmail, cleanupListings, ensureTestPassword, execute, queryOne } from "../helpers/testApp.js";
+import { client, adminEmail, cleanupListings, ensureTestPassword, execute, queryOne, ensurePackageForEmail } from "../helpers/testApp.js";
 import { expireDueListings, runListingMaintenance } from "../../src/modules/listings/listings.jobs.js";
 import { closePool } from "../../src/db/pool.js";
 
@@ -37,6 +37,7 @@ beforeAll(async () => {
       WHERE u.status = 'active' AND u.deleted_at IS NULL
       ORDER BY u.id LIMIT 1`
   );
+  await ensurePackageForEmail(account.email);
   await owner.login(account.email, PASSWORD);
   await admin.login(await adminEmail("super_admin"), PASSWORD);
   await admin.stepUp();

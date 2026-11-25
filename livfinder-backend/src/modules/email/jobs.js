@@ -4,6 +4,7 @@ import { query, queryOne } from "../../db/query.js";
 import { dateOnly, localClock, siteUrl } from "./format.js";
 import { accountUsers, emailStaff, emailUsers, listingSummary, queueEmail, usersByIds } from "./send.js";
 import { sendDueDigests } from "./worker.js";
+import { heldListingsCondition, notHeldAccount, paymentRules } from "../accounts/entitlement.js";
 
 /**
  * Emails that time triggers, not a request: reminders, alerts, digests and reports.
@@ -18,6 +19,8 @@ const day = (date) => new Date(date).toISOString().slice(0, 10);
 /** Listings ending in about 7 days or within a day, and listings that ended in the last 3 days. */
 export async function listingExpiryEmails() {
   let queued = 0;
+  // Sellers without a working package get no automations (0084).
+  const notHeld = await notHeldAccount("l.account_id");
   const windows = [
     { days: 7, sql: "l.expires_at BETWEEN DATE_ADD(NOW(3), INTERVAL 6 DAY) AND DATE_ADD(NOW(3), INTERVAL 7 DAY)" },
     { days: 1, sql: "l.expires_at BETWEEN NOW(3) AND DATE_ADD(NOW(3), INTERVAL 1 DAY)" },
@@ -25,7 +28,7 @@ export async function listingExpiryEmails() {
   for (const window of windows) {
     const rows = await query(
       `SELECT l.id, l.account_id, l.organization_id, l.agent_id, l.expires_at FROM listings l
-        WHERE l.status = 'active' AND l.deleted_at IS NULL AND l.expires_at IS NOT NULL AND ${window.sql} LIMIT 500`
+        WHERE l.status = 'active' AND l.deleted_at IS NULL AND l.expires_at IS NOT NULL AND ${window.sql} AND ${notHeld} LIMIT 500`
     );
     for (const row of rows) {
       const listing = await listingSummary(row.id);
@@ -38,7 +41,7 @@ export async function listingExpiryEmails() {
   }
   const expired = await query(
     `SELECT l.id, l.account_id, l.organization_id, l.agent_id, l.expires_at FROM listings l
-      WHERE l.status = 'expired' AND l.deleted_at IS NULL AND l.expires_at BETWEEN DATE_SUB(NOW(3), INTERVAL 3 DAY) AND NOW(3) LIMIT 500`
+      WHERE l.status = 'expired' AND l.deleted_at IS NULL AND l.expires_at BETWEEN DATE_SUB(NOW(3), INTERVAL 3 DAY) AND NOW(3) AND ${notHeld} LIMIT 500`
   );
   for (const row of expired) {
     const listing = await listingSummary(row.id);
@@ -103,6 +106,7 @@ export async function viewingReminders() {
 
 /** Enquiries with no reply after a day: one reminder per account per day. */
 export async function unansweredLeadReminders() {
+  const notHeld = await notHeldAccount("i.account_id");
   const rows = await query(
     `SELECT i.account_id, i.organization_id, i.name, i.created_at, COALESCE(l.title, p.name, 'your listing') AS about
        FROM inquiries i
@@ -110,7 +114,7 @@ export async function unansweredLeadReminders() {
        LEFT JOIN projects p ON p.id = i.project_id
       WHERE i.status = 'new' AND i.first_response_at IS NULL AND i.deleted_at IS NULL AND COALESCE(i.is_spam, 0) = 0
         AND i.created_at BETWEEN DATE_SUB(NOW(3), INTERVAL 7 DAY) AND DATE_SUB(NOW(3), INTERVAL 24 HOUR)
-        AND i.account_id IS NOT NULL
+        AND i.account_id IS NOT NULL AND ${notHeld}
       ORDER BY i.created_at ASC LIMIT 2000`
   );
   const byAccount = new Map();
@@ -160,10 +164,14 @@ export async function staffDailyQueue() {
 
 /** Invoices due within 3 days, once each. */
 export async function invoiceDueReminders() {
+  // Nobody pays while "Clients must pay" is off, and accounts with free access never do (0084).
+  const { paymentsRequired } = await paymentRules();
+  if (!paymentsRequired) return 0;
   const rows = await query(
     `SELECT i.id, i.invoice_number, i.account_id, i.total, i.currency_code, i.issued_at, i.due_at, p.name AS plan_name
        FROM invoices i LEFT JOIN subscriptions s ON s.id = i.subscription_id LEFT JOIN plans p ON p.id = s.plan_id
-      WHERE i.status NOT IN ('paid', 'void', 'voided', 'draft') AND i.due_at BETWEEN NOW(3) AND DATE_ADD(NOW(3), INTERVAL 3 DAY) LIMIT 500`
+      WHERE i.status NOT IN ('paid', 'void', 'voided', 'draft') AND i.due_at BETWEEN NOW(3) AND DATE_ADD(NOW(3), INTERVAL 3 DAY)
+        AND NOT EXISTS (SELECT 1 FROM accounts fa WHERE fa.id = i.account_id AND fa.free_access = 1) LIMIT 500`
   );
   let queued = 0;
   for (const row of rows) {
@@ -231,6 +239,8 @@ export async function invitationReminders() {
  * purpose and location plus the price and bedroom criteria it stored.
  */
 export async function savedSearchAlerts() {
+  // Alerts match what search shows, so held sellers' listings are left out (0084).
+  const held = await heldListingsCondition("ls");
   const searches = await query(
     `SELECT s.*, u.timezone FROM saved_searches s JOIN users u ON u.id = s.user_id AND u.deleted_at IS NULL
       WHERE s.alerts_enabled = 1 AND s.deleted_at IS NULL AND s.alert_frequency <> 'never' LIMIT 2000`
@@ -251,7 +261,7 @@ export async function savedSearchAlerts() {
     } catch {
       criteria = {};
     }
-    const where = ["ls.listing_id > ?"];
+    const where = ["ls.listing_id > ?", ...(held ? [held] : [])];
     const params = [Number(search.last_result_max_listing_id) || 0];
     if (search.category_id) {
       where.push("(ls.category_id = ? OR ls.root_category_id = ?)");
@@ -308,10 +318,11 @@ export async function savedSearchAlerts() {
 
 /** Price drops in the last day on listings people saved as favourites. */
 export async function priceDropAlerts() {
+  const notHeld = await notHeldAccount("l.account_id");
   const drops = await query(
     `SELECT h.id, h.listing_id, h.old_price, h.new_price, h.change_percentage
        FROM listing_price_history h JOIN listings l ON l.id = h.listing_id AND l.status = 'active' AND l.deleted_at IS NULL
-      WHERE h.new_price < h.old_price AND h.changed_at >= DATE_SUB(NOW(3), INTERVAL 1 DAY) LIMIT 500`
+      WHERE h.new_price < h.old_price AND h.changed_at >= DATE_SUB(NOW(3), INTERVAL 1 DAY) AND ${notHeld} LIMIT 500`
   );
   let queued = 0;
   for (const drop of drops) {
@@ -329,6 +340,7 @@ export async function priceDropAlerts() {
 export async function weeklyReports() {
   const clock = localClock(env.EMAIL_DEFAULT_TIMEZONE);
   if (clock.weekday !== "Mon" || clock.hour < 8) return 0;
+  const notHeld = await notHeldAccount("l.account_id");
   const accounts = await query(
     `SELECT l.account_id, MAX(l.organization_id) AS organization_id,
             SUM(s.stat_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) AND s.stat_date < CURDATE()) AS days,
@@ -337,7 +349,7 @@ export async function weeklyReports() {
             SUM(IF(s.stat_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY), s.inquiries, 0)) AS enquiries,
             SUM(IF(s.stat_date < DATE_SUB(CURDATE(), INTERVAL 7 DAY), s.inquiries, 0)) AS enquiries_before
        FROM listing_daily_stats s JOIN listings l ON l.id = s.listing_id
-      WHERE s.stat_date >= DATE_SUB(CURDATE(), INTERVAL 14 DAY) AND s.stat_date < CURDATE() AND l.account_id IS NOT NULL
+      WHERE s.stat_date >= DATE_SUB(CURDATE(), INTERVAL 14 DAY) AND s.stat_date < CURDATE() AND l.account_id IS NOT NULL AND ${notHeld}
       GROUP BY l.account_id HAVING views > 0 OR enquiries > 0 LIMIT 5000`
   );
   const change = (now, before) => (Number(before) > 0 ? `${now >= before ? "+" : ""}${Math.round(((now - before) / before) * 100)}%` : null);

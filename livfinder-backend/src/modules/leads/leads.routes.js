@@ -9,7 +9,7 @@ import { AppError } from "../../utils/errors.js";
 import { detailResponse } from "../../utils/http.js";
 import { assertAddonActive } from "../accounts/addons.service.js";
 import { auditFromRequest } from "../system/audit.service.js";
-import { requireAccountId } from "../portal/authorization.js";
+import { requireAccountId, restrictedAgentId } from "../portal/authorization.js";
 import { MAX_LEAD_DOCUMENT_BYTES } from "../media/media.service.js";
 import { FUNNEL_STEPS, LOST_REASON_CODES } from "./leadFunnel.js";
 import * as leadsWorkspace from "./portalLeads.service.js";
@@ -133,6 +133,8 @@ const manageLeads = [requireAuth, requireAccountCapability("can_manage_leads")];
 const leadScope = (req) => ({
   accountId: requireAccountId(req),
   organizationId: req.auth.activeMembership?.organization_id ?? null,
+  // An agent-role member may open only their own leads (see agentLeadClause).
+  agentId: restrictedAgentId(req),
 });
 
 // One file at a time, held in memory until it has been checked and stored privately.
@@ -176,6 +178,8 @@ const viewingSchema = z.object({
   scheduledStart: z.string().min(1).max(40),
   location: z.string().trim().max(500).optional(),
   notes: z.string().trim().max(2000).optional(),
+  // Viewings screen → Add Viewing: the listing being viewed, when it is not the lead's own.
+  listingId: z.string().trim().max(40).optional(),
 });
 
 portalLeadsRouter.post(

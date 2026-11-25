@@ -11,7 +11,7 @@ import { AppError } from "../../utils/errors.js";
 import { ownAgentClause } from "../../utils/tenantScope.js";
 import { listResponse, detailResponse } from "../../utils/http.js";
 import { auditFromRequest } from "../system/audit.service.js";
-import { requireAccountId, requireOrganizationId, assertListingAccess } from "./authorization.js";
+import { requireAccountId, requireOrganizationId, assertListingAccess, restrictedAgentId } from "./authorization.js";
 import * as portalRepo from "./portal.repository.js";
 import * as engagement from "./engagement.repository.js";
 import * as listingsService from "../listings/listings.service.js";
@@ -43,6 +43,7 @@ import { agentQualities } from "../quality/profileQuality.js";
 import { loadOptionSets } from "../options/optionSets.js";
 import { rootIdFor } from "../admin/admin.shared.js";
 import "../options/filterOptionSets.js";
+import { accountPackage, dismissPackagePrompt, packageAudiences } from "../accounts/entitlement.js";
 
 const router = Router();
 
@@ -154,7 +155,7 @@ router.get(
   "/dashboard",
   asyncHandler(async (req, res) => {
     const { accountId, organizationId } = scope(req);
-    return res.json(detailResponse(await portalRepo.accountDashboard({ accountId, organizationId })));
+    return res.json(detailResponse(await portalRepo.accountDashboard({ accountId, organizationId, agentId: restrictedAgentId(req) })));
   })
 );
 
@@ -338,7 +339,8 @@ router.get(
   asyncHandler(async (req, res) => {
     const params = q(req);
     const { accountId, organizationId } = scope(req);
-    const result = await engagement.listInquiries({ accountId, organizationId, ...params });
+    // An agent-role member sees only the inquiries for their own listings or assigned to them.
+    const result = await engagement.listInquiries({ ...params, accountId, organizationId, agentId: restrictedAgentId(req) });
     return res.json({
       ...listResponse(result.data, { page: result.page, pageSize: result.pageSize, total: result.total }),
       counts: result.counts,
@@ -363,10 +365,12 @@ router.patch(
   asyncHandler(async (req, res) => {
     const { accountId, organizationId, userId } = scope(req);
     const ownAgent = ownAgentClause({ organizationId, userId });
+    const agentId = restrictedAgentId(req);
+    const own = agentId != null ? engagement.agentInquiryClause("inquiries", agentId) : { sql: "1 = 1", params: [] };
     const inquiry = await queryOne(
       `SELECT id, public_id, status FROM inquiries
-        WHERE public_id = ? AND (account_id = ? OR organization_id = ?) AND deleted_at IS NULL`,
-      [req.params.id, accountId, organizationId]
+        WHERE public_id = ? AND (account_id = ? OR organization_id = ?) AND ${own.sql} AND deleted_at IS NULL`,
+      [req.params.id, accountId, organizationId, ...own.params]
     );
     if (!inquiry) throw AppError.notFound("That inquiry was not found.");
 
@@ -442,7 +446,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const params = q(req);
     const { accountId, organizationId } = scope(req);
-    const result = await engagement.listLeads({ accountId, organizationId, ...params });
+    const result = await engagement.listLeads({ ...params, accountId, organizationId, agentId: restrictedAgentId(req) });
     return res.json(listResponse(result.data, { page: result.page, pageSize: result.pageSize, total: result.total }));
   })
 );
@@ -619,7 +623,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const params = q(req);
     const { accountId, organizationId } = scope(req);
-    const result = await engagement.listOffers({ accountId, organizationId, ...params });
+    const result = await engagement.listOffers({ ...params, accountId, organizationId, agentId: restrictedAgentId(req) });
     return res.json({
       ...listResponse(result.data, { page: result.page, pageSize: result.pageSize, total: result.total }),
       counts: result.counts,
@@ -642,10 +646,12 @@ router.patch(
   }),
   asyncHandler(async (req, res) => {
     const { accountId, organizationId } = scope(req);
+    const agentId = restrictedAgentId(req);
+    const own = agentId != null ? engagement.agentOfferClause("offers", agentId) : { sql: "1 = 1", params: [] };
     const offer = await queryOne(
       `SELECT id, public_id, status, listing_id, currency_code, amount FROM offers
-        WHERE public_id = ? AND (account_id = ? OR organization_id = ?) AND deleted_at IS NULL`,
-      [req.params.id, accountId, organizationId]
+        WHERE public_id = ? AND (account_id = ? OR organization_id = ?) AND ${own.sql} AND deleted_at IS NULL`,
+      [req.params.id, accountId, organizationId, ...own.params]
     );
     if (!offer) throw AppError.notFound("That offer was not found.");
     if (["accepted", "declined", "withdrawn"].includes(offer.status)) {
@@ -1175,12 +1181,23 @@ router.get(
   asyncHandler(async (req, res) => {
     const params = q(req) || {};
     const accountId = requireAccountId(req);
-    const [billing, accountAddons] = await Promise.all([
+    const [billing, accountAddons, access] = await Promise.all([
       engagement.accountBilling({ accountId, ...params }),
       addons.listAccountAddons(accountId),
+      accountPackage(accountId),
     ]);
-    return res.json(detailResponse({ ...billing, addons: accountAddons }));
+    // Only the packages made for this kind of account (individual, or company and developer).
+    const audiences = packageAudiences(req.auth.activeMembership?.account_type_code);
+    const plans = (billing.plans || []).filter((plan) => !plan.audience || audiences.includes(plan.audience));
+    return res.json(detailResponse({ ...billing, plans, addons: accountAddons, access }));
   })
+);
+
+/** "Later" on the first-login package screen: it is not shown again on its own (0084). */
+router.post(
+  "/billing/package-prompt/dismiss",
+  writeLimiter,
+  asyncHandler(async (req, res) => res.json(detailResponse(await dismissPackagePrompt(requireAccountId(req)))))
 );
 
 router.patch(
@@ -1194,6 +1211,11 @@ router.patch(
     // an operator. No payment provider is connected, so this deliberately
     // never claims a charge was raised — see the shared function's own note.
     const accountId = requireAccountId(req);
+    const audiences = packageAudiences(req.auth.activeMembership?.account_type_code);
+    const plan = await queryOne("SELECT audience FROM plans WHERE public_id = ?", [req.body.packageId]);
+    if (plan && !audiences.includes(plan.audience)) {
+      throw AppError.validation("Some information is invalid.", { packageId: "That package is not for this kind of account." });
+    }
     const result = await assignPlanToAccount({ accountId, packageId: req.body.packageId, publicOnly: true });
     await auditFromRequest(req, { action: "account.package_changed", subjectType: "account", subjectLabel: String(accountId), changes: { packageId: result.packageId } });
     return res.json(detailResponse(result));

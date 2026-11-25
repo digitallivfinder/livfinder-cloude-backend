@@ -112,6 +112,24 @@ export async function getProfile(req) {
   };
 
   profile.profileCompletion = completionFor(profile, agent);
+  // The form's lists come from the API, never from what the profile already holds: an agent with
+  // no languages yet saw an empty Languages list, and Country offered only one country.
+  const [languageOptions, countryOptions, specialtyOptions] = await Promise.all([
+    query("SELECT name FROM languages WHERE is_active = 1 ORDER BY sort_order, name"),
+    query("SELECT name FROM locations WHERE level = 'country' AND status = 'active' AND deleted_at IS NULL ORDER BY name"),
+    // Specialties are saved as categories, so a typed word that is not one was dropped on save.
+    query(
+      `SELECT c.name, root.name AS root_name FROM categories c
+         LEFT JOIN categories root ON root.id = c.root_category_id AND root.id <> c.id
+        WHERE c.status = 'active' AND c.deleted_at IS NULL AND c.depth <= 1
+        ORDER BY COALESCE(root.sort_order, c.sort_order), c.depth, c.name`
+    ),
+  ]);
+  profile.options = {
+    languages: languageOptions.map((row) => ({ value: row.name, label: row.name })),
+    countries: countryOptions.map((row) => ({ value: row.name, label: row.name })),
+    specialties: specialtyOptions.map((row) => ({ value: row.name, label: row.root_name ? `${row.root_name} · ${row.name}` : row.name })),
+  };
   return profile;
 }
 
@@ -125,6 +143,40 @@ function completionFor(profile, agent) {
   ];
   const complete = items.filter((item) => item.complete).length;
   return { percentage: Math.round((complete / items.length) * 100), items };
+}
+
+/**
+ * A place the profile form sends by name: "United Arab Emirates", "Dubai", or a search label such
+ * as "Business Bay, Dubai, United Arab Emirates" (the place, then the places it sits in).
+ * `resolveLocation` only matches ids and URL slugs, so a country or a labelled service area was
+ * silently dropped on save. Falls back to it for ids and slugs.
+ */
+const LEVELS_BY_TYPE = { country: ["country"], city: ["city"] };
+async function resolvePlaceByName(value, { type } = {}) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const [name, ...context] = raw.split(",").map((part) => part.trim()).filter(Boolean);
+  const levels = type ? LEVELS_BY_TYPE[type] : null;
+  const candidates = await query(
+    `SELECT l.id FROM locations l
+      WHERE l.name = ? AND l.deleted_at IS NULL AND l.status = 'active'
+        ${levels ? `AND l.level IN (${levels.map(() => "?").join(", ")})` : ""}
+      ORDER BY l.depth ASC, l.active_listing_count DESC, l.id ASC
+      LIMIT 20`,
+    [name, ...(levels ?? [])]
+  );
+  for (const candidate of candidates) {
+    if (!context.length) return candidate;
+    // Every other part of the label must be one of this place's ancestors.
+    const ancestors = await query(
+      `SELECT a.name FROM location_closure c JOIN locations a ON a.id = c.ancestor_id
+        WHERE c.descendant_id = ? AND c.depth > 0`,
+      [candidate.id]
+    );
+    const names = new Set(ancestors.map((row) => String(row.name).toLowerCase()));
+    if (context.every((part) => names.has(part.toLowerCase()))) return candidate;
+  }
+  return resolveLocation(raw, { type });
 }
 
 export async function updateProfile(req, payload) {
@@ -150,11 +202,11 @@ export async function updateProfile(req, payload) {
     if (payload.timezone !== undefined) setUser("timezone", payload.timezone);
 
     if (payload.country !== undefined) {
-      const country = payload.country ? await resolveLocation(payload.country, { type: "country" }) : null;
+      const country = payload.country ? await resolvePlaceByName(payload.country, { type: "country" }) : null;
       setUser("country_id", country?.id ?? null);
     }
     if (payload.city !== undefined) {
-      const city = payload.city ? await resolveLocation(payload.city, { type: "city" }) : null;
+      const city = payload.city ? await resolvePlaceByName(payload.city, { type: "city" }) : null;
       setUser("city_id", city?.id ?? null);
     }
     if (payload.avatarAssetId !== undefined) {
@@ -216,7 +268,7 @@ export async function updateProfile(req, payload) {
     if (payload.serviceAreas) {
       await execute("DELETE FROM agent_service_areas WHERE agent_id = ?", [agent.id], connection);
       for (const [index, area] of payload.serviceAreas.entries()) {
-        const location = await resolveLocation(area);
+        const location = await resolvePlaceByName(area);
         if (location) {
           await execute(
             "INSERT INTO agent_service_areas (agent_id, location_id, is_primary) VALUES (?, ?, ?)",

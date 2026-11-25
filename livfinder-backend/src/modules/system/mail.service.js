@@ -115,7 +115,7 @@ export async function sendMail({ to, subject, text, html, attachments, from = en
     text,
     html,
     attachments,
-    replyTo: replyTo ?? env.MAIL_REPLY_TO ?? undefined,
+    replyTo: replyTo ?? env.MAIL_REPLY_TO ?? env.EMAIL_SUPPORT_ADDRESS ?? undefined,
     headers: headers && Object.keys(headers).length ? headers : undefined,
   };
   sentInMemory.push({ ...message, sentAt: new Date().toISOString() });

@@ -4,7 +4,7 @@ import { withTransaction } from "../../db/transaction.js";
 import { AppError } from "../../utils/errors.js";
 import { ulid } from "../../utils/ids.js";
 import { ownAgentClause } from "../../utils/tenantScope.js";
-import { frontendCategoryIdFor, scopeClause } from "../portal/engagement.repository.js";
+import { agentInquiryClause, agentLeadClause, frontendCategoryIdFor, scopeClause } from "../portal/engagement.repository.js";
 import { rootIdForFrontendCategory } from "../portal/portal.repository.js";
 import { readLeadDocument, removeLeadDocument, storeLeadDocument } from "../media/media.service.js";
 import { emitLeadEvent } from "./webhooks.service.js";
@@ -34,7 +34,9 @@ import {
  */
 
 async function loadLead(scope, publicId, connection) {
-  const clause = scopeClause("l", scope);
+  const base = scopeClause("l", scope);
+  const own = scope.agentId != null ? agentLeadClause("l", scope.agentId) : null;
+  const clause = own ? { sql: `${base.sql} AND ${own.sql}`, params: [...base.params, ...own.params] } : base;
   const lead = await queryOne(
     `SELECT l.id, l.public_id, l.organization_id, l.account_id, l.contact_id, l.status, l.stage_id, l.stage_type,
             l.stage_entered_at, l.root_category_id, l.primary_listing_id, l.project_id, l.owner_agent_id,
@@ -455,7 +457,25 @@ export async function addViewing({ scope, publicId, payload, userId }) {
     const lead = await loadLead(scope, publicId, connection);
     if (isClosedStep(lead.step)) throw AppError.badRequest("Reopen this lead before adding a viewing.");
 
-    const kind = viewingKindFor(lead.rootCategoryId);
+    // A listing picked on the Viewings screen; otherwise the lead's own. It must be this seller's
+    // (and, for an agent, their own) listing.
+    let listingId = lead.primary_listing_id;
+    let rootCategoryId = lead.rootCategoryId;
+    if (payload.listingId) {
+      const picked = await queryOne(
+        `SELECT id, root_category_id FROM listings
+          WHERE (public_id = ? OR reference = ?) AND account_id = ? AND deleted_at IS NULL
+            ${scope.agentId != null ? "AND agent_id = ?" : ""}
+          LIMIT 1`,
+        [payload.listingId, payload.listingId, scope.accountId, ...(scope.agentId != null ? [scope.agentId] : [])],
+        connection
+      );
+      if (!picked) throw AppError.validation("Some information is invalid.", { listingId: "Choose one of your listings." });
+      listingId = picked.id;
+      rootCategoryId = picked.root_category_id;
+    }
+
+    const kind = viewingKindFor(rootCategoryId);
     const maxRef = await queryValue(
       "SELECT MAX(CAST(SUBSTRING(reference, 4) AS UNSIGNED)) FROM bookings WHERE reference LIKE 'BK-%'",
       [],
@@ -472,7 +492,7 @@ export async function addViewing({ scope, publicId, payload, userId }) {
           meeting_location, confirmed_at, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, 1, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
       [
-        publicBookingId, reference, lead.primary_listing_id, lead.id, lead.account_id ?? scope.accountId, lead.organization_id,
+        publicBookingId, reference, listingId, lead.id, lead.account_id ?? scope.accountId, lead.organization_id,
         lead.owner_agent_id ?? lead.listing_agent_id, kind.bookingType, start, new Date(start.getTime() + 60 * 60 * 1000),
         contact?.display_name ?? lead.name, contact?.primary_email ?? lead.email, contact?.primary_phone_e164 ?? lead.phone_e164,
         payload.notes || null, payload.location || null,
@@ -587,7 +607,9 @@ export async function createManualLead({ scope, payload, userId }) {
  * individuals having leads (or whose listing is gone) has none yet, so it gets one here.
  */
 export async function ensureInquiryLead({ scope, inquiryPublicId }) {
-  const clause = scopeClause("i", scope);
+  const base = scopeClause("i", scope);
+  const own = scope.agentId != null ? agentInquiryClause("i", scope.agentId) : null;
+  const clause = own ? { sql: `${base.sql} AND ${own.sql}`, params: [...base.params, ...own.params] } : base;
   const inquiry = await queryOne(
     `SELECT i.id, i.name, i.email, i.phone, i.message, i.inquiry_type, i.listing_id, i.project_id,
             i.account_id, i.organization_id,

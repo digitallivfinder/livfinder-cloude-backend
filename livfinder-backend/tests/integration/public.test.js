@@ -268,8 +268,8 @@ describe("editorial and seo", () => {
   it("lists the canonical directory, not its alias, among the static pages", async () => {
     const response = await api.get("/v1/public/sitemap", { kind: "static" });
     const urls = response.body.data.map((entry) => entry.url);
-    expect(urls).toContain("/agencies");
-    expect(urls).not.toContain("/companies");
+    expect(urls).toContain("/companies");
+    expect(urls).not.toContain("/agencies");
   });
 });
 

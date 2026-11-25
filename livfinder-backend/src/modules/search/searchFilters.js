@@ -23,7 +23,7 @@ export const SPEC_MAP = {
   yachts: {
     spec_a: "lengthFt", spec_b: "year", spec_c: "cabins", spec_d: "guests",
     spec_e: "engineHours", spec_f: "maxSpeedKnots",
-    facet_a: "vesselType", facet_b: "hullMaterial", facet_c: "charterOrSale",
+    facet_a: "vesselType", facet_b: "hullMaterial", facet_c: null,
   },
   jets: {
     spec_a: "year", spec_b: "flightHours", spec_c: "passengerCapacity", spec_d: "rangeNm",
@@ -85,9 +85,11 @@ const FACET_FILTERS = {
   "real-estate": { furnishing: "facet_a", completionStatus: "facet_b", ownershipType: "facet_c" },
   cars: { transmission: "facet_a", fuelType: "facet_b", condition: "facet_c" },
   yachts: { yachtType: "facet_a", hullMaterial: "facet_b" },
-  jets: { aircraftType: "facet_a", engineProgram: "facet_b" },
-  helicopters: { aircraftType: "facet_a", engineProgram: "facet_b" },
-  watches: { movement: "facet_a", condition: "facet_b", caseMaterial: "facet_c" },
+  // `size` groups several aircraft types (Light, Midsize …; see aircraftSizeTypes).
+  jets: { aircraftType: "facet_a", engineProgram: "facet_b", size: "facet_a" },
+  helicopters: { aircraftType: "facet_a", engineProgram: "facet_b", size: "facet_a" },
+  // Case material is matched on the detail table's words (DETAIL_FILTERS), not the projection.
+  watches: { movement: "facet_a", condition: "facet_b" },
 };
 
 /**
@@ -119,6 +121,15 @@ export const COLOUR_FAMILIES = {
   beige: ["beige", "cream", "sand", "ivory"],
 };
 
+/**
+ * The colour families the website offers (its option lists come from here, not the page): every
+ * one is a key of COLOUR_FAMILIES, so each choice searches the makers' own names too.
+ */
+export const CAR_COLOUR_OPTIONS = {
+  exteriorColor: ["black", "white", "silver", "grey", "blue", "red", "green", "yellow", "gold"],
+  interiorColor: ["black", "tan", "brown", "red", "beige", "grey"],
+};
+
 const DETAIL_FILTERS = {
   cars: {
     exteriorColor: { table: "listing_vehicle", alias: "d_veh", column: "exterior_color", op: "colour" },
@@ -133,6 +144,8 @@ const DETAIL_FILTERS = {
   watches: {
     dialColor: { table: "listing_timepiece", alias: "d_tp", column: "dial_color", op: "like" },
     isFullSet: { table: "listing_timepiece", alias: "d_tp", column: "is_full_set", op: "bool" },
+    gender: { table: "listing_timepiece", alias: "d_tp", column: "gender", op: "eq" },
+    caseMaterial: { table: "listing_timepiece", alias: "d_tp", column: "case_material", op: "material" },
   },
   yachts: {
     homePort: { table: "listing_marine", alias: "d_mar", column: "home_port", op: "like" },

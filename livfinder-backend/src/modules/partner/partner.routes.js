@@ -387,6 +387,21 @@ router.delete(
     try {
       const { importRun, outcome } = await runWithdrawal({ client: req.apiClient, ctx, externalId: req.params.externalId, ...sourceOf(req) });
       res.setHeader("X-Import-Id", importRun.publicId);
+      if (outcome.project) {
+        // A development taken down: archived, off the site, still in the company's portal.
+        return res.json(
+          detailResponse({
+            entity: "development",
+            developmentId: outcome.project.public_id,
+            name: outcome.project.name,
+            status: outcome.project.moderation_status === "archived" ? "withdrawn" : outcome.project.moderation_status,
+            publicUrl: null,
+            externalId: req.params.externalId,
+            operation: outcome.operation === "delete" ? "withdraw" : "unchanged",
+            importId: importRun.publicId,
+          })
+        );
+      }
       return res.json(
         detailResponse(
           serializeImportedListing(outcome.listing, {

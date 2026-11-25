@@ -2,6 +2,7 @@ import { execute, query, queryOne } from "../../db/query.js";
 import { AppError } from "../../utils/errors.js";
 import { ulid } from "../../utils/ids.js";
 import { notifyAccount } from "../system/notifications.service.js";
+import { isEntitled } from "./entitlement.js";
 
 /**
  * Paid add-ons on top of a plan (migration 0059).
@@ -113,7 +114,8 @@ export async function isAddonActive(accountId, code, connection) {
     ),
     currentSubscription(accountId, connection),
   ]);
-  return runningState(row, subscription);
+  // No working package (none chosen, or payment needed and not made): no API or integrations.
+  return runningState(row, subscription) && (await isEntitled(accountId));
 }
 
 export async function assertAddonActive(accountId, code, connection) {
@@ -137,6 +139,7 @@ export async function listAccountAddons(accountId) {
     ),
   ]);
   const offered = planAddons.get(Number(subscription?.plan_id)) || {};
+  const entitled = await isEntitled(accountId);
   return ADDON_CODES.map((code) => {
     const row = rows.find((item) => item.addon_code === code);
     return {
@@ -146,7 +149,7 @@ export async function listAccountAddons(accountId) {
       availableOnPlan: offered[code]?.isAvailable ?? false,
       planPrice: offered[code] ? { amount: offered[code].amount, currency: offered[code].currency } : null,
       status: row?.status ?? "off",
-      isActive: runningState(row, subscription),
+      isActive: runningState(row, subscription) && entitled,
       price: row ? { amount: num(row.amount), currency: row.currency_code } : null,
       startedAt: row?.started_at ?? null,
       endsAt: row?.ends_at ?? null,

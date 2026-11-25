@@ -20,6 +20,7 @@ import { splitPhone } from "../../utils/phone.js";
 import { isoDay } from "../../serializers/primitives.js";
 import { assertApplicationCategory } from "./sellerType.js";
 import { ORGANIZATION_KINDS } from "./organizationKinds.js";
+import { refreshPackageHold } from "./entitlement.js";
 
 async function assertEmailAvailable(email, executor) {
   const existing = await queryValue(
@@ -740,6 +741,8 @@ export async function assignPlanToAccount({ accountId, packageId, publicOnly = f
   // Best-effort: `notify`/`notifyAccount` already swallow their own errors, so
   // a notification failure never undoes or masks the plan change above.
   await syncAccountAddons(accountId);
+  // A package chosen (or changed) can open the portal and bring listings back into search.
+  await refreshPackageHold(accountId);
   await notifyPlanChanged({ accountId, planName: plan.name });
 
   return { packageId: plan.public_id, packageName: plan.name, chargeRaised: false };

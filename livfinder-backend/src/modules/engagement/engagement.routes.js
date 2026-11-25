@@ -595,6 +595,14 @@ router.post(
   }),
   asyncHandler(async (req, res) => {
     const listing = await resolvePublicListing(req.body.listingId);
+    // Offers are made from the buyer's portal, on a listing they have enquired about.
+    const enquired = await queryValue(
+      "SELECT 1 FROM inquiries WHERE listing_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1",
+      [listing.id, req.auth.user.id]
+    );
+    if (!enquired) {
+      throw AppError.validation("Some information is invalid.", { listingId: "Send an enquiry about this listing before making an offer." });
+    }
     const currency = req.body.currency || listing.currency_code;
     const publicId = ulid();
 

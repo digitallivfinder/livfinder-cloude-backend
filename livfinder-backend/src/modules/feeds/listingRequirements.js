@@ -67,8 +67,8 @@ const REQUIRED_WHEN = {
   },
   cars: { engineSizeCc: notElectric, cylinders: notElectric },
   yachts: {},
-  jets: { charterHourlyRate: (record) => Boolean(record.detail?.isCharterAvailable) },
-  helicopters: { charterHourlyRate: (record) => Boolean(record.detail?.isCharterAvailable) },
+  jets: {},
+  helicopters: {},
 };
 
 const ONE_OF = {

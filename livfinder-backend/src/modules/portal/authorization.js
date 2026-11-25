@@ -51,6 +51,15 @@ export async function assertListingAccess(req, identifier, action = "view") {
   return listing;
 }
 
+/**
+ * The agent an agent-role member is limited to, or null for owners and managers. An agent-role
+ * member without an agent profile gets 0, which matches nothing: failing closed, not open.
+ */
+export function restrictedAgentId(req) {
+  if (req.auth?.activeMembership?.role !== "agent") return null;
+  return req.auth.agent?.id ?? 0;
+}
+
 /** The organization behind the caller's active account, or a 403. */
 export function requireOrganizationId(req) {
   const organizationId = req.auth?.activeMembership?.organization_id;

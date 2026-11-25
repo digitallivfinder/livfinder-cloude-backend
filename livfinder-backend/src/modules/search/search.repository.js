@@ -1,9 +1,36 @@
-import { query, queryValue } from "../../db/query.js";
+import { query, queryOne, queryValue } from "../../db/query.js";
+import { heldListingsCondition } from "../accounts/entitlement.js";
 import { resolveLocation } from "../locations/locations.repository.js";
 import { segmentCondition } from "./propertySegments.js";
-import { marketCondition, sellerTypeCondition } from "./marketAndSeller.js";
+import { aircraftSizeTypes, caseMaterialWords, marketCondition, watchConditionGrades, sellerTypeCondition, sellerTypesFor, yachtTypeValues } from "./marketAndSeller.js";
 import { normalizeSearchInput, SORT_MAP, RANGE_FILTERS, FACET_FILTERS, DETAIL_FILTERS, COLOUR_FAMILIES } from "./searchFilters.js";
 import { serializeListingCard } from "../../serializers/listing.js";
+
+/**
+ * The Call and WhatsApp numbers behind a listing's contact buttons — on its card and on its
+ * page — so a button is never hidden. Needs `ls` (listing_search) and `org` (its company).
+ */
+const CONTACT_COLUMNS = `
+  -- Contact buttons never hide: the listing's own number, then its agent's (both only when the
+  -- listing allows that channel), then the company's, then an individual seller's own profile.
+  -- WhatsApp falls back to the company's / seller's phone when nobody has a WhatsApp number.
+  COALESCE(
+    IF(lc.allow_call, COALESCE(NULLIF(ls.contact_phone, ''), NULLIF(ag.phone, '')), NULL),
+    NULLIF(org.phone, ''), NULLIF(ow.phone, '')) AS card_phone,
+  COALESCE(
+    IF(lc.allow_whatsapp, COALESCE(NULLIF(ls.contact_whatsapp, ''), NULLIF(ag.whatsapp, '')), NULL),
+    NULLIF(org.whatsapp, ''), NULLIF(org.phone, ''),
+    NULLIF(ow.whatsapp, ''), NULLIF(ow.phone, '')) AS card_whatsapp`;
+
+const CONTACT_JOINS = `
+  LEFT JOIN listings lc ON lc.id = ls.listing_id
+  LEFT JOIN agents ag ON ag.id = ls.agent_id
+  -- An individual seller's listing has no agent or company; their own profile is the contact.
+  LEFT JOIN agents ow ON ow.id = (
+    SELECT a.id FROM agents a
+     WHERE ls.agent_id IS NULL AND ls.organization_id IS NULL
+       AND a.user_id = lc.created_by_user_id AND a.organization_id IS NULL
+     ORDER BY a.id LIMIT 1)`;
 
 /**
  * Reads exclusively from `listing_search`, the maintained flat projection.
@@ -18,11 +45,17 @@ const CARD_COLUMNS = `
   ls.cover_image_url, ls.image_count, ls.price, ls.currency_code, ls.price_base,
   ls.price_period, ls.location_label, ls.latitude, ls.longitude,
   ls.organization_id, ls.organization_name, ls.organization_logo_url,
-  ls.agent_id, ls.agent_name, ls.agent_slug, ls.agent_photo_url,
-  ls.is_featured, ls.is_premium, ls.is_verified, ls.is_exclusive, ls.has_virtual_tour,
+  ls.agent_id, COALESCE(ls.agent_name, ow.display_name) AS agent_name,
+  COALESCE(ls.agent_slug, ow.slug) AS agent_slug,
+  COALESCE(ls.agent_photo_url, ag.photo_url, ow.photo_url) AS agent_photo_url,
+  ls.is_featured, ls.is_premium, ls.is_exclusive, ls.has_virtual_tour, lc.is_new_listing,
+  -- Verified: the listing itself, or the company behind it, or an individual seller's own profile.
+  (ls.is_verified = 1 OR org.verification_status = 'verified'
+    OR (ls.organization_id IS NULL AND ow.verification_status = 'verified')) AS is_verified,
   ls.spec_a, ls.spec_b, ls.spec_c, ls.spec_d, ls.spec_e, ls.spec_f, ls.spec_labels,
   ls.brand_id, ls.brand_model_id, ls.project_id, ls.quality_score, ls.published_at,
   ls.source_updated_at, ls.property_segment,
+  ${CONTACT_COLUMNS},
   co.slug AS country_slug, co.name AS country_name,
   st.slug AS state_slug,
   ct.slug AS city_slug,   ct.name AS city_name,
@@ -37,6 +70,7 @@ const CARD_JOINS = `
   LEFT JOIN locations ct ON ct.id = ls.city_id
   LEFT JOIN locations cm ON cm.id = ls.community_id
   LEFT JOIN organizations org ON org.id = ls.organization_id
+  ${CONTACT_JOINS}
   LEFT JOIN brands br ON br.id = ls.brand_id
   LEFT JOIN brand_models bm ON bm.id = ls.brand_model_id`;
 
@@ -242,6 +276,15 @@ export async function buildSearchQuery(rawFilters = {}) {
     }
   }
 
+  // Listed by in the other marketplaces that offer it (Cars); real estate applies it below.
+  if (filters.listingType !== "real-estate") {
+    const seller = sellerTypeCondition(sellerTypesFor(filters.listingType, filters.sellerTypes));
+    if (seller) {
+      conditions.push(seller.sql);
+      params.push(...seller.params);
+    }
+  }
+
   if (filters.listingType === "real-estate") {
     // Rent duration: how the rent is quoted (yearly, monthly …).
     if (filters.rentPeriod) {
@@ -291,6 +334,27 @@ export async function buildSearchQuery(rawFilters = {}) {
   for (const [key, column] of Object.entries(FACET_FILTERS[filters.listingType] || {})) {
     const value = filters.facets[key];
     if (!value) continue;
+    // An aircraft Size is a group of aircraft types; an unknown one matches nothing.
+    if (key === "size") {
+      const types = aircraftSizeTypes(filters.listingType, value);
+      conditions.push(types.length ? `ls.${column} IN (${types.map(() => "?").join(", ")})` : "1 = 0");
+      params.push(...types);
+      continue;
+    }
+    // Watches' Unworn / Pre-owned are groups of condition grades.
+    if (filters.listingType === "watches" && key === "condition") {
+      const grades = watchConditionGrades(value);
+      conditions.push(`ls.${column} IN (${grades.map(() => "?").join(", ")})`);
+      params.push(...grades);
+      continue;
+    }
+    // Yachts' Superyacht also finds the mega yachts (YACHT_TYPE_OPTIONS).
+    if (filters.listingType === "yachts" && key === "yachtType") {
+      const values = yachtTypeValues(value);
+      conditions.push(`ls.${column} IN (${values.map(() => "?").join(", ")})`);
+      params.push(...values);
+      continue;
+    }
     // Under Construction is folded into Off Plan (migration 0076). Until a database has run it,
     // Off Plan still finds the listings stored the old way, and an old link to Under
     // Construction lands on Off Plan rather than on an empty page.
@@ -318,6 +382,10 @@ export async function buildSearchQuery(rawFilters = {}) {
       const words = COLOUR_FAMILIES[String(value).trim().toLowerCase()] || [String(value).slice(0, 60)];
       conditions.push(`(${words.map(() => `${spec.alias}.${spec.column} LIKE ?`).join(" OR ")})`);
       params.push(...words.map((word) => `%${word}%`));
+    } else if (spec.op === "material") {
+      const words = caseMaterialWords(String(value).trim().toLowerCase());
+      conditions.push(`(${words.map(() => `${spec.alias}.${spec.column} LIKE ?`).join(" OR ")})`);
+      params.push(...words.map((word) => `%${word.slice(0, 60)}%`));
     } else if (spec.op === "like") {
       conditions.push(`${spec.alias}.${spec.column} LIKE ?`);
       params.push(`%${String(value).slice(0, 60)}%`);
@@ -337,6 +405,11 @@ export async function buildSearchQuery(rawFilters = {}) {
     conditions.push("(ls.title LIKE ? OR ls.location_label LIKE ? OR ls.reference = ?)");
     params.push(`%${filters.keyword}%`, `%${filters.keyword}%`, filters.keyword.toUpperCase());
   }
+
+  // Sellers without a working package stay out of search and the listing pages (0084). Their
+  // listings' own pages and the sitemap still have them.
+  const held = await heldListingsCondition("ls");
+  if (held) conditions.push(held);
 
   return {
     impossible: false,
@@ -453,6 +526,19 @@ export async function countryFacets(rawFilters = {}, { limit = 12 } = {}) {
       LIMIT ${bounded}`,
     built.params
   );
+}
+
+/** The contact-button numbers for one published listing, or null when it is not public. */
+export async function listingContactNumbers(listingId) {
+  const row = await queryOne(
+    `SELECT ${CONTACT_COLUMNS}, ow.display_name AS owner_name
+       FROM listing_search ls
+       LEFT JOIN organizations org ON org.id = ls.organization_id
+       ${CONTACT_JOINS}
+      WHERE ls.listing_id = ?`,
+    [listingId]
+  );
+  return row ? { phone: row.card_phone || null, whatsapp: row.card_whatsapp || null, ownerName: row.owner_name || null } : null;
 }
 
 export { CARD_COLUMNS, CARD_JOINS };

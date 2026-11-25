@@ -590,9 +590,11 @@ export async function listAdminDevelopments({
               b.public_id AS developer_public_id, b.logo_url AS developer_logo_url,
               co.name AS country_name, st.name AS state_name, ct.name AS city_name, cm.name AS community_name,
               cat.name AS category_name,
+              o.name AS owner_name, o.logo_url AS owner_logo_url,
               (SELECT COUNT(*) FROM inquiries i WHERE i.project_id = p.id) AS lead_count
          FROM projects p
          ${joins}
+         LEFT JOIN organizations o ON o.id = p.organization_id
          LEFT JOIN categories cat ON cat.id = p.category_id
          ${where}
         ORDER BY ${orderBy} LIMIT ${safeSize} OFFSET ${offset}`,
@@ -654,6 +656,7 @@ function serializeAdminDevelopment(row) {
     canonicalPath: row.canonical_path,
     publicUrl: row.moderation_status === "published" && bool(row.is_publicly_visible) ? row.canonical_path : null,
 
+    // No developer brand (every imported project): the owning company is the developer.
     developer: row.developer_public_id
       ? {
           id: row.developer_public_id,
@@ -661,7 +664,9 @@ function serializeAdminDevelopment(row) {
           name: row.developer_name,
           logoUrl: row.developer_logo_url,
         }
-      : null,
+      : row.owner_name
+        ? { id: null, name: row.owner_name, logoUrl: row.owner_logo_url || null, fromOwner: true }
+        : null,
     developerId: row.developer_public_id,
 
     projectType: row.project_type,
@@ -746,9 +751,17 @@ export async function getAdminDevelopment(identifier) {
             co.name AS country_name, st.name AS state_name, ct.name AS city_name, cm.name AS community_name,
             sc.name AS sub_community_name,
             cat.name AS category_name,
-            (SELECT COUNT(*) FROM inquiries i WHERE i.project_id = p.id) AS lead_count
+            (SELECT COUNT(*) FROM inquiries i WHERE i.project_id = p.id) AS lead_count,
+            b.website_url AS developer_website, b.description AS developer_description,
+            bco.name AS developer_country,
+            o.id AS owner_org_id, o.public_id AS owner_public_id, o.name AS owner_name, o.kind AS owner_kind,
+            o.phone AS owner_phone, o.email AS owner_email, o.website_url AS owner_website,
+            o.description AS owner_description, o.logo_url AS owner_logo_url, oco.name AS owner_country
        FROM projects p
        LEFT JOIN brands b ON b.id = p.developer_brand_id
+       LEFT JOIN locations bco ON bco.id = b.country_id
+       LEFT JOIN organizations o ON o.id = p.organization_id
+       LEFT JOIN locations oco ON oco.id = o.country_id
        LEFT JOIN locations co ON co.id = p.country_id
        LEFT JOIN locations st ON st.id = p.state_id
        LEFT JOIN locations ct ON ct.id = p.city_id
@@ -852,8 +865,50 @@ export async function getAdminDevelopment(identifier) {
     .map((item) => int(item.bedrooms))
     .filter((value) => value !== null && value !== undefined);
 
+  // The company that owns the development (it pushed or created it). With no developer brand
+  // assigned, that company is the developer — imported projects never carry a brand.
+  const owner = row.owner_public_id
+    ? {
+        id: row.owner_public_id,
+        name: row.owner_name,
+        type: row.owner_kind ? titleCaseWords(row.owner_kind) : "Company",
+        reference: `CMP-${String(row.owner_org_id).padStart(5, "0")}`,
+        phone: row.owner_phone || null,
+        email: row.owner_email || null,
+        source: null,
+        notes: null,
+        initials: initialsFrom(row.owner_name),
+        logoUrl: row.owner_logo_url || null,
+        href: `/admin/companies/${row.owner_public_id}`,
+      }
+    : null;
+  const developer = row.developer_public_id
+    ? {
+        id: row.developer_public_id,
+        slug: row.developer_slug,
+        name: row.developer_name,
+        logoUrl: row.developer_logo_url,
+        country: row.developer_country || null,
+        website: row.developer_website || null,
+        description: row.developer_description || null,
+      }
+    : owner
+      ? {
+          id: null,
+          name: row.owner_name,
+          logoUrl: row.owner_logo_url || null,
+          country: row.owner_country || null,
+          website: row.owner_website || null,
+          description: row.owner_description || null,
+          fromOwner: true,
+        }
+      : null;
+
   return {
     ...serializeAdminDevelopment(row),
+    owner,
+    developer,
+    submittedBy: owner ? { name: owner.name } : null,
     description: {
       heading: row.marketing_heading,
       body: row.description,
@@ -1002,6 +1057,14 @@ export async function getAdminDevelopment(identifier) {
       image: unit.cover_image_url,
     })),
   };
+}
+
+function titleCaseWords(value) {
+  return String(value).replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function initialsFrom(name) {
+  return String(name || "").trim().split(/\s+/).slice(0, 2).map((part) => part[0] || "").join("").toUpperCase();
 }
 
 function safeJson(value, fallback) {
@@ -1348,8 +1411,11 @@ export async function getAdminCompany(identifier) {
   const scheduledPackage = await scheduledPlanChange(row.account_id);
   const [agents, listings, activity, subscription, inquiryCount, invoices] = await Promise.all([
     query(
-      `SELECT public_id, display_name, email, phone, status, created_at
-         FROM agents WHERE organization_id = ? AND deleted_at IS NULL ORDER BY display_name`,
+      `SELECT ag.public_id, ag.display_name, ag.title, ag.email, ag.phone, ag.status, ag.verification_status, ag.created_at,
+              -- An agent's open verification request: documents waiting for LivFinder.
+              EXISTS (SELECT 1 FROM verification_requests vr
+                       WHERE vr.subject_type = 'agent' AND vr.subject_id = ag.id AND vr.status IN ('pending','in_review')) AS verification_open
+         FROM agents ag WHERE ag.organization_id = ? AND ag.deleted_at IS NULL ORDER BY ag.display_name`,
       [row.id]
     ),
     query(
@@ -1434,7 +1500,10 @@ export async function getAdminCompany(identifier) {
       name: agent.display_name,
       email: agent.email,
       phone: agent.phone,
+      title: agent.title ?? null,
       status: agent.status,
+      verificationStatus: agent.verification_status,
+      verificationOpen: Boolean(Number(agent.verification_open)),
       dateAdded: isoDate(agent.created_at),
     })),
     listingList: listings.map((listing) => ({
@@ -1802,6 +1871,8 @@ export async function listAdminAgents({ status = "all", search = "", organizatio
     query(
       `SELECT a.id, a.public_id, a.first_name, a.last_name, a.display_name, a.slug, a.email,
               a.phone, a.title, a.status, a.verification_status, a.is_publicly_visible,
+              EXISTS (SELECT 1 FROM verification_requests vr
+                       WHERE vr.subject_type = 'agent' AND vr.subject_id = a.id AND vr.status IN ('pending','in_review')) AS verification_open,
               a.active_listing_count, a.listing_count, a.created_at, a.updated_at, a.photo_url,
               o.public_id AS organization_public_id, o.name AS organization_name,
               u.public_id AS user_public_id
@@ -1852,6 +1923,8 @@ export async function listAdminAgents({ status = "all", search = "", organizatio
       photo: row.photo_url,
       status: row.status,
       verificationStatus: row.verification_status,
+      // Documents waiting for LivFinder's review (the agent sent them from My Profile).
+      verificationOpen: Boolean(Number(row.verification_open)),
       isPubliclyVisible: bool(row.is_publicly_visible),
       parentId: row.organization_public_id,
       parentType: row.organization_public_id ? "company" : "individual",
@@ -2405,5 +2478,27 @@ export async function getCompanyIntegration(identifier) {
     leadFeeds,
     imports: imports.rows,
     importTotal: imports.total,
+  };
+}
+
+/** One agent of a company, with their latest verification request, for the admin review. */
+export async function getCompanyAgentVerification(companyIdentifier, agentPublicId) {
+  const agent = await queryOne(
+    `SELECT ag.id, ag.public_id, ag.display_name, ag.email, ag.phone, ag.title, ag.verification_status
+       FROM agents ag JOIN organizations o ON o.id = ag.organization_id
+      WHERE ag.public_id = ? AND (o.public_id = ? OR o.slug = ?) AND ag.deleted_at IS NULL LIMIT 1`,
+    [agentPublicId, companyIdentifier, companyIdentifier]
+  );
+  if (!agent) return null;
+  return {
+    agent: {
+      id: agent.public_id,
+      name: agent.display_name,
+      email: agent.email,
+      phone: agent.phone,
+      title: agent.title,
+      verificationStatus: agent.verification_status,
+    },
+    verification: await verificationReview("agent", agent.id),
   };
 }

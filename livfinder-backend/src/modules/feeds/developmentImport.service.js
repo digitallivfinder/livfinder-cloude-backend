@@ -5,7 +5,7 @@ import { recordAudit } from "../system/audit.service.js";
 import * as importsRepo from "../imports/imports.repository.js";
 import { assertLocationComplete, importImages, payloadHash, resolveImportLocation } from "../imports/listingImport.service.js";
 import { developmentSchema, upsertDevelopment } from "../admin/admin.mutations.js";
-import { beginDeveloperChange } from "../projects/projectRevisions.service.js";
+import { beginDeveloperChange, closeOpenProjectRevision } from "../projects/projectRevisions.service.js";
 import { assertSellerTypeAllowsCategory } from "../accounts/sellerType.js";
 
 /**
@@ -145,6 +145,15 @@ export async function importDevelopment({ client, ctx, record, importId = null }
     project = await queryOne("SELECT id, public_id, name, moderation_status FROM projects WHERE public_id = ?", [created.id]);
     await callProcedure("sp_refresh_project_search", [project.id]);
     operation = "create";
+  } else if (project.moderation_status === "archived") {
+    // Withdrawn through the API and now sent again: back as a draft the company submits, as new.
+    await upsertDevelopment({ identifier: project.public_id, payload, userId: client.createdByUserId });
+    await execute(
+      "UPDATE projects SET moderation_status = 'draft', is_publicly_visible = 0, rejection_reason = NULL, updated_at = NOW(3) WHERE id = ?",
+      [project.id]
+    );
+    await callProcedure("sp_refresh_project_search", [project.id]);
+    operation = "update";
   } else {
     // A change to a published development waits for approval; the site keeps the approved version.
     await beginDeveloperChange({ projectId: project.id, userId: client.createdByUserId, change: "Updated by the development feed" });
@@ -174,6 +183,52 @@ export async function importDevelopment({ client, ctx, record, importId = null }
   return { operation, project, warnings, media: { attached: imagesAttached, failed: [] } };
 }
 
+/**
+ * Takes a pushed development off the site: archived and hidden, never deleted, so its leads and
+ * history stay and the company still sees it under Archived. Pushing the same externalId again
+ * brings it back as a draft for the company to resubmit.
+ */
+export async function withdrawImportedDevelopment({ client, ctx, externalId, importId = null }) {
+  const reference = await findReference(ctx, externalId);
+  const project = reference
+    ? await queryOne(
+        "SELECT id, public_id, name, moderation_status FROM projects WHERE id = ? AND organization_id <=> ? AND deleted_at IS NULL",
+        [reference.project_id, client.organizationId]
+      )
+    : null;
+  if (!project) throw AppError.notFound(`No listing or development with the externalId "${externalId}" was pushed for this company.`);
+
+  const changed = project.moderation_status !== "archived";
+  if (changed) {
+    await execute(
+      "UPDATE projects SET moderation_status = 'archived', is_publicly_visible = 0, updated_at = NOW(3) WHERE id = ?",
+      [project.id]
+    );
+    // A change waiting for approval goes with it: there is nothing left to approve.
+    await closeOpenProjectRevision(project.id);
+    await callProcedure("sp_refresh_project_search", [project.id]);
+    await recordAudit({
+      action: "development.import_withdrawn",
+      subjectType: "project",
+      subjectId: project.id,
+      subjectLabel: project.name,
+      userId: client.createdByUserId,
+      actorType: "api",
+      actorLabel: `Development feed "${client.name}"`,
+      metadata: { externalId, importId },
+    });
+  }
+  // Forget the last payload, so pushing it again counts as a change and brings it back.
+  await execute(
+    "UPDATE external_references SET payload_hash = NULL, remote_status = 'removed', last_synced_at = NOW(3) WHERE id = ?",
+    [reference.reference_id]
+  );
+  return {
+    operation: changed ? "delete" : "unchanged",
+    project: await queryOne("SELECT id, public_id, name, moderation_status FROM projects WHERE id = ?", [project.id]),
+  };
+}
+
 /** Processes a feed run's queued development entries, one at a time. */
 export async function importDevelopmentsRun({ run, client, ctx }) {
   const items = await query(
@@ -183,7 +238,9 @@ export async function importDevelopmentsRun({ run, client, ctx }) {
   for (const item of items) {
     try {
       const record = typeof item.raw_payload === "string" ? JSON.parse(item.raw_payload) : item.raw_payload;
-      const outcome = await importDevelopment({ client, ctx, record, importId: run.public_id });
+      const outcome = record.withdraw
+        ? await withdrawImportedDevelopment({ client, ctx, externalId: record.externalId, importId: run.public_id })
+        : await importDevelopment({ client, ctx, record, importId: run.public_id });
       await importsRepo.recordItemSuccess(item.id, run.id, { ...outcome, listing: outcome.project });
     } catch (error) {
       if (!(error instanceof AppError) || error.status >= 500) logger.error({ err: error, itemId: item.id }, "development import item failed");

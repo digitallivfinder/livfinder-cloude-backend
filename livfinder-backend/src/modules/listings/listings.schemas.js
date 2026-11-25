@@ -141,7 +141,6 @@ export const marineDetail = z.object({
   maxSpeedKnots: optionalNumber(0, 300),
   rangeNm: optionalInt(0, 100_000),
   homePort: optionalText(120),
-  isCharterAvailable: z.boolean().optional(),
   isVatPaid: z.boolean().optional(),
 });
 
@@ -171,8 +170,6 @@ export const aviationDetail = z.object({
   avionicsSuite: optionalText(160),
   interiorConfiguration: optionalText(200),
   baseAirportCode: optionalText(10),
-  isCharterAvailable: z.boolean().optional(),
-  charterHourlyRate: optionalNumber(0, 1e9),
   // Both were collected by the wizard and dropped here, so they never reached listing_aviation (F38).
   nextInspectionDue: z.iso.date("Use a date such as 2026-10-15.").optional().nullable().or(z.literal("").transform(() => null)),
   serialNumber: optionalText(60),
@@ -237,3 +234,22 @@ export const listingStatusSchema = z.object({
   status: z.enum(["draft", "pending_review", "active", "sold", "rented", "withdrawn", "archived", "expired"]),
   reason: z.string().trim().max(500).optional(),
 });
+
+/**
+ * Detail fields LivFinder no longer takes, by marketplace: charter went with it (owner,
+ * 2026-11-25; only real estate rents). A partner still sending them is not refused; the values are
+ * dropped before the detail is checked, so nothing breaks on their side.
+ */
+export const RETIRED_DETAIL_KEYS = {
+  yachts: ["isCharterAvailable"],
+  jets: ["isCharterAvailable", "charterHourlyRate"],
+  helicopters: ["isCharterAvailable", "charterHourlyRate"],
+};
+
+/** `detail` without the retired keys of `listingType` (the same object when it has none). */
+export function withoutRetiredDetails(listingType, detail) {
+  const retired = RETIRED_DETAIL_KEYS[listingType];
+  if (!retired || !detail || typeof detail !== "object") return detail;
+  if (!retired.some((key) => key in detail)) return detail;
+  return Object.fromEntries(Object.entries(detail).filter(([key]) => !retired.includes(key)));
+}

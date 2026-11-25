@@ -1,5 +1,6 @@
 import { query, queryOne } from "../../db/query.js";
 import { AppError } from "../../utils/errors.js";
+import { heldListingsCondition } from "../accounts/entitlement.js";
 
 // The frontend's location entity ids are `type:key` strings. `type` is the
 // frontend's own vocabulary (subcommunity, not sub_community).
@@ -189,8 +190,10 @@ export async function searchLocations({ q, types = [], parentId = null, ancestor
   const joinParams = [];
   if (categoryRootId) {
     const tiers = ["country_id", "state_id", "city_id", "community_id", "sub_community_id"];
+    // Held sellers' listings are not counted, as search does not show them (0084).
+    const held = await heldListingsCondition("listing_search");
     const union = tiers
-      .map((tier) => `SELECT ${tier} AS location_id FROM listing_search WHERE root_category_id = ? AND ${tier} IS NOT NULL`)
+      .map((tier) => `SELECT ${tier} AS location_id FROM listing_search WHERE root_category_id = ? AND ${tier} IS NOT NULL${held ? ` AND ${held}` : ""}`)
       .join(" UNION ALL ");
     fromClause = `${FROM_CLAUSE}
   JOIN (SELECT location_id, COUNT(*) AS n FROM (${union}) tiers GROUP BY location_id) lc ON lc.location_id = l.id`;

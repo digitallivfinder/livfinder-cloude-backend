@@ -113,15 +113,15 @@ INSERT INTO categories (id, public_id, parent_id, root_category_id, code, slug, 
 -- -----------------------------------------------------------------------------
 -- Which purposes apply to which asset class
 --
--- Watches are sale-only. Yachts and aircraft charter rather than rent. Applied
+-- Only real estate rents (0086): the other marketplaces are sale only. Applied
 -- to the root categories and inherited by their children in application code.
 -- -----------------------------------------------------------------------------
 INSERT INTO category_purposes (category_id, purpose_id, is_default, sort_order) VALUES
   (1, 1, 1, 1), (1, 2, 0, 2),                          -- real estate: sale, rent
-  (2, 1, 1, 1), (2, 2, 0, 2), (2, 5, 0, 3),            -- cars: sale, rent, auction
-  (3, 1, 1, 1), (3, 3, 0, 2),                          -- yachts: sale, charter
-  (4, 1, 1, 1), (4, 3, 0, 2), (4, 4, 0, 3),            -- jets: sale, charter, lease
-  (5, 1, 1, 1), (5, 3, 0, 2),                          -- helicopters: sale, charter
+  (2, 1, 1, 1), (2, 5, 0, 3),                          -- cars: sale, auction (no rent since 0086)
+  (3, 1, 1, 1),                                        -- yachts: sale
+  (4, 1, 1, 1),                                        -- jets: sale
+  (5, 1, 1, 1),                                        -- helicopters: sale
   (6, 1, 1, 1), (6, 5, 0, 2);                          -- watches: sale, auction
 
 -- -----------------------------------------------------------------------------

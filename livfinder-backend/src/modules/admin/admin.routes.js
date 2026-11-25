@@ -37,6 +37,8 @@ import { allPermissionCodes } from "../auth/rbac.js";
 import { sendAccountSetupEmail } from "../auth/auth.service.js";
 import { adminCompanyCreateSchema, adminIndividualCreateSchema, createCompanyByAdmin, createIndividualByAdmin } from "./admin.accountCreation.js";
 import { archiveAdminContact, contactWriteSchema, createAdminContact, updateAdminContact } from "./admin.contacts.js";
+import { packageAccessSummary, setPaymentsRequired } from "../accounts/entitlement.js";
+import { listActivity } from "./admin.activity.js";
 
 const router = Router();
 
@@ -451,6 +453,41 @@ router.patch(
   })
 );
 
+/* An agent's own verification: the agent uploads from My Profile, LivFinder decides here. */
+router.get(
+  "/companies/:id/agents/:agentId/verification",
+  requirePermission("companies.verify"),
+  asyncHandler(async (req, res) => {
+    const result = await catalog.getCompanyAgentVerification(req.params.id, req.params.agentId);
+    if (!result) throw AppError.notFound("That agent was not found on this company.");
+    return res.json(detailResponse(result));
+  })
+);
+
+router.patch(
+  "/companies/:id/agents/:agentId/verification",
+  writeLimiter,
+  requirePermission("companies.verify"),
+  validate({ body: mutations.verificationDecisionSchema }),
+  asyncHandler(async (req, res) => {
+    const found = await catalog.getCompanyAgentVerification(req.params.id, req.params.agentId);
+    if (!found) throw AppError.notFound("That agent was not found on this company.");
+    const result = await mutations.decideVerification({
+      subjectType: "agent",
+      identifier: req.params.agentId,
+      ...req.body,
+      userId: req.auth.user.id,
+    });
+    await auditFromRequest(req, {
+      action: `agent.verification_${req.body.decision}`,
+      subjectType: "agent",
+      subjectLabel: req.params.agentId,
+      changes: req.body,
+    });
+    return res.json(detailResponse(result));
+  })
+);
+
 router.patch(
   "/companies/:id/status",
   writeLimiter,
@@ -824,6 +861,30 @@ router.delete(
     await revokeFeedToken({ accountId, publicId: req.params.feedId });
     await auditIntegration(req, "lead_feed_token.revoked", req.params.feedId);
     return res.json(detailResponse({ revoked: true }));
+  })
+);
+
+/** Free access (0084): this account uses its package without paying, whatever the switch says. */
+router.get(
+  "/companies/:id/free-access",
+  requirePermission("companies.view", "finance.plans"),
+  asyncHandler(async (req, res) => res.json(detailResponse(await mutations.getAccountFreeAccess(req.params.id))))
+);
+
+router.put(
+  "/companies/:id/free-access",
+  writeLimiter,
+  requirePermission("companies.edit", "finance.plans"),
+  validate({ body: z.object({ enabled: z.boolean() }) }),
+  asyncHandler(async (req, res) => {
+    const result = await mutations.setAccountFreeAccess({ identifier: req.params.id, enabled: req.body.enabled, userId: req.auth.user.id });
+    await auditFromRequest(req, {
+      action: req.body.enabled ? "account.free_access_granted" : "account.free_access_removed",
+      subjectType: "account",
+      subjectLabel: req.params.id,
+      changes: req.body,
+    });
+    return res.json(detailResponse(result));
   })
 );
 
@@ -1618,6 +1679,33 @@ router.patch(
   })
 );
 
+/**
+ * "Clients must pay" (0084). Off: every client uses their package without paying, and no billing
+ * warning reaches them. On: a package must be paid unless the client has free access.
+ */
+router.get(
+  "/settings/payment/access",
+  requirePermission("settings.view", "finance.view"),
+  asyncHandler(async (req, res) => res.json(detailResponse(await packageAccessSummary())))
+);
+
+router.patch(
+  "/settings/payment/access",
+  writeLimiter,
+  requirePermission("settings.manage", "finance.plans"),
+  validate({ body: z.object({ paymentsRequired: z.boolean() }) }),
+  asyncHandler(async (req, res) => {
+    await setPaymentsRequired(req.body.paymentsRequired, req.auth.user.id);
+    await auditFromRequest(req, {
+      action: "settings.updated",
+      subjectType: "settings",
+      subjectLabel: "payment",
+      changes: { paymentsRequired: req.body.paymentsRequired },
+    });
+    return res.json(detailResponse(await packageAccessSummary()));
+  })
+);
+
 for (const group of ["listings", "security", "seo"]) {
   router.get(
     `/settings/${group}`,
@@ -1759,6 +1847,19 @@ router.post(
   })
 );
 
+router.delete(
+  "/access-users/:id",
+  writeLimiter,
+  requirePermission("accessManagement.manageUsers"),
+  // SEC-IAM-011: high-risk, so the session must have re-proved itself recently.
+  requireStepUp(),
+  asyncHandler(async (req, res) => {
+    const result = await mutations.deleteInternalUser({ identifier: req.params.id, actorUserId: req.auth.user.id });
+    await auditFromRequest(req, { action: "internal_user.deleted", subjectType: "user", subjectLabel: result.email });
+    return res.json(detailResponse({ id: result.id, deleted: true }));
+  })
+);
+
 router.patch(
   "/access-users/:id",
   writeLimiter,
@@ -1830,6 +1931,26 @@ router.get(
  * The audit trail, queryable at last. Gated on `system.view` — the same permission that opens
  * system logs, because they answer the same kind of question.
  */
+// System Logs → Activity: who did what, as a sentence, linked to the admin page it was about.
+router.get(
+  "/activity",
+  requirePermission("system.view"),
+  validate({
+    query: z.object({
+      q: z.string().trim().max(200).optional(),
+      area: z.string().trim().max(60).optional(),
+      from: z.string().trim().max(40).optional(),
+      to: z.string().trim().max(40).optional(),
+      page: z.coerce.number().int().min(1).max(5000).optional(),
+      pageSize: z.coerce.number().int().min(1).max(200).optional(),
+    }).partial(),
+  }),
+  asyncHandler(async (req, res) => {
+    const { q, ...rest } = req.query;
+    return res.json(await listActivity({ search: q || "", ...rest }));
+  })
+);
+
 router.get(
   "/audit-events",
   requirePermission("system.view"),

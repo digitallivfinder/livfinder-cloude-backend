@@ -5,6 +5,7 @@ import { withTransaction } from "../../db/transaction.js";
 import { ulid } from "../../utils/ids.js";
 import { AppError } from "../../utils/errors.js";
 import { notifyInvoicePaid } from "./notifications.service.js";
+import { refreshPackageHold } from "../accounts/entitlement.js";
 
 /**
  * Payment adapter for paying an outstanding invoice.
@@ -89,7 +90,25 @@ async function settleInvoicePayment({ invoice, accountId, userId, intentId, prov
       [invoice.id],
       connection
     );
+    // Paying the last unpaid invoice of a past-due subscription brings it back: active again,
+    // with a fresh period when the old one has already ended.
+    if (invoice.subscription_id) {
+      await execute(
+        `UPDATE subscriptions s
+            SET s.status = 'active',
+                s.current_period_start = IF(s.current_period_end IS NULL OR s.current_period_end < NOW(3), NOW(3), s.current_period_start),
+                s.current_period_end = IF(s.current_period_end IS NULL OR s.current_period_end < NOW(3),
+                  DATE_ADD(NOW(3), INTERVAL (CASE s.billing_interval WHEN 'quarterly' THEN 3 WHEN 'yearly' THEN 12 ELSE 1 END) MONTH),
+                  s.current_period_end),
+                s.updated_at = NOW(3)
+          WHERE s.id = ? AND s.status = 'past_due'
+            AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.subscription_id = s.id AND i.id <> ? AND i.status IN ('open', 'past_due', 'partially_paid'))`,
+        [invoice.subscription_id, invoice.id],
+        connection
+      );
+    }
   });
+  await refreshPackageHold(accountId);
   await notifyInvoicePaid({ accountId, invoice });
 }
 

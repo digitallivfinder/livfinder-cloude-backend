@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { client, adminEmail, cleanupListings, cleanupProjects, ensureTestPassword, execute, queryOne } from "../helpers/testApp.js";
+import { client, adminEmail, cleanupListings, cleanupProjects, ensureTestPassword, execute, queryOne, ensurePackageForEmail } from "../helpers/testApp.js";
 import { closePool } from "../../src/db/pool.js";
 
 /**
@@ -18,6 +18,13 @@ const createdListings = [];
 const createdProjects = [];
 
 async function ownerForCategory(categoryId) {
+  // Sellers need a package to publish (0084).
+  const owner = await ownerForCategoryRow(categoryId);
+  if (owner) await ensurePackageForEmail(owner.email);
+  return owner;
+}
+
+async function ownerForCategoryRow(categoryId) {
   return queryOne(
     `SELECT u.email, a.id AS account_id
        FROM users u
@@ -97,7 +104,7 @@ describe.each(CASES)("an owner's change to a live $category listing", ({ categor
     const created = await portal.send("post", "/v1/portal/listings", {
       category,
       categorySlug,
-      purpose: category === "yachts" ? "charter" : "sale",
+      purpose: "sale",
       title: `QA reapproval ${category} ${Date.now()}`,
       subtitle: "Approved subtitle",
       description: `<p>Exercises re-approval after an owner edit for ${category}.</p>`,
@@ -263,6 +270,7 @@ describe("a developer's change to a live development", () => {
         WHERE u.status = 'active' AND u.deleted_at IS NULL
         ORDER BY u.id LIMIT 1`
     );
+    await ensurePackageForEmail(owner.email);
     await developer.login(owner.email, PASSWORD);
     await admin.login(await adminEmail("super_admin"), PASSWORD);
     await admin.stepUp();

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { adminEmail, cleanupListings, cleanupUsers, client, ensureTestPassword, execute, query, queryOne } from "../helpers/testApp.js";
+import { adminEmail, cleanupListings, cleanupUsers, client, ensureTestPassword, execute, query, queryOne, ensurePackageForEmail } from "../helpers/testApp.js";
 import { getStorage } from "../../src/config/storage.js";
 
 /**
@@ -175,6 +175,8 @@ describe("Individual seller", () => {
   });
 
   it("has its seller tools and keeps what it had", async () => {
+    // A seller picks a package before the seller tools open (0084).
+    await ensurePackageForEmail(email);
     for (const path of ["/v1/portal/listings", "/v1/portal/leads", "/v1/portal/bookings", "/v1/portal/inquiries", "/v1/portal/categories", "/v1/portal/billing", "/v1/portal/favourites", "/v1/portal/my-enquiries", "/v1/portal/my-viewings"]) {
       expect(await statusOf(path), path).toBe(200);
     }

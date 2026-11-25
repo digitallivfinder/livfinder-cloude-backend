@@ -1,4 +1,5 @@
 import { requireAccount, requireSellerTools } from "./middleware/auth.js";
+import { requirePackage } from "./modules/accounts/entitlement.js";
 import { devMailboxRouter } from "./modules/system/devMailbox.routes.js";
 import { devEmailsRouter } from "./modules/email/devPreview.routes.js";
 import { emailPublicRouter } from "./modules/email/email.routes.js";
@@ -132,7 +133,8 @@ export function createApp() {
   app.use("/v1/chat", chatRouter);
   app.use("/v1/accounts", accountsRouter);
   app.use("/v1/media", mediaRouter);
-  app.use("/v1/portal", requireAccount, requireSellerTools);
+  // A seller without a working package keeps only the basics (modules/accounts/entitlement.js).
+  app.use("/v1/portal", requireAccount, requireSellerTools, requirePackage);
   app.use("/v1/portal", portalCalendarRouter);
   app.use("/v1/portal", myRecordsRouter);
   app.use("/v1/portal", portalFeedFormatsRouter);

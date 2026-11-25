@@ -222,7 +222,7 @@ ${body}
 </td></tr>
 <tr><td class="lf-muted" style="padding:20px 32px 8px;font-family:${T.body};font-size:12px;line-height:1.6;color:${T.slate}" dir="${dir}">
 ${footer.reason ? `${e(footer.reason)}<br>` : ""}${footerLinks.join(" &nbsp;·&nbsp; ")}<br>
-© ${year} ${e(env.EMAIL_LEGAL_NAME)} · ${e(env.EMAIL_LEGAL_ADDRESS)}${footer.reference ? `<br><span style="color:#98a6b6">Ref ${e(footer.reference)}</span>` : ""}
+© ${year} ${e(env.EMAIL_LEGAL_NAME)}${footer.reference ? `<br><span style="color:#98a6b6">Ref ${e(footer.reference)}</span>` : ""}
 </td></tr>
 </table></td></tr></table>
 </body></html>`;
@@ -235,7 +235,7 @@ ${footer.reason ? `${e(footer.reason)}<br>` : ""}${footerLinks.join(" &nbsp;·&n
     footer.reason,
     footer.settingsUrl && `Email settings: ${footer.settingsUrl}`,
     footer.unsubscribeUrl && `Unsubscribe: ${footer.unsubscribeUrl}`,
-    `${env.EMAIL_LEGAL_NAME} · ${env.EMAIL_LEGAL_ADDRESS}`,
+    `© ${new Date().getFullYear()} ${env.EMAIL_LEGAL_NAME}`,
   ]
     .filter((line) => line !== undefined && line !== null && line !== false)
     .join("\n")

@@ -2,7 +2,7 @@ import env from "../../config/env.js";
 import logger from "../../config/logger.js";
 import { execute, query, queryOne } from "../../db/query.js";
 import { sendMail } from "../system/mail.service.js";
-import { CATEGORIES, isOptional, streamFor } from "./catalog.js";
+import { CATEGORIES, isOptional } from "./catalog.js";
 import { localClock, siteUrl } from "./format.js";
 import { preferencesFor, suppressionFor, unsubscribeToken } from "./preferences.js";
 import { renderEmail } from "./render.js";
@@ -105,8 +105,8 @@ export async function composeMessage(row, { forceDark = false } = {}) {
     headers["List-Unsubscribe"] = `<${siteUrl(`/v1/email/unsubscribe?token=${encodeURIComponent(unsubscribeToken(row.to_email, category))}`)}>`;
     headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click";
   }
-  const stream = streamFor(category);
-  const from = stream === "news" ? env.MAIL_FROM_NEWS || env.MAIL_FROM : stream === "alerts" ? env.MAIL_FROM_ALERTS || env.MAIL_FROM : env.MAIL_FROM;
+  // Every stream sends from the one no-reply sender.
+  const from = env.MAIL_FROM;
   return {
     to: row.to_email,
     from,

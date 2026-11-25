@@ -3,6 +3,7 @@ import { agentIn, applyColumnFilters, locationAtAnyTier } from "../../utils/colu
 import { bool, int, isoDate, isoDay, num } from "../../serializers/primitives.js";
 import { frontendCategoryId, categoryByRootId } from "../../utils/categories.js";
 import { qualityBand } from "../quality/listingQuality.js";
+import { agentInquiryClause } from "./agentScope.js";
 
 /**
  * Portal read model.
@@ -297,11 +298,20 @@ export async function listAccountListings({
     queryValue(`SELECT COUNT(*) FROM listings l ${where}`, params),
     // The counters read the same rows the tabs then show, from the view that
     // exists for exactly this reason.
-    queryOne(
-      `SELECT total, active, pending, drafts, sold_rented, expired, rejected
-         FROM v_account_listing_counts WHERE account_id = ?`,
-      [accountId]
-    ),
+    // An agent's tabs count their own listings, the same rows their list shows.
+    agentId
+      ? queryOne(
+          `SELECT COUNT(*) AS total, SUM(status = 'active') AS active, SUM(status = 'pending_review') AS pending,
+                  SUM(status = 'draft') AS drafts, SUM(status IN ('sold','rented')) AS sold_rented,
+                  SUM(status = 'expired') AS expired, SUM(status = 'rejected') AS rejected
+             FROM listings WHERE account_id = ? AND agent_id = ? AND deleted_at IS NULL`,
+          [accountId, agentId]
+        )
+      : queryOne(
+          `SELECT total, active, pending, drafts, sold_rented, expired, rejected
+             FROM v_account_listing_counts WHERE account_id = ?`,
+          [accountId]
+        ),
   ]);
 
   const overview = {
@@ -345,37 +355,51 @@ export async function getAccountListing({ accountId, identifier }) {
 /* Dashboard                                                                   */
 /* -------------------------------------------------------------------------- */
 
-export async function accountDashboard({ accountId, organizationId }) {
+export async function accountDashboard({ accountId, organizationId, agentId = null }) {
+  // An agent-role member's dashboard counts their own listings and enquiries, as their lists do.
+  const own = agentId != null;
+  const listingAgent = own ? " AND agent_id = ?" : "";
+  const listingAgentL = own ? " AND l.agent_id = ?" : "";
+  const agentParam = own ? [agentId] : [];
+  const inquiryOwn = own ? agentInquiryClause("i", agentId) : { sql: "1 = 1", params: [] };
   const [counts, totals, recentListings, recentInquiries, series] = await Promise.all([
-    queryOne(
-      `SELECT total, active, pending, drafts, sold_rented, expired, rejected
-         FROM v_account_listing_counts WHERE account_id = ?`,
-      [accountId]
-    ),
+    own
+      ? queryOne(
+          `SELECT COUNT(*) AS total, SUM(status = 'active') AS active, SUM(status = 'pending_review') AS pending,
+                  SUM(status = 'draft') AS drafts, SUM(status IN ('sold','rented')) AS sold_rented,
+                  SUM(status = 'expired') AS expired, SUM(status = 'rejected') AS rejected
+             FROM listings WHERE account_id = ? AND agent_id = ? AND deleted_at IS NULL`,
+          [accountId, agentId]
+        )
+      : queryOne(
+          `SELECT total, active, pending, drafts, sold_rented, expired, rejected
+             FROM v_account_listing_counts WHERE account_id = ?`,
+          [accountId]
+        ),
     queryOne(
       `SELECT COALESCE(SUM(view_count), 0) AS views,
               COALESCE(SUM(inquiry_count), 0) AS inquiries,
               COALESCE(SUM(favourite_count), 0) AS favourites
-         FROM listings WHERE account_id = ? AND deleted_at IS NULL`,
-      [accountId]
+         FROM listings WHERE account_id = ? AND deleted_at IS NULL${listingAgent}`,
+      [accountId, ...agentParam]
     ),
     query(
       `SELECT ${PORTAL_LISTING_COLUMNS} FROM listings l ${PORTAL_LISTING_JOINS}
-        WHERE l.account_id = ? AND l.deleted_at IS NULL
+        WHERE l.account_id = ? AND l.deleted_at IS NULL${listingAgentL}
         ORDER BY l.updated_at DESC LIMIT 3`,
-      [accountId]
+      [accountId, ...agentParam]
     ),
     query(
       `SELECT i.public_id, i.name, i.message, i.status, i.created_at,
               l.title AS listing_title, l.cover_image_url
          FROM inquiries i
          LEFT JOIN listings l ON l.id = i.listing_id
-        WHERE (i.account_id = ? OR i.organization_id = ?) AND i.deleted_at IS NULL AND i.is_spam = 0
+        WHERE (i.account_id = ? OR i.organization_id = ?) AND ${inquiryOwn.sql} AND i.deleted_at IS NULL AND i.is_spam = 0
         ORDER BY i.created_at DESC LIMIT 4`,
-      [accountId, organizationId ?? null]
+      [accountId, organizationId ?? null, ...inquiryOwn.params]
     ),
     // Read from the daily rollup, never from the raw event stream.
-    performanceSeries(accountId),
+    performanceSeries(accountId, agentId),
   ]);
 
   const performance = buildPerformanceSeries(series);
@@ -429,12 +453,14 @@ const PERFORMANCE_BUCKET_DAYS = 4;
  * the nightly job has not run yet is worse than one that shows the last real
  * period.
  */
-async function performanceSeries(accountId) {
+async function performanceSeries(accountId, agentId = null) {
+  const agentSql = agentId != null ? " AND l.agent_id = ?" : "";
+  const agentParam = agentId != null ? [agentId] : [];
   const anchor = await queryValue(
     `SELECT MAX(d.stat_date) FROM listing_daily_stats d
        JOIN listings l ON l.id = d.listing_id
-      WHERE l.account_id = ?`,
-    [accountId]
+      WHERE l.account_id = ?${agentSql}`,
+    [accountId, ...agentParam]
   );
   if (!anchor) return { rows: [], anchor: null };
   const span = PERFORMANCE_BUCKETS * PERFORMANCE_BUCKET_DAYS;
@@ -444,11 +470,11 @@ async function performanceSeries(accountId) {
             COALESCE(SUM(d.inquiries), 0) AS inquiries
        FROM listing_daily_stats d
        JOIN listings l ON l.id = d.listing_id
-      WHERE l.account_id = ?
+      WHERE l.account_id = ?${agentSql}
         AND d.stat_date <= ?
         AND d.stat_date > DATE_SUB(?, INTERVAL ? DAY)
       GROUP BY bucket`,
-    [anchor, PERFORMANCE_BUCKET_DAYS, accountId, anchor, anchor, span]
+    [anchor, PERFORMANCE_BUCKET_DAYS, accountId, ...agentParam, anchor, anchor, span]
   );
   return { rows, anchor };
 }

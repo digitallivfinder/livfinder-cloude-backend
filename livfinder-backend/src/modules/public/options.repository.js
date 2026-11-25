@@ -1,10 +1,17 @@
 import { normalizePurpose, offeredForCondition } from "../search/realEstateCatalogue.js";
 import { query } from "../../db/query.js";
 import { resolveCategory } from "../../utils/categories.js";
-import { SPEC_MAP } from "../search/searchFilters.js";
+import { CAR_COLOUR_OPTIONS, SPEC_MAP } from "../search/searchFilters.js";
 import { isPropertySegment } from "../search/propertySegments.js";
-import { MARKET_OPTIONS, sellerTypeOptions } from "../search/marketAndSeller.js";
+import { CAR_CONDITION_OPTIONS, MARKET_OPTIONS, WATCH_CASE_MATERIAL_OPTIONS, WATCH_CONDITION_OPTIONS, WATCH_FULL_SET_OPTIONS, YACHT_TYPE_OPTIONS, aircraftSizeOptions, hasListedBy, sellerTypeOptions, watchGenderOptions } from "../search/marketAndSeller.js";
 import { resolveLocation, searchLocations, toEntity } from "../locations/locations.repository.js";
+import { heldListingsCondition } from "../accounts/entitlement.js";
+
+/** "AND <listing not held>" for the counts below, so a filter never counts what search hides (0084). */
+async function heldAnd(alias = "listing_search") {
+  const held = await heldListingsCondition(alias);
+  return held ? `AND ${held}` : "";
+}
 
 /**
  * `brands.kind` is how the catalogue separates makes from builders from
@@ -104,7 +111,7 @@ export async function listBrands(listingType, { q = null, limit = 40, onlyWithLi
   if (definition?.rootId) {
     joinSql = `LEFT JOIN (
         SELECT brand_id, COUNT(*) AS n FROM listing_search
-         WHERE root_category_id = ? AND brand_id IS NOT NULL
+         WHERE root_category_id = ? AND brand_id IS NOT NULL ${await heldAnd()}
          GROUP BY brand_id
       ) live ON live.brand_id = b.id`;
     countExpr = "COALESCE(live.n, 0)";
@@ -163,7 +170,7 @@ export async function listModels(listingType, { brandSlug = null, q = null, limi
        LEFT JOIN (
          SELECT brand_model_id, COUNT(*) AS n
            FROM listing_search
-          WHERE brand_model_id IS NOT NULL${definition?.rootId ? " AND root_category_id = ?" : ""}
+          WHERE brand_model_id IS NOT NULL${definition?.rootId ? " AND root_category_id = ?" : ""} ${await heldAnd()}
           GROUP BY brand_model_id
        ) live ON live.brand_model_id = bm.id
       WHERE ${conditions.join(" AND ")}
@@ -218,7 +225,7 @@ export async function listCategoryTypes(listingType, { q = null, limit = 60, seg
        FROM categories c
        ${all ? "LEFT JOIN" : "JOIN"} (
          SELECT category_slug, COUNT(*) AS n FROM listing_search
-          WHERE root_category_id = ? AND category_slug IS NOT NULL${liveFilter}
+          WHERE root_category_id = ? AND category_slug IS NOT NULL${liveFilter} ${await heldAnd()}
           GROUP BY category_slug
        ) live ON live.category_slug = c.slug
       WHERE c.root_category_id = ? AND c.id <> c.root_category_id
@@ -269,7 +276,7 @@ async function listYears(listingType) {
   const rows = await query(
     `SELECT ${column} AS value, COUNT(*) AS listing_count
        FROM listing_search
-      WHERE root_category_id = ? AND ${column} IS NOT NULL AND ${column} <> ''
+      WHERE root_category_id = ? AND ${column} IS NOT NULL AND ${column} <> '' ${await heldAnd()}
       GROUP BY ${column}
       ORDER BY CAST(${column} AS UNSIGNED) DESC`,
     [definition.rootId]
@@ -294,7 +301,7 @@ async function facetValues(listingType, column, { limit = 40 } = {}) {
   const rows = await query(
     `SELECT ${column} AS value, COUNT(*) AS listing_count
        FROM listing_search
-      WHERE root_category_id = ? AND ${column} IS NOT NULL AND ${column} <> ''
+      WHERE root_category_id = ? AND ${column} IS NOT NULL AND ${column} <> '' ${await heldAnd()}
       GROUP BY ${column}
       ORDER BY listing_count DESC
       LIMIT ${safeLimit}`,
@@ -372,7 +379,7 @@ const FACET_KEY_COLUMN = {
   yachts: { yachtType: "facet_a", hullMaterial: "facet_b" },
   jets: { aircraftType: "facet_a", engineProgram: "facet_b" },
   helicopters: { helicopterType: "facet_a", aircraftType: "facet_a", engineProgram: "facet_b" },
-  watches: { movement: "facet_a", condition: "facet_b", caseMaterial: "facet_c" },
+  watches: { movement: "facet_a", condition: "facet_b" },
 };
 
 /**
@@ -454,10 +461,44 @@ export async function filterOptions(category, filterKey, { q = null, parent = nu
     return MARKET_OPTIONS;
   }
 
-  if (listingType === "real-estate" && filterKey === "listedBy") {
-    // The `accounts.seller_type` values, with the names buyers use (Agency, Owner).
+  if (filterKey === "listedBy" && hasListedBy(listingType)) {
+    // The `accounts.seller_type` values, with the names buyers use in that marketplace
+    // (real estate: Developer, Agency, Owner; cars: Dealer, Private seller).
     const values = (await enumOptions("accounts", "seller_type", "listedBy")).map((option) => option.value);
-    return sellerTypeOptions(values);
+    return sellerTypeOptions(values, listingType);
+  }
+
+  if (listingType === "cars" && CAR_COLOUR_OPTIONS[filterKey]) {
+    // Colour families, each searched against the makers' own names (COLOUR_FAMILIES).
+    const options = CAR_COLOUR_OPTIONS[filterKey].map((value) => ({ id: `${filterKey}:${value}`, value, slug: value, label: humanise(value), type: filterKey }));
+    return q ? options.filter((option) => option.label.toLowerCase().startsWith(q.toLowerCase())) : options;
+  }
+
+  // Watches (2026-11-25): fixed lists or the ENUMs, never what listings carry.
+  if (listingType === "watches") {
+    const fixed = {
+      condition: () => WATCH_CONDITION_OPTIONS,
+      isFullSet: () => WATCH_FULL_SET_OPTIONS,
+      caseMaterial: () => WATCH_CASE_MATERIAL_OPTIONS,
+      gender: async () => watchGenderOptions((await enumOptions("listing_timepiece", "gender", "gender")).map((option) => option.value)),
+      movement: () => enumOptions("listing_timepiece", "movement_type", "movement"),
+    }[filterKey];
+    if (fixed) {
+      const options = await fixed();
+      return q ? options.filter((option) => option.label.toLowerCase().startsWith(q.toLowerCase())) : options;
+    }
+  }
+
+  if (filterKey === "size" && aircraftSizeOptions(listingType).length) {
+    return aircraftSizeOptions(listingType);
+  }
+
+  if (listingType === "yachts" && filterKey === "yachtType") {
+    return q ? YACHT_TYPE_OPTIONS.filter((option) => option.label.toLowerCase().startsWith(q.toLowerCase())) : YACHT_TYPE_OPTIONS;
+  }
+
+  if (listingType === "cars" && filterKey === "condition") {
+    return q ? CAR_CONDITION_OPTIONS.filter((option) => option.label.toLowerCase().startsWith(q.toLowerCase())) : CAR_CONDITION_OPTIONS;
   }
 
   if (filterKey === "amenities") {
@@ -571,7 +612,7 @@ export async function categoryCounts() {
     `SELECT c.id, c.code, c.slug, c.name, c.name_plural, c.hero_image_url,
             COUNT(ls.listing_id) AS listing_count
        FROM categories c
-       LEFT JOIN listing_search ls ON ls.root_category_id = c.id
+       LEFT JOIN listing_search ls ON ls.root_category_id = c.id ${await heldAnd("ls")}
       WHERE c.parent_id IS NULL AND c.status = 'active'
       GROUP BY c.id
       ORDER BY c.sort_order ASC, c.id ASC`,

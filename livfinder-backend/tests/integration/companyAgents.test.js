@@ -282,7 +282,8 @@ describe("Inviting someone who already has a login", () => {
 
 describe("Team seats", () => {
   it("refuses an invitation past the plan's seats", async () => {
-    const plan = await queryOne("SELECT id FROM plans ORDER BY id LIMIT 1");
+    // A business plan: a personal one is no package at all for a company (0084).
+    const plan = await queryOne("SELECT id FROM plans WHERE audience <> 'personal' ORDER BY id LIMIT 1");
     const before = await queryOne("SELECT agent_seat_quota FROM plans WHERE id = ?", [plan.id]);
     const subscription = await execute(
       `INSERT INTO subscriptions (public_id, account_id, plan_id, status, billing_interval, amount, currency_code, created_at)

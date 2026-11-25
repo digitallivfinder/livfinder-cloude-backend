@@ -10,6 +10,8 @@ import * as locationsRepo from "../locations/locations.repository.js";
 import * as editorialRepo from "../editorial/editorial.repository.js";
 import * as optionsRepo from "./options.repository.js";
 import * as sitemapRepo from "./sitemap.repository.js";
+import * as llmsRepo from "./llms.repository.js";
+import * as hubSummaryRepo from "./hubSummary.repository.js";
 import { listingSearchQuery, slugParam, locationsQuery, paginationQuery } from "./public.schemas.js";
 import { resolveCategory } from "../../utils/categories.js";
 import { query } from "../../db/query.js";
@@ -727,10 +729,38 @@ router.get(
 router.get(
   "/sitemap",
   asyncHandler(async (req, res) => {
+    // `page`/`pageSize` split the big sections into files of up to 10,000 URLs; `kind=counts`
+    // says how many URLs each section holds, so the sitemap index can list every file.
     const entries = await sitemapRepo.sitemapEntries(String(req.query.kind || "all"), {
       category: req.query.category ? String(req.query.category) : undefined,
+      page: req.query.page ? Number(req.query.page) : undefined,
+      pageSize: req.query.pageSize ? Math.min(sitemapRepo.SITEMAP_PAGE_SIZE, Number(req.query.pageSize)) : undefined,
     });
     return res.json({ data: entries });
+  })
+);
+
+// What a browse page says about itself (intro paragraph and FAQ): counts, price range, top types
+// and child pages. 404 for a category or path that is not a marketplace browse page.
+router.get(
+  "/hub-summary",
+  asyncHandler(async (req, res) => {
+    const data = await hubSummaryRepo.hubSummary(String(req.query.category || ""), String(req.query.path || ""));
+    if (!data) throw new AppError("No such browse page", { status: 404, code: "NOT_FOUND" });
+    return res.json({ data });
+  })
+);
+
+// Compact facts for the website's llms files: `kind` = counts | listings (+category) | projects | posts.
+router.get(
+  "/llms",
+  asyncHandler(async (req, res) => {
+    const data = await llmsRepo.llmsEntries(String(req.query.kind || ""), {
+      category: req.query.category ? String(req.query.category) : undefined,
+      page: req.query.page ? Number(req.query.page) : undefined,
+      pageSize: req.query.pageSize ? Number(req.query.pageSize) : undefined,
+    });
+    return res.json({ data });
   })
 );
 

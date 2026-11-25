@@ -5,7 +5,7 @@ import { retryTransient } from "../../db/retry.js";
 import { AppError } from "../../utils/errors.js";
 import { notifyRejectedListings } from "./rejectionNotice.service.js";
 import { importProviderId } from "./importConnection.js";
-import { importDevelopmentsRun } from "../feeds/developmentImport.service.js";
+import { importDevelopmentsRun, withdrawImportedDevelopment } from "../feeds/developmentImport.service.js";
 import { assertAddonActive } from "../accounts/addons.service.js";
 import * as repo from "./imports.repository.js";
 import { importListing, parseListingRecord, withdrawImportedListing } from "./listingImport.service.js";
@@ -40,11 +40,25 @@ export async function runSingleImport({ client, ctx, record, ip, userAgent, requ
 }
 
 /** A withdrawal, recorded like any other change so it shows in the company's history. */
+/**
+ * A takedown by externalId: a pushed listing or, for a developer company, a pushed development.
+ * A development's outcome carries `project` (and `listing` for the import log, as its own run does).
+ */
+async function withdrawPushed(args) {
+  try {
+    return await withdrawImportedListing(args);
+  } catch (error) {
+    if (error?.status !== 404 || !args.client?.organizationId) throw error;
+    const outcome = await withdrawImportedDevelopment(args);
+    return { ...outcome, listing: outcome.project };
+  }
+}
+
 export async function runWithdrawal({ client, ctx, externalId, ip, userAgent, requestId }) {
   const importRun = await repo.createImportRun({ client, ctx, type: "single", total: 1, status: "running", ip, userAgent });
   const [itemId] = await repo.addImportItems(importRun.id, [{ row: 1, externalId, raw: { externalId, action: "withdraw" } }]);
   try {
-    const outcome = await retryTransient(() => withdrawImportedListing({ client, ctx, externalId, importId: importRun.publicId, ip, requestId }), { label: "listing withdrawal" });
+    const outcome = await retryTransient(() => withdrawPushed({ client, ctx, externalId, importId: importRun.publicId, ip, requestId }), { label: "listing withdrawal" });
     await repo.recordItemSuccess(itemId, importRun.id, { ...outcome, warnings: [] });
     await repo.finalizeImport(importRun.id);
     return { importRun, outcome };
@@ -206,7 +220,7 @@ export async function processImport(importId) {
       const outcome = await retryTransient(
         () =>
           raw.withdraw
-            ? withdrawImportedListing({ client, ctx, externalId: raw.externalId, importId: run.public_id, ip: run.source_ip })
+            ? withdrawPushed({ client, ctx, externalId: raw.externalId, importId: run.public_id, ip: run.source_ip })
             : importListing({ client, ctx, record: parseListingRecord(raw), source, importId: run.public_id, ip: run.source_ip }),
         { label: "listing import item" }
       );

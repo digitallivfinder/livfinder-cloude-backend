@@ -2,6 +2,7 @@ import { query, queryOne, execute, callProcedure } from "../../db/query.js";
 import { serializeListingDetail } from "../../serializers/listing.js";
 import { serializeCompany, serializeAgent } from "../../serializers/organization.js";
 import { categoryByRootId } from "../../utils/categories.js";
+import { listingContactNumbers } from "../search/search.repository.js";
 
 const LISTING_COLUMNS = `
   l.*,
@@ -90,7 +91,11 @@ async function loadRelated(listing, { includePrivate = false } = {}) {
       [listingId]
     ),
     listing.organization_id ? loadOrganizationSummary(listing.organization_id) : null,
-    listing.agent_id ? loadAgentSummary(listing.agent_id) : null,
+    listing.agent_id
+      ? loadAgentSummary(listing.agent_id)
+      : listing.organization_id
+        ? null
+        : loadIndividualSellerProfile(listingId),
     listing.project_id
       ? queryOne(
           `SELECT public_id, name, slug, status, expected_completion_date FROM projects WHERE id = ?`,
@@ -100,6 +105,21 @@ async function loadRelated(listing, { includePrivate = false } = {}) {
   ]);
 
   return { detail, media, features, attributes, organization, agent, project };
+}
+
+/**
+ * An individual seller's listing has no agent and no company: their own seller profile (an
+ * `agents` row with no organization) is who the listing is offered by.
+ */
+async function loadIndividualSellerProfile(listingId) {
+  const row = await queryOne(
+    `SELECT a.id FROM listings x
+       JOIN agents a ON a.user_id = x.created_by_user_id AND a.organization_id IS NULL AND a.deleted_at IS NULL
+      WHERE x.id = ?
+      ORDER BY a.id LIMIT 1`,
+    [listingId]
+  );
+  return row ? loadAgentSummary(row.id) : null;
 }
 
 export async function loadOrganizationSummary(organizationId) {
@@ -206,6 +226,16 @@ export async function getListingDetail(identifier, { source = "public", includeP
   const related = await loadRelated(listing, { includePrivate });
   const detail = serializeListingDetail({ listing, ...related });
   if (source === "public") {
+    // The page's Call / WhatsApp buttons use the same numbers as the listing's card.
+    const numbers = await listingContactNumbers(listing.id);
+    if (numbers) {
+      detail.contact = {
+        ...detail.contact,
+        name: detail.contact?.name || numbers.ownerName,
+        phone: numbers.phone,
+        whatsapp: numbers.whatsapp,
+      };
+    }
     // Changes waiting for approval: the public page stays the approved version (0060).
     const pending = await queryOne("SELECT pending_revision_id FROM listings WHERE id = ?", [listing.id]);
     if (pending?.pending_revision_id) {

@@ -148,20 +148,40 @@ export async function mappingCandidates(id, q = "") {
     within = "AND (l.country_id = ? OR l.state_id = ? OR l.city_id = ? OR l.community_id = ? OR l.parent_id = ?)";
     params.push(...Array(5).fill(Number(row.scope_key)));
   }
-  const term = String(q || row.external_label || "").trim().slice(0, 80);
-  return query(
+  // Companies decorate names ("Maple At Dubai Hills Estate", "Sidra Villas"), so the search goes
+  // word by word: filler words and the words of the place it was sent for are dropped, a place
+  // matching any remaining word is offered, and the most matching words rank first. With no words
+  // left, every place inside that place is offered.
+  const raw = String(q ?? row.external_label ?? "").replace(/\s*\(.*$/, "").trim().slice(0, 80);
+  const scopeName = row.scope_key
+    ? (await queryOne("SELECT name FROM locations WHERE id = ?", [Number(row.scope_key)]))?.name || ""
+    : "";
+  const ignored = new Set(["at", "the", "in", "of", "by", "and", "&", "-", ...wordsOf(scopeName)]);
+  const words = wordsOf(raw).filter((word) => !ignored.has(word)).slice(0, 6);
+  const wordMatch = words.map(() => "(l.name LIKE ? OR l.slug LIKE ?)");
+  const wordParams = words.flatMap((word) => [`%${word}%`, `%${word}%`]);
+  const score = words.length ? wordMatch.map((condition) => `(${condition})`).join(" + ") : "0";
+  const rows = await query(
     `SELECT l.public_id AS id, l.name, l.level,
-            CONCAT_WS(', ', l.name, cm.name, ct.name, co.name) AS label
+            CONCAT_WS(', ', l.name, cm.name, ct.name, co.name) AS label,
+            ${score} AS word_hits
        FROM locations l
        LEFT JOIN locations cm ON cm.id = l.community_id AND cm.id <> l.id
        LEFT JOIN locations ct ON ct.id = l.city_id AND ct.id <> l.id
        LEFT JOIN locations co ON co.id = l.country_id
       WHERE l.deleted_at IS NULL AND l.status = 'active' AND l.level <> 'country' ${within}
-        AND (l.name LIKE ? OR l.slug LIKE ?)
-      ORDER BY l.active_listing_count DESC, l.depth ASC, l.name ASC
-      LIMIT 20`,
-    [...params, `%${term}%`, `%${term.toLowerCase().replace(/\s+/g, "-")}%`]
+        ${words.length ? `AND (${wordMatch.join(" OR ")})` : ""}
+      ORDER BY word_hits DESC, l.active_listing_count DESC, l.depth ASC, l.name ASC
+      LIMIT 50`,
+    [...wordParams, ...params, ...wordParams]
   );
+  // No word matched: offer every place inside the one it was sent for, rather than nothing.
+  if (!rows.length && words.length) return mappingCandidates(id, " ");
+  return rows;
+}
+
+function wordsOf(text) {
+  return String(text || "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 }
 
 /**

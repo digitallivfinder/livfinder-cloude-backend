@@ -41,6 +41,8 @@ async function recipientsForAccount({ accountId, organizationId, agentId = null 
       WHERE m.account_id = ?
         AND m.status = 'active'
         AND m.user_id IS NOT NULL
+        -- An agent-role member hears only about their own listings (the UNION below adds them).
+        AND m.role <> 'agent'
       UNION
      SELECT DISTINCT a.user_id
        FROM agents a

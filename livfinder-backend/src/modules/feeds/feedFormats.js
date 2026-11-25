@@ -114,7 +114,7 @@ const DESCRIPTIONS = {
   externalId: "Your own id for the listing. It names the same listing on every run, so keep it stable.",
   title: "At least 4 characters.",
   description: "Plain text or simple HTML.",
-  purpose: "sale, rent or charter, as the category allows.",
+  purpose: "sale; real estate also takes rent.",
   propertyType: "The listing's type within the category, by its LivFinder code or name.",
   propertySegment: "residential or commercial. The property type must belong to it.",
   price: "A number without separators.",

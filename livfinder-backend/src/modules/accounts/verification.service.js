@@ -172,6 +172,8 @@ export async function verificationReview(subjectType, subjectId) {
     rejectionReason: request.rejection_reason,
     decisionNotes: request.decision_notes,
     requestedCategoryId: payload?.categoryId ?? null,
+    // What the applicant wrote to the reviewer (an agent's note from My Profile).
+    notes: payload?.notes ?? null,
     documents: documents.map((document) => ({
       id: String(document.id),
       documentType: document.document_type,
@@ -263,6 +265,15 @@ export async function submitVerification({ req, subjectType, documents, notes })
         connection
       );
     }
+    // An agent waiting on LivFinder shows as Pending on their company's team page, unless
+    // they are already verified (a later resubmission does not take the badge away).
+    if (subject.subjectType === "agent") {
+      await execute(
+        "UPDATE agents SET verification_status = 'pending' WHERE id = ? AND verification_status <> 'verified'",
+        [subject.subjectId],
+        connection
+      );
+    }
     return verificationRequestId;
   });
 
@@ -289,6 +300,10 @@ export async function verificationStatus(req) {
   if (req.auth.activeMembership?.organization_id) subjects.push(["organization", req.auth.activeMembership.organization_id]);
   if (req.auth.agent) subjects.push(["agent", req.auth.agent.id]);
   if (!subjects.length) return { status: "not_required", requests: [] };
+  // The agent's own badge, for the Verification card on My Profile.
+  const agent = req.auth.agent
+    ? await queryOne("SELECT verification_status, verified_at FROM agents WHERE id = ?", [req.auth.agent.id])
+    : null;
 
   const conditions = subjects.map(() => "(subject_type = ? AND subject_id = ?)").join(" OR ");
   const rows = await query(
@@ -304,6 +319,7 @@ export async function verificationStatus(req) {
 
   return {
     status: rows[0]?.status || "not_submitted",
+    agent: agent ? { verificationStatus: agent.verification_status, verifiedAt: isoDate(agent.verified_at) } : null,
     requests: rows.map((row) => ({
       id: row.public_id,
       subjectType: row.subject_type,

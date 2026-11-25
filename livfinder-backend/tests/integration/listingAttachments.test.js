@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import sharp from "sharp";
-import { client, cleanupListings, ensureTestPassword, findPortalOwner, queryOne } from "../helpers/testApp.js";
+import { client, cleanupListings, ensureTestPassword, findPortalOwner, queryOne, ensurePackageForEmail } from "../helpers/testApp.js";
 import { query } from "../../src/db/query.js";
 import { closePool } from "../../src/db/pool.js";
 
@@ -239,6 +239,7 @@ describe("category-appropriate media", () => {
         WHERE u.status = 'active' AND u.deleted_at IS NULL
         ORDER BY u.id LIMIT 1`
     );
+    await ensurePackageForEmail(owner.email);
     await cars.login(owner.email, PASSWORD);
     const anyLocation = await queryOne("SELECT id FROM locations WHERE level = 'city' AND status = 'active' LIMIT 1");
     const created = await cars.send("post", "/v1/portal/listings", {

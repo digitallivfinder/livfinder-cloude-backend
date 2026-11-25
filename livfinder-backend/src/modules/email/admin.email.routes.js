@@ -183,7 +183,7 @@ router.get(
         passwordSet: Boolean(env.SMTP_PASSWORD),
         from: env.MAIL_FROM,
         fromName: env.MAIL_FROM_NAME,
-        replyTo: env.MAIL_REPLY_TO,
+        replyTo: env.MAIL_REPLY_TO ?? env.EMAIL_SUPPORT_ADDRESS,
         bounceWebhookConfigured: Boolean(env.EMAIL_WEBHOOK_SECRET),
         worker: env.EMAIL_WORKER_ENABLED,
       })

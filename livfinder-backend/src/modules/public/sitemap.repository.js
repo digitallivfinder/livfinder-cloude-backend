@@ -15,17 +15,36 @@ const STATIC_PATHS = [
   { url: "/watches", priority: 0.8, changeFrequency: "daily" },
   { url: "/blogs", priority: 0.7, changeFrequency: "daily" },
   { url: "/countries", priority: 0.7, changeFrequency: "weekly" },
-  // `/companies` canonicalises to `/agencies`; listing both advertised a URL that points elsewhere.
-  { url: "/agencies", priority: 0.7, changeFrequency: "weekly" },
+  // The directory's one URL; `/agencies` permanently redirects here.
+  { url: "/companies", priority: 0.7, changeFrequency: "weekly" },
   { url: "/agents", priority: 0.7, changeFrequency: "weekly" },
   { url: "/contact-us", priority: 0.4, changeFrequency: "monthly" },
+  { url: "/sitemap", priority: 0.3, changeFrequency: "weekly" },
 ];
 
 const KIND_TO_ROOT = { properties: 1, "real-estate": 1, cars: 2, yachts: 3, jets: 4, helicopters: 5, watches: 6 };
 
+/**
+ * A `lastmod` date, or nothing. An unknown date used to read as today, which tells crawlers every
+ * page changed on every visit — they learn to ignore the field, so it is left out instead.
+ */
 function iso(value) {
-  if (!value) return new Date().toISOString().slice(0, 10);
-  return new Date(value).toISOString().slice(0, 10);
+  if (!value) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString().slice(0, 10);
+}
+
+/** A browse page with fewer live listings than this is thin: noindex, and out of the sitemap. */
+export const THIN_HUB_MIN_LISTINGS = 3;
+/** The most URLs one sitemap file holds (the protocol's limit is 50,000; smaller is quicker). */
+export const SITEMAP_PAGE_SIZE = 10000;
+const LEGACY_LIMIT = 50000;
+const MAX_IMAGES = 5;
+
+function paging({ page, pageSize } = {}) {
+  const size = Math.min(LEGACY_LIMIT, Math.max(1, Number(pageSize) || LEGACY_LIMIT));
+  const number = Math.max(1, Math.floor(Number(page) || 1));
+  return { limit: size, offset: (number - 1) * size };
 }
 
 /** A cover image for image sitemaps, only when the row actually has one. */
@@ -33,57 +52,90 @@ function images(url, title) {
   return url ? [{ url, title: title || undefined }] : undefined;
 }
 
-async function listingRows(rootCategoryId = null, limit = 20000) {
-  const params = [];
-  let filter = "";
-  if (rootCategoryId) {
-    filter = "WHERE ls.root_category_id = ?";
-    params.push(rootCategoryId);
-  }
-  const safeLimit = Math.min(50000, Math.max(1, limit));
+/** Every live listing's path and date: the source of a category's browse pages. */
+async function livePathRows(rootCategoryId) {
   return query(
-    `SELECT ls.canonical_path, ls.title, ls.cover_image_url, ls.source_updated_at, ls.is_featured
-       FROM listing_search ls ${filter}
-      ORDER BY ls.published_at DESC
-      LIMIT ${safeLimit}`,
-    params
+    `SELECT ls.canonical_path, ls.source_updated_at
+       FROM listing_search ls
+      WHERE ls.root_category_id = ?`,
+    [rootCategoryId]
   );
 }
 
 /**
- * Sold, rented and withdrawn listings whose page still works (v_reachable_listings, 0062). They
- * stay in the sitemap so the page keeps its ranking; they are not hub pages' content, so
- * `hubEntries` keeps reading the live projection only.
+ * One page of a category's listing URLs: live listings first, then the sold, rented and withdrawn
+ * ones whose page still works (v_reachable_listings, 0062 — the owner's rule of 2026-10-29: they
+ * keep their URL and stay in the sitemap so the page keeps its ranking). Ordered by id so a page
+ * holds the same listings from one request to the next.
  */
-async function closedListingRows(rootCategoryId = null, limit = 20000) {
-  const params = [];
-  let filter = "";
-  if (rootCategoryId) {
-    filter = "AND l.root_category_id = ?";
-    params.push(rootCategoryId);
-  }
-  const safeLimit = Math.min(50000, Math.max(1, limit));
+async function listingPageRows(rootCategoryId, options) {
+  const { limit, offset } = paging(options);
   return query(
-    `SELECT l.canonical_path, l.title, l.cover_image_url, l.updated_at AS source_updated_at, 0 AS is_featured
-       FROM v_reachable_listings l
-      WHERE l.status IN ('sold', 'rented', 'withdrawn') AND l.canonical_path IS NOT NULL ${filter}
-      ORDER BY l.published_at DESC
-      LIMIT ${safeLimit}`,
-    params
+    `SELECT u.id, u.canonical_path, u.title, u.cover_image_url, u.updated
+       FROM (
+         SELECT ls.listing_id AS id, ls.canonical_path, ls.title, ls.cover_image_url, ls.source_updated_at AS updated, 0 AS closed
+           FROM listing_search ls
+          WHERE ls.root_category_id = ?
+         UNION ALL
+         SELECT l.id, l.canonical_path, l.title, l.cover_image_url, l.updated_at AS updated, 1 AS closed
+           FROM v_reachable_listings l
+          WHERE l.status IN ('sold', 'rented', 'withdrawn') AND l.canonical_path IS NOT NULL AND l.root_category_id = ?
+       ) u
+      ORDER BY u.closed, u.id DESC
+      LIMIT ${limit} OFFSET ${offset}`,
+    [rootCategoryId, rootCategoryId]
   );
 }
 
-async function listingEntries(rootCategoryId = null, limit = 20000) {
-  const [live, closed] = await Promise.all([listingRows(rootCategoryId, limit), closedListingRows(rootCategoryId, limit)]);
-  const rows = [...live, ...closed].slice(0, Math.min(50000, Math.max(1, limit)));
-  return rows.map((row) => ({
-    url: row.canonical_path,
-    title: row.title,
-    lastModified: iso(row.source_updated_at),
-    changeFrequency: "daily",
-    priority: row.is_featured ? 0.9 : 0.75,
-    images: images(row.cover_image_url, row.title),
-  }));
+/** Up to five public photos per listing, cover first, for the image sitemap. */
+async function listingPhotos(ids) {
+  if (!ids.length) return new Map();
+  const rows = await query(
+    `SELECT listing_id, url, alt_text
+       FROM listing_media
+      WHERE listing_id IN (${ids.map(() => "?").join(",")}) AND media_type = 'image' AND is_public = 1
+      ORDER BY listing_id, is_cover DESC, sort_order, id`,
+    ids
+  );
+  const byListing = new Map();
+  for (const row of rows) {
+    const list = byListing.get(String(row.listing_id)) || [];
+    if (list.length < MAX_IMAGES) list.push({ url: row.url, title: row.alt_text || undefined });
+    byListing.set(String(row.listing_id), list);
+  }
+  return byListing;
+}
+
+async function listingEntries(rootCategoryId, options) {
+  const rows = await listingPageRows(rootCategoryId, options);
+  const photos = await listingPhotos(rows.map((row) => row.id));
+  return rows.map((row) => {
+    const gallery = photos.get(String(row.id)) || [];
+    return {
+      url: row.canonical_path,
+      title: row.title,
+      lastModified: iso(row.updated),
+      images: gallery.length ? gallery.map((image) => ({ ...image, title: image.title || row.title || undefined })) : images(row.cover_image_url, row.title),
+    };
+  });
+}
+
+/** How many URLs each paged section holds, so the sitemap index knows how many files to list. */
+async function sectionCounts() {
+  const [live, closed, projects] = await Promise.all([
+    query("SELECT root_category_id, COUNT(*) AS total FROM listing_search GROUP BY root_category_id", []),
+    query(
+      `SELECT root_category_id, COUNT(*) AS total FROM v_reachable_listings
+        WHERE status IN ('sold', 'rented', 'withdrawn') AND canonical_path IS NOT NULL GROUP BY root_category_id`,
+      []
+    ),
+    query("SELECT COUNT(*) AS total FROM project_search", []),
+  ]);
+  const byRoot = {};
+  for (const row of [...live, ...closed]) byRoot[row.root_category_id] = (byRoot[row.root_category_id] || 0) + Number(row.total);
+  const counts = { projects: Number(projects[0]?.total || 0) };
+  for (const [kind, rootId] of Object.entries(KIND_TO_ROOT)) if (kind !== "real-estate") counts[kind] = byRoot[rootId] || 0;
+  return { ...counts, pageSize: SITEMAP_PAGE_SIZE };
 }
 
 /**
@@ -94,10 +146,10 @@ async function listingEntries(rootCategoryId = null, limit = 20000) {
  * below the category root is a hierarchy page that resolves and lists that listing — so a hub
  * cannot be listed unless it has something on it, and an empty city never reaches the sitemap.
  */
-export async function hubEntries(kind) {
+export async function hubEntries(kind, { minListings = THIN_HUB_MIN_LISTINGS } = {}) {
   const rootId = KIND_TO_ROOT[kind];
   if (!rootId) return [];
-  return hubsFromPaths(await listingRows(rootId, 50000));
+  return hubsFromPaths(await livePathRows(rootId)).filter((hub) => hub.listingCount >= minListings);
 }
 
 /**
@@ -166,12 +218,13 @@ async function blogTaxonomyEntries() {
   ];
 }
 
-export async function sitemapEntries(kind = "all", { category } = {}) {
-  if (kind === "static") {
-    return STATIC_PATHS.map((entry) => ({ ...entry, lastModified: iso(null) }));
-  }
+export async function sitemapEntries(kind = "all", { category, page, pageSize, minListings } = {}) {
+  // The static pages have no reliable change date: no `lastmod` rather than an invented one.
+  if (kind === "static") return STATIC_PATHS.map(({ url }) => ({ url }));
 
-  if (kind === "hubs") return hubEntries(category);
+  if (kind === "counts") return sectionCounts();
+
+  if (kind === "hubs") return hubEntries(category, minListings === undefined ? {} : { minListings });
 
   if (kind === "blog-taxonomy") return blogTaxonomyEntries();
 
@@ -232,16 +285,23 @@ export async function sitemapEntries(kind = "all", { category } = {}) {
    * and every URL in it renders a page.
    */
   if (kind === "projects") {
+    const { limit, offset } = paging({ page, pageSize });
     const rows = await query(
       `SELECT canonical_path, name, cover_image_url, source_updated_at, is_featured
          FROM project_search
-        ORDER BY is_featured DESC, published_at DESC
-        LIMIT 20000`
+        ORDER BY project_id DESC
+        LIMIT ${limit} OFFSET ${offset}`
     );
     // The Developments location pages (/projects/{country}/…) are real results pages again
-    // since 2026-11-14; they used to redirect into Real Estate Off Plan.
+    // since 2026-11-14; they used to redirect into Real Estate Off Plan. They are listed with the
+    // first page, from every project's path, and only when they hold enough projects.
+    const hubs = offset
+      ? []
+      : hubsFromPaths(await query("SELECT canonical_path, source_updated_at FROM project_search", [])).filter(
+          (hub) => hub.listingCount >= (minListings ?? THIN_HUB_MIN_LISTINGS)
+        );
     return [
-      ...hubsFromPaths(rows),
+      ...hubs,
       ...rows.map((row) => ({
         url: row.canonical_path,
         title: row.name,
@@ -268,7 +328,7 @@ export async function sitemapEntries(kind = "all", { category } = {}) {
 
   const rootId = KIND_TO_ROOT[kind];
   if (!rootId) return [];
-  return listingEntries(rootId);
+  return listingEntries(rootId, { page, pageSize });
 }
 
 export { STATIC_PATHS };
