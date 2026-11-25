@@ -12,6 +12,12 @@ const app = createApp();
 
 const server = app.listen(env.PORT, async () => {
   logger.info({ port: env.PORT, env: env.NODE_ENV }, "livfinder api listening");
+  // Whether this system can email anyone, stated at every start (MAIL_LIVE, config/env.js).
+  {
+    const { mailModeSummary } = await import("./modules/system/mail.service.js");
+    const mail = mailModeSummary();
+    logger.info({ mail: mail.mode }, `mail: ${mail.detail}`);
+  }
   try {
     const database = await pingDatabase();
     logger.info({ database: database.database, version: database.version }, "database reachable");

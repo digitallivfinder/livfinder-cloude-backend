@@ -176,7 +176,10 @@ router.get(
   asyncHandler(async (req, res) =>
     res.json(
       detailResponse({
-        driver: env.MAIL_DRIVER,
+        // What actually happens: "log" unless MAIL_DRIVER=smtp and MAIL_LIVE=true.
+        driver: env.mailDriver,
+        configuredDriver: env.MAIL_DRIVER,
+        live: env.MAIL_LIVE === true,
         host: env.SMTP_HOST,
         port: env.SMTP_PORT,
         user: env.SMTP_USER,

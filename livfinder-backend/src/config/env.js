@@ -86,6 +86,11 @@ const schema = z.object({
   STORAGE_FORCE_PATH_STYLE: bool(false),
 
   MAIL_DRIVER: z.enum(["log", "smtp"]).default("log"),
+  // The master switch for real email (owner, 2026-11-26): nothing leaves the system unless the
+  // system is live. Real SMTP needs MAIL_DRIVER=smtp AND MAIL_LIVE=true; otherwise every email is
+  // written to the mailbox and the log, whatever SMTP settings are present. Off by default — set it
+  // on the production API only, at launch.
+  MAIL_LIVE: bool(false),
   MAIL_FROM: z.string().default("no-reply@livfinder.com"),
   SMTP_HOST: z.string().optional().transform((value) => value || null),
   SMTP_PORT: int(587),
@@ -159,6 +164,8 @@ export const env = Object.freeze({
   ...parsed.data,
   isProduction: parsed.data.NODE_ENV === "production",
   isTest: parsed.data.NODE_ENV === "test",
+  // "smtp" only when the system is live; local, test and staging always log.
+  mailDriver: parsed.data.MAIL_DRIVER === "smtp" && parsed.data.MAIL_LIVE === true ? "smtp" : "log",
   cacheEnabled: Boolean(parsed.data.REDIS_URL) && (parsed.data.CACHE_ENABLED ?? parsed.data.NODE_ENV !== "test"),
   allowedOrigins: parsed.data.LIVFINDER_ALLOWED_ORIGINS.length
     ? parsed.data.LIVFINDER_ALLOWED_ORIGINS

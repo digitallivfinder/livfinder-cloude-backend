@@ -9,7 +9,11 @@ import logger from "../../config/logger.js";
  *
  * The "log" driver is a real development mailbox: every message is written to storage/mailbox
  * (a readable .txt, plus the HTML part as .html) and shown at /dev/mailbox, so every flow can be
- * tested end to end without SMTP credentials. MAIL_DRIVER=smtp with SMTP_* set sends for real.
+ * tested end to end without SMTP credentials.
+ *
+ * Real email needs MAIL_DRIVER=smtp AND MAIL_LIVE=true (`env.mailDriver`). A system that is not
+ * live — the Mac, the test server, any staging copy — logs every email instead, even with working
+ * SMTP credentials in its .env, so no customer can be emailed from a test.
  */
 const mailboxDir = () => path.resolve(process.cwd(), env.LOCAL_STORAGE_PATH, "mailbox");
 
@@ -23,11 +27,17 @@ export function formatAddress(address, name = env.MAIL_FROM_NAME) {
 }
 
 /** The development inbox, as readable text between the JSON log lines. */
+/** Why an email was logged instead of sent, in the words a log reader needs. */
+function notSentReason() {
+  if (env.MAIL_DRIVER === "smtp" && !env.MAIL_LIVE) return "system not live (MAIL_LIVE is not true)";
+  return "MAIL_DRIVER=log";
+}
+
 function printToTerminal(message) {
   const line = "=".repeat(72);
   const attachments = (message.attachments ?? []).map((attachment) => attachment.filename).join(", ");
   process.stdout.write(
-    `\n${line}\nEMAIL (not sent: MAIL_DRIVER=log)\nTo:      ${message.to}\nSubject: ${message.subject}\n${
+    `\n${line}\nEMAIL (not sent: ${notSentReason()})\nTo:      ${message.to}\nSubject: ${message.subject}\n${
       attachments ? `Attached: ${attachments}\n` : ""
     }\n${message.text}\n\nInbox: http://localhost:${env.PORT}/dev/mailbox\n${line}\n\n`
   );
@@ -57,7 +67,7 @@ async function logDriver(message) {
         .join("")}`
   );
   if (message.html) await fs.writeFile(`${base}.html`, message.html);
-  logger.info({ to: message.to, subject: message.subject, file: `${base}.txt` }, "mail written to development mailbox");
+  logger.info({ to: message.to, subject: message.subject, file: `${base}.txt`, reason: notSentReason() }, "email not sent: written to the mailbox");
   if (!env.isProduction && !env.isTest) printToTerminal(message);
   return { delivered: true, driver: "log", file: `${base}.txt`, messageId: path.basename(base) };
 }
@@ -96,7 +106,7 @@ async function smtpDriver(message) {
 
 /** Checks the SMTP login without sending anything (admin Emails screen → "Test connection"). */
 export async function verifyTransport() {
-  if (env.MAIL_DRIVER !== "smtp") return { ok: true, driver: "log", detail: "MAIL_DRIVER=log: emails go to the development mailbox." };
+  if (env.mailDriver !== "smtp") return { ok: true, driver: "log", detail: `Emails are not sent (${notSentReason()}): they go to the mailbox and the log.` };
   if (!env.SMTP_HOST) return { ok: false, driver: "smtp", detail: "SMTP_HOST is empty." };
   try {
     const transport = await smtpTransport();
@@ -121,7 +131,14 @@ export async function sendMail({ to, subject, text, html, attachments, from = en
   sentInMemory.push({ ...message, sentAt: new Date().toISOString() });
   if (sentInMemory.length > 100) sentInMemory = sentInMemory.slice(-100);
   if (env.isTest) return { delivered: true, driver: "memory", messageId: `memory-${sentInMemory.length}` };
-  return env.MAIL_DRIVER === "smtp" ? smtpDriver(message) : logDriver(message);
+  return env.mailDriver === "smtp" ? smtpDriver(message) : logDriver(message);
+}
+
+/** Said once at start-up, so the log always shows whether this system can send email. */
+export function mailModeSummary() {
+  return env.mailDriver === "smtp"
+    ? { mode: "live", detail: `emails are sent through ${env.SMTP_HOST}:${env.SMTP_PORT}` }
+    : { mode: "log", detail: `emails are NOT sent (${notSentReason()}): written to the mailbox and the log` };
 }
 
 export const mailboxDirectory = mailboxDir;

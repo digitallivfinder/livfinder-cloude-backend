@@ -62,7 +62,7 @@ export function createApp() {
   // Health checks answer before the body parsers and the limiter so a probe
   // still works when the API is under load.
   app.use("/health", healthRouter);
-  if (!env.isProduction && !env.isTest && env.MAIL_DRIVER === "log") app.use("/dev/mailbox", devMailboxRouter);
+  if (!env.isProduction && !env.isTest && env.mailDriver === "log") app.use("/dev/mailbox", devMailboxRouter);
   // Every email design rendered from sample data (loopback only, never in production).
   if (!env.isProduction && !env.isTest) app.use("/dev/emails", devEmailsRouter);
 
