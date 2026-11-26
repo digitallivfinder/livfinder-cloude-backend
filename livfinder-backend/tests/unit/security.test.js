@@ -272,8 +272,11 @@ describe("legacy CDN image rewriting", () => {
     expect(out.data[1].logoUrl).toMatch(/\/media\/placeholder\/organizations\/omniyat\.svg$/);
     // A lookalike host is not the CDN and must not be rewritten.
     expect(out.data[1].website).toBe("https://cdn.livfinder.com.evil/x.jpg");
-    // The stored key is retained while a development origin follows the local storage config.
-    expect(out.cover.url).toBe(`${env.STORAGE_PUBLIC_BASE_URL.replace(/\/+$/, "")}/listings/imported/yachts/real.jpg`);
+    // The stored key is retained while a development origin follows the local storage config;
+    // on s3 it is left for scripts/migrate-media-to-s3.js.
+    expect(out.cover.url).toBe(env.STORAGE_DRIVER === "local"
+      ? `${env.STORAGE_PUBLIC_BASE_URL.replace(/\/+$/, "")}/listings/imported/yachts/real.jpg`
+      : payload.cover.url);
     expect(out.count).toBe(2);
     expect(out.nothing).toBeNull();
   });

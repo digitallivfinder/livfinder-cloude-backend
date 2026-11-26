@@ -15,3 +15,9 @@ export function publicMediaUrl(value, publicBaseUrl) {
     return value;
   }
 }
+
+/** The API's own /media base, where generated placeholders are served. Null on s3 without API_MEDIA_BASE_URL. */
+export function apiMediaBaseUrl(env) {
+  const base = env.API_MEDIA_BASE_URL || (env.STORAGE_DRIVER === "local" ? env.STORAGE_PUBLIC_BASE_URL : null);
+  return base ? base.replace(/\/+$/, "") : null;
+}

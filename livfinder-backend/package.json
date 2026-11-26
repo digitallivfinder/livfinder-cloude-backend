@@ -23,6 +23,7 @@
     "cleanup:test-artifacts": "node scripts/cleanup-test-artifacts.js",
     "maintenance": "node scripts/run-maintenance.js",
     "cache:flush": "node scripts/cache-flush.js",
+    "media:migrate-s3": "node scripts/migrate-media-to-s3.js",
     "mail:watch": "node scripts/mail-watch.js"
   },
   "dependencies": {

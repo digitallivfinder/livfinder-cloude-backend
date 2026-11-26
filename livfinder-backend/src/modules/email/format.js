@@ -1,4 +1,5 @@
 import env from "../../config/env.js";
+import { apiMediaBaseUrl, publicMediaUrl } from "../../utils/publicMediaUrl.js";
 
 /**
  * Formatting for email copy. Every value that reaches an email passes through here so a price,
@@ -20,7 +21,8 @@ export const assetUrl = (pathname) => `${String(env.EMAIL_ASSET_BASE_URL || env.
 export function imageUrl(url) {
   if (!url) return null;
   if (/^https?:\/\//i.test(url)) return url;
-  if (url.startsWith("/media")) return `${String(env.STORAGE_PUBLIC_BASE_URL).replace(/\/media\/?$/, "")}${url}`;
+  // Relative /media paths come from the seeds and are served by the API.
+  if (url.startsWith("/media/")) return publicMediaUrl(url, apiMediaBaseUrl(env) ?? env.STORAGE_PUBLIC_BASE_URL);
   return siteUrl(url);
 }
 

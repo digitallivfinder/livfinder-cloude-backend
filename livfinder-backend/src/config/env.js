@@ -63,6 +63,9 @@ const schema = z.object({
   STORAGE_DRIVER: z.enum(["local", "s3"]).default("local"),
   LOCAL_STORAGE_PATH: z.string().default("./storage"),
   STORAGE_PUBLIC_BASE_URL: z.string().default("http://localhost:4000/media"),
+  // The API's own /media route, which serves the generated placeholders for seeded CDN images.
+  // Defaults to STORAGE_PUBLIC_BASE_URL on the local driver; set it on s3, where that is the bucket.
+  API_MEDIA_BASE_URL: z.string().optional().transform((value) => value || null),
   // The CDN host the seeded catalogue's image URLs point at. When MEDIA_CDN_BASE_URL is set,
   // those URLs are served as-is; when it is empty the host does not exist in this environment
   // and the API substitutes a generated stand-in so the UI is not full of broken images.
@@ -129,6 +132,11 @@ const schema = z.object({
   // sweep exhausted it and turned every protected page into a 500.
   SESSION_RATE_LIMIT_MAX: int(1200),
   AUTH_RATE_LIMIT_MAX: int(10),
+  // Shared with the website's server (frontend LIVFINDER_SERVER_API_SECRET, same value). Its
+  // server-rendered pages all reach the API from the host's few egress IPs, so they would share
+  // one visitor's read budget; a request carrying this secret in X-LivFinder-Server-Key skips the
+  // general and session limiters. Empty (or under 32 characters) means no request is exempt.
+  LIVFINDER_SERVER_API_SECRET: z.string().optional().transform((value) => value || null),
   PUBLIC_SITE_ORIGIN: z.string().default("https://livfinder.com"),
 
   // Redis response cache for the public API (src/cache). Empty REDIS_URL means no cache: every
